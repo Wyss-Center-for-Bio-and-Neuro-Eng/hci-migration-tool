@@ -57,18 +57,38 @@ class NutanixClient:
         return entities[0] if entities else None
     
     def power_off_vm(self, vm_uuid: str) -> dict:
-        """Power off a VM."""
+        """Power off a VM (ACPI shutdown)."""
         vm = self.get_vm(vm_uuid)
-        vm['spec']['resources']['power_state'] = 'OFF'
-        del vm['status']
-        return self._request("PUT", f"vms/{vm_uuid}", vm)
+        spec_version = vm.get('metadata', {}).get('spec_version', 0)
+        
+        payload = {
+            "metadata": {
+                "kind": "vm",
+                "uuid": vm_uuid,
+                "spec_version": spec_version
+            },
+            "spec": vm['spec']
+        }
+        payload['spec']['resources']['power_state'] = 'OFF'
+        
+        return self._request("PUT", f"vms/{vm_uuid}", payload)
     
     def power_on_vm(self, vm_uuid: str) -> dict:
         """Power on a VM."""
         vm = self.get_vm(vm_uuid)
-        vm['spec']['resources']['power_state'] = 'ON'
-        del vm['status']
-        return self._request("PUT", f"vms/{vm_uuid}", vm)
+        spec_version = vm.get('metadata', {}).get('spec_version', 0)
+        
+        payload = {
+            "metadata": {
+                "kind": "vm",
+                "uuid": vm_uuid,
+                "spec_version": spec_version
+            },
+            "spec": vm['spec']
+        }
+        payload['spec']['resources']['power_state'] = 'ON'
+        
+        return self._request("PUT", f"vms/{vm_uuid}", payload)
     
     # === Image Operations ===
     
@@ -92,20 +112,6 @@ class NutanixClient:
     def get_image_download_url(self, image_uuid: str) -> str:
         """Return image download URL."""
         return f"https://{self.prism_ip}:9440/api/nutanix/v3/images/{image_uuid}/file"
-    
-    def power_off_vm(self, vm_uuid: str) -> dict:
-        """Power off a VM."""
-        vm = self.get_vm(vm_uuid)
-        vm['spec']['resources']['power_state'] = 'OFF'
-        del vm['status']
-        return self._request("PUT", f"vms/{vm_uuid}", vm)
-    
-    def power_on_vm(self, vm_uuid: str) -> dict:
-        """Power on a VM."""
-        vm = self.get_vm(vm_uuid)
-        vm['spec']['resources']['power_state'] = 'ON'
-        del vm['status']
-        return self._request("PUT", f"vms/{vm_uuid}", vm)
     
     def delete_image(self, image_uuid: str) -> dict:
         """Delete an image."""

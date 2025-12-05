@@ -121,16 +121,30 @@ class HarvesterClient:
         return self._request("DELETE", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}")
     
     def start_vm(self, name: str, namespace: str = None) -> dict:
-        """Start VM by patching running state."""
+        """Start VM using KubeVirt subresource API."""
         ns = namespace or self.namespace
-        patch = {"spec": {"running": True}}
-        return self._request("PATCH", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}", patch)
+        # Use subresource endpoint for starting VM
+        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start"
+        response = requests.put(
+            url,
+            cert=self.cert,
+            verify=self.verify if self.verify else False
+        )
+        response.raise_for_status()
+        return response.json() if response.text else {}
     
     def stop_vm(self, name: str, namespace: str = None) -> dict:
-        """Stop VM by patching running state."""
+        """Stop VM using KubeVirt subresource API."""
         ns = namespace or self.namespace
-        patch = {"spec": {"running": False}}
-        return self._request("PATCH", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}", patch)
+        # Use subresource endpoint for stopping VM
+        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop"
+        response = requests.put(
+            url,
+            cert=self.cert,
+            verify=self.verify if self.verify else False
+        )
+        response.raise_for_status()
+        return response.json() if response.text else {}
     
     # === VMI Operations (Running Instances) ===
     
