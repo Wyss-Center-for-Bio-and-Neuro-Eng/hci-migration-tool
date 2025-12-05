@@ -228,6 +228,92 @@ class MigrationTool:
         else:
             print("Cancelled")
     
+    def power_on_nutanix_vm(self):
+        """Power on a Nutanix VM."""
+        if not self.nutanix and not self.connect_nutanix():
+            return
+        
+        vms = self.nutanix.list_vms()
+        
+        # Filter OFF VMs
+        off_vms = [vm for vm in vms if NutanixClient.parse_vm_info(vm).get('power_state') == 'OFF']
+        
+        if not off_vms:
+            print(colored("❌ No powered off VMs found", Colors.YELLOW))
+            return
+        
+        print("\nPowered OFF VMs:")
+        sorted_vms = sorted(off_vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
+        for i, vm in enumerate(sorted_vms, 1):
+            info = NutanixClient.parse_vm_info(vm)
+            print(f"  {i}. {info['name']}")
+        
+        choice = self.input_prompt("VM number to power ON")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        info = NutanixClient.parse_vm_info(selected)
+        vm_name = info['name']
+        vm_uuid = info['uuid']
+        
+        confirm = self.input_prompt(f"Power ON '{vm_name}'? (y/n)")
+        if confirm.lower() == 'y':
+            try:
+                print(f"🚀 Starting {vm_name}...")
+                self.nutanix.power_on_vm(vm_uuid)
+                print(colored(f"✅ Power ON request sent for: {vm_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
+    def power_off_nutanix_vm(self):
+        """Power off a Nutanix VM."""
+        if not self.nutanix and not self.connect_nutanix():
+            return
+        
+        vms = self.nutanix.list_vms()
+        
+        # Filter ON VMs
+        on_vms = [vm for vm in vms if NutanixClient.parse_vm_info(vm).get('power_state') == 'ON']
+        
+        if not on_vms:
+            print(colored("❌ No powered on VMs found", Colors.YELLOW))
+            return
+        
+        print("\nPowered ON VMs:")
+        sorted_vms = sorted(on_vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
+        for i, vm in enumerate(sorted_vms, 1):
+            info = NutanixClient.parse_vm_info(vm)
+            print(f"  {i}. {info['name']}")
+        
+        choice = self.input_prompt("VM number to power OFF")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        info = NutanixClient.parse_vm_info(selected)
+        vm_name = info['name']
+        vm_uuid = info['uuid']
+        
+        confirm = self.input_prompt(f"Power OFF '{vm_name}'? (y/n)")
+        if confirm.lower() == 'y':
+            try:
+                print(f"🛑 Stopping {vm_name}...")
+                self.nutanix.power_off_vm(vm_uuid)
+                print(colored(f"✅ Power OFF request sent for: {vm_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
     # === Harvester Display Methods ===
     
     def list_harvester_vms(self):
@@ -323,6 +409,138 @@ class MigrationTool:
             print(f"{name:<40} {provisioner:<30} {default}")
         
         print(f"{'='*70}")
+    
+    def power_on_harvester_vm(self):
+        """Power on a Harvester VM."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        vms = self.harvester.list_all_vms()
+        
+        # Filter stopped VMs
+        stopped_vms = [vm for vm in vms if not vm.get('spec', {}).get('running', False)]
+        
+        if not stopped_vms:
+            print(colored("❌ No stopped VMs found", Colors.YELLOW))
+            return
+        
+        print("\nStopped VMs:")
+        sorted_vms = sorted(stopped_vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        for i, vm in enumerate(sorted_vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            print(f"  {i}. {name} ({ns})")
+        
+        choice = self.input_prompt("VM number to start")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        vm_name = selected.get('metadata', {}).get('name')
+        vm_ns = selected.get('metadata', {}).get('namespace')
+        
+        confirm = self.input_prompt(f"Start '{vm_name}'? (y/n)")
+        if confirm.lower() == 'y':
+            try:
+                print(f"🚀 Starting {vm_name}...")
+                self.harvester.start_vm(vm_name, vm_ns)
+                print(colored(f"✅ Start request sent for: {vm_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
+    def power_off_harvester_vm(self):
+        """Power off a Harvester VM."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        vms = self.harvester.list_all_vms()
+        
+        # Filter running VMs
+        running_vms = [vm for vm in vms if vm.get('spec', {}).get('running', False)]
+        
+        if not running_vms:
+            print(colored("❌ No running VMs found", Colors.YELLOW))
+            return
+        
+        print("\nRunning VMs:")
+        sorted_vms = sorted(running_vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        for i, vm in enumerate(sorted_vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            print(f"  {i}. {name} ({ns})")
+        
+        choice = self.input_prompt("VM number to stop")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        vm_name = selected.get('metadata', {}).get('name')
+        vm_ns = selected.get('metadata', {}).get('namespace')
+        
+        confirm = self.input_prompt(f"Stop '{vm_name}'? (y/n)")
+        if confirm.lower() == 'y':
+            try:
+                print(f"🛑 Stopping {vm_name}...")
+                self.harvester.stop_vm(vm_name, vm_ns)
+                print(colored(f"✅ Stop request sent for: {vm_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
+    def delete_harvester_vm(self):
+        """Delete a Harvester VM."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        vms = self.harvester.list_all_vms()
+        
+        if not vms:
+            print(colored("❌ No VMs found", Colors.YELLOW))
+            return
+        
+        print("\nAll VMs:")
+        sorted_vms = sorted(vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        for i, vm in enumerate(sorted_vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            running = "🟢" if vm.get('spec', {}).get('running', False) else "🔴"
+            print(f"  {i}. {running} {name} ({ns})")
+        
+        choice = self.input_prompt("VM number to delete")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        vm_name = selected.get('metadata', {}).get('name')
+        vm_ns = selected.get('metadata', {}).get('namespace')
+        is_running = selected.get('spec', {}).get('running', False)
+        
+        if is_running:
+            print(colored("⚠️  VM is running! Stop it first.", Colors.YELLOW))
+            return
+        
+        confirm = self.input_prompt(f"DELETE '{vm_name}'? (yes to confirm)")
+        if confirm.lower() == 'yes':
+            try:
+                print(f"🗑️  Deleting {vm_name}...")
+                self.harvester.delete_vm(vm_name, vm_ns)
+                print(colored(f"✅ Deleted: {vm_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
     
     # === Migration Methods ===
     
@@ -617,12 +835,26 @@ class MigrationTool:
         
         # Get Nutanix VM specs if selected
         vm_info = None
+        source_mac = None
+        source_ip = None
         if self._selected_vm and self.nutanix:
             print(f"\n📋 Getting specs from Nutanix VM: {self._selected_vm}")
             vm = self.nutanix.get_vm_by_name(self._selected_vm)
             if vm:
                 vm_info = NutanixClient.parse_vm_info(vm)
                 print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {format_size(vm_info['memory_mb'] * 1024 * 1024)}, Boot: {vm_info['boot_type']}", Colors.GREEN))
+                
+                # Display network info
+                if vm_info['nics']:
+                    print(colored("\n🌐 Source Network Configuration:", Colors.BOLD))
+                    for i, nic in enumerate(vm_info['nics']):
+                        source_mac = nic.get('mac')
+                        source_ip = nic.get('ip')
+                        subnet = nic.get('subnet', 'N/A')
+                        print(f"   NIC {i}: {subnet}")
+                        print(f"      MAC: {colored(source_mac, Colors.YELLOW)}")
+                        print(f"      IP:  {colored(source_ip or 'DHCP/Unknown', Colors.YELLOW)}")
+                    print(colored("\n   ⚠️  Save this info! You may need to reconfigure network in Windows.", Colors.YELLOW))
         
         # VM Name
         default_name = self._selected_vm or ""
@@ -691,6 +923,22 @@ class MigrationTool:
             print(colored("Invalid choice", Colors.RED))
             return
         
+        # MAC address option
+        use_source_mac = False
+        custom_mac = None
+        if source_mac:
+            print(f"\n   Source MAC: {colored(source_mac, Colors.YELLOW)}")
+            keep_mac = self.input_prompt("Keep source MAC address? (y/n) [y]")
+            if keep_mac.lower() != 'n':
+                use_source_mac = True
+                custom_mac = source_mac
+                print(colored(f"   ✅ Will use MAC: {source_mac}", Colors.GREEN))
+        
+        if not use_source_mac:
+            manual_mac = self.input_prompt("Enter custom MAC (or Enter for auto)")
+            if manual_mac:
+                custom_mac = manual_mac
+        
         # Get storage classes
         storage_classes = self.harvester.list_storage_classes()
         
@@ -724,6 +972,28 @@ class MigrationTool:
         
         boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
         boot = boot.upper() if boot else default_boot
+        if boot not in ('BIOS', 'UEFI'):
+            boot = default_boot
+        
+        if boot == "UEFI":
+            print(colored("   ⚠️  UEFI boot selected - make sure source VM was UEFI!", Colors.YELLOW))
+        
+        # Disk bus selection
+        print(colored("\n💾 Disk Bus Selection:", Colors.BOLD))
+        print("   - sata   : Most compatible, works without extra drivers (recommended for migration)")
+        print("   - virtio : Best performance, requires virtio drivers installed in guest")
+        print("   - scsi   : Uses virtio-scsi, also requires virtio drivers")
+        
+        default_bus = "sata"  # Safe default for migration
+        disk_bus = self.input_prompt(f"Disk bus (sata/virtio/scsi) [{default_bus}]")
+        disk_bus = disk_bus.lower() if disk_bus else default_bus
+        if disk_bus not in ('sata', 'virtio', 'scsi'):
+            disk_bus = default_bus
+        
+        if disk_bus == "sata":
+            print(colored("   ℹ️  Using SATA for compatibility. After Windows boots:", Colors.CYAN))
+            print(colored("      1. Install virtio drivers: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
+            print(colored("      2. Shutdown VM, change disk bus to 'virtio' for better performance", Colors.CYAN))
         
         # Summary
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
@@ -731,10 +1001,16 @@ class MigrationTool:
         print(f"   Namespace: {namespace}")
         print(f"   Image: {image_name} ({image_ns})")
         print(f"   Network: {network_name}")
+        if custom_mac:
+            print(f"   MAC: {custom_mac}")
+        else:
+            print(f"   MAC: auto-generated")
+        if source_ip:
+            print(f"   Source IP (for reference): {source_ip}")
         print(f"   Storage: {storage_class}")
         print(f"   CPU: {cpu} cores")
         print(f"   RAM: {ram} GB")
-        print(f"   Disk: {disk_size} GB")
+        print(f"   Disk: {disk_size} GB (bus: {disk_bus})")
         print(f"   Boot: {boot}")
         
         confirm = self.input_prompt("\nCreate VM? (y/n)")
@@ -778,7 +1054,7 @@ class MigrationTool:
                                         {
                                             "name": "disk-0",
                                             "disk": {
-                                                "bus": "virtio"
+                                                "bus": disk_bus
                                             },
                                             "bootOrder": 1
                                         }
@@ -839,19 +1115,59 @@ class MigrationTool:
                 }
             }
             
-            # Add UEFI if needed
+            # Add UEFI firmware if needed
             if boot == "UEFI":
                 manifest['spec']['template']['spec']['domain']['firmware'] = {
                     "bootloader": {
                         "efi": {
-                            "secureBoot": False
+                            "secureBoot": False,
+                            "persistent": False
                         }
                     }
                 }
+                # Also add machine type for better UEFI support
+                manifest['spec']['template']['spec']['domain']['machine'] = {
+                    "type": "q35"
+                }
+            
+            # Add custom MAC address if specified
+            if custom_mac:
+                manifest['spec']['template']['spec']['domain']['devices']['interfaces'][0]['macAddress'] = custom_mac
             
             result = self.harvester.create_vm(manifest)
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
             print("   Start it from Harvester UI or wait for disk provisioning")
+            
+            # Offer to delete the source image
+            delete_img = self.input_prompt(f"\nDelete source image '{image_name}' from Harvester? (y/n)")
+            if delete_img.lower() == 'y':
+                try:
+                    self.harvester.delete_image(image_name, image_ns)
+                    print(colored(f"✅ Image deleted: {image_name}", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"⚠️  Could not delete image: {e}", Colors.YELLOW))
+            
+            # Offer to delete staging files
+            delete_staging = self.input_prompt("\nDelete staging files (RAW/QCOW2)? (y/n)")
+            if delete_staging.lower() == 'y':
+                self.init_actions()
+                staging_files = self.actions.list_staging_files()
+                for f in staging_files:
+                    if f['name'].endswith(('.raw', '.qcow2')) and vm_name.replace('-', '').lower() in f['name'].replace('-', '').lower():
+                        if self.actions.delete_file(f['path']):
+                            print(colored(f"✅ Deleted: {f['name']}", Colors.GREEN))
+            
+            # Remind about Nutanix image cleanup
+            print(colored("\n💡 Don't forget to delete the Nutanix export image (Menu Nutanix → Delete image)", Colors.YELLOW))
+            
+            # Remind about virtio drivers if using SATA
+            if disk_bus == "sata":
+                print(colored("\n📝 POST-MIGRATION STEPS:", Colors.BOLD))
+                print(colored("   1. Boot VM and verify Windows works", Colors.CYAN))
+                print(colored("   2. Download virtio drivers ISO: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
+                print(colored("   3. Mount ISO in VM, run virtio-win-gt-x64.msi", Colors.CYAN))
+                print(colored("   4. Shutdown VM, edit config: change disk bus from 'sata' to 'virtio'", Colors.CYAN))
+                print(colored("   5. Start VM - now with better disk performance!", Colors.CYAN))
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
@@ -865,8 +1181,10 @@ class MigrationTool:
                 ("1", "List VMs"),
                 ("2", "VM details"),
                 ("3", "Select VM"),
-                ("4", "List images"),
-                ("5", "Delete image (cleanup)"),
+                ("4", "Power ON VM"),
+                ("5", "Power OFF VM"),
+                ("6", "List images"),
+                ("7", "Delete image (cleanup)"),
                 ("0", "Back")
             ])
             
@@ -882,9 +1200,15 @@ class MigrationTool:
                 self.select_vm()
                 self.pause()
             elif choice == "4":
-                self.list_nutanix_images()
+                self.power_on_nutanix_vm()
                 self.pause()
             elif choice == "5":
+                self.power_off_nutanix_vm()
+                self.pause()
+            elif choice == "6":
+                self.list_nutanix_images()
+                self.pause()
+            elif choice == "7":
                 self.delete_nutanix_image()
                 self.pause()
             elif choice == "0":
@@ -895,9 +1219,12 @@ class MigrationTool:
             self.print_header()
             self.print_menu("HARVESTER", [
                 ("1", "List VMs"),
-                ("2", "List images"),
-                ("3", "List networks"),
-                ("4", "List storage classes"),
+                ("2", "Start VM"),
+                ("3", "Stop VM"),
+                ("4", "Delete VM"),
+                ("5", "List images"),
+                ("6", "List networks"),
+                ("7", "List storage classes"),
                 ("0", "Back")
             ])
             
@@ -907,12 +1234,21 @@ class MigrationTool:
                 self.list_harvester_vms()
                 self.pause()
             elif choice == "2":
-                self.list_harvester_images()
+                self.power_on_harvester_vm()
                 self.pause()
             elif choice == "3":
-                self.list_harvester_networks()
+                self.power_off_harvester_vm()
                 self.pause()
             elif choice == "4":
+                self.delete_harvester_vm()
+                self.pause()
+            elif choice == "5":
+                self.list_harvester_images()
+                self.pause()
+            elif choice == "6":
+                self.list_harvester_networks()
+                self.pause()
+            elif choice == "7":
                 self.list_harvester_storage()
                 self.pause()
             elif choice == "0":

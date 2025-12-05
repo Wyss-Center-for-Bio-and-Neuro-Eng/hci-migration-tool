@@ -69,10 +69,16 @@ class HarvesterClient:
     def _request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Execute API request."""
         url = f"{self.base_url}{endpoint}"
+        
+        headers = {}
+        if method == "PATCH":
+            headers['Content-Type'] = 'application/merge-patch+json'
+        
         response = requests.request(
             method=method,
             url=url,
             json=data,
+            headers=headers if headers else None,
             cert=self.cert,
             verify=self.verify if self.verify else False
         )

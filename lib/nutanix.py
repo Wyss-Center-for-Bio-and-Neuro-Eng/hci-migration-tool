@@ -93,6 +93,20 @@ class NutanixClient:
         """Return image download URL."""
         return f"https://{self.prism_ip}:9440/api/nutanix/v3/images/{image_uuid}/file"
     
+    def power_off_vm(self, vm_uuid: str) -> dict:
+        """Power off a VM."""
+        vm = self.get_vm(vm_uuid)
+        vm['spec']['resources']['power_state'] = 'OFF'
+        del vm['status']
+        return self._request("PUT", f"vms/{vm_uuid}", vm)
+    
+    def power_on_vm(self, vm_uuid: str) -> dict:
+        """Power on a VM."""
+        vm = self.get_vm(vm_uuid)
+        vm['spec']['resources']['power_state'] = 'ON'
+        del vm['status']
+        return self._request("PUT", f"vms/{vm_uuid}", vm)
+    
     def delete_image(self, image_uuid: str) -> dict:
         """Delete an image."""
         return self._request("DELETE", f"images/{image_uuid}")
