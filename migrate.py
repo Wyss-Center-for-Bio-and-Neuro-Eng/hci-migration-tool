@@ -418,7 +418,12 @@ class MigrationTool:
                 self.harvester.delete_image(image_name, image_ns)
                 print(colored(f"✅ Deleted: {image_name}", Colors.GREEN))
             except Exception as e:
-                print(colored(f"❌ Error: {e}", Colors.RED))
+                error_msg = str(e)
+                if "422" in error_msg or "being used" in error_msg.lower():
+                    print(colored(f"❌ Cannot delete: Image is being used by a volume", Colors.RED))
+                    print(colored(f"   → First delete the volume (Menu 8), then retry", Colors.YELLOW))
+                else:
+                    print(colored(f"❌ Error: {e}", Colors.RED))
         else:
             print("Cancelled")
     
@@ -457,6 +462,69 @@ class MigrationTool:
             print(f"{name:<40} {provisioner:<30} {default}")
         
         print(f"{'='*70}")
+    
+    def list_harvester_volumes(self):
+        """List all volumes (PVCs) in Harvester."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        pvcs = self.harvester.list_all_pvcs()
+        
+        print(f"\n{'='*90}")
+        print(f"{'Volume Name':<45} {'Namespace':<20} {'Size':<12} {'Status'}")
+        print(f"{'='*90}")
+        
+        for pvc in sorted(pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower()):
+            name = pvc.get('metadata', {}).get('name', 'N/A')[:44]
+            ns = pvc.get('metadata', {}).get('namespace', 'N/A')[:19]
+            size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
+            status = pvc.get('status', {}).get('phase', 'N/A')
+            print(f"{name:<45} {ns:<20} {size:<12} {status}")
+        
+        print(f"{'='*90}")
+        print(f"Total: {len(pvcs)} volumes")
+    
+    def delete_harvester_volume(self):
+        """Delete a Harvester volume (PVC)."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        pvcs = self.harvester.list_all_pvcs()
+        
+        if not pvcs:
+            print(colored("❌ No volumes found", Colors.YELLOW))
+            return
+        
+        print("\nAvailable volumes (Enter to cancel):")
+        sorted_pvcs = sorted(pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        for i, pvc in enumerate(sorted_pvcs, 1):
+            name = pvc.get('metadata', {}).get('name', 'N/A')
+            ns = pvc.get('metadata', {}).get('namespace', 'N/A')
+            size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
+            print(f"  {i}. {name} ({ns}) - {size}")
+        
+        choice = self.input_prompt("Volume number to delete")
+        if not choice:
+            return
+        try:
+            idx = int(choice) - 1
+            selected = sorted_pvcs[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        vol_name = selected.get('metadata', {}).get('name')
+        vol_ns = selected.get('metadata', {}).get('namespace')
+        
+        confirm = self.input_prompt(f"Delete volume '{vol_name}' from {vol_ns}? (yes to confirm)")
+        if confirm.lower() == 'yes':
+            try:
+                self.harvester.delete_pvc(vol_name, vol_ns)
+                print(colored(f"✅ Deleted: {vol_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
     
     def power_on_harvester_vm(self):
         """Power on a Harvester VM."""
@@ -1337,8 +1405,10 @@ class MigrationTool:
                 ("4", "Delete VM"),
                 ("5", "List images"),
                 ("6", "Delete image"),
-                ("7", "List networks"),
-                ("8", "List storage classes"),
+                ("7", "List volumes"),
+                ("8", "Delete volume"),
+                ("9", "List networks"),
+                ("10", "List storage classes"),
                 ("0", "Back")
             ])
             
@@ -1363,9 +1433,15 @@ class MigrationTool:
                 self.delete_harvester_image()
                 self.pause()
             elif choice == "7":
-                self.list_harvester_networks()
+                self.list_harvester_volumes()
                 self.pause()
             elif choice == "8":
+                self.delete_harvester_volume()
+                self.pause()
+            elif choice == "9":
+                self.list_harvester_networks()
+                self.pause()
+            elif choice == "10":
                 self.list_harvester_storage()
                 self.pause()
             elif choice == "0":

@@ -243,6 +243,16 @@ class HarvesterClient:
         result = self._request("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims")
         return result.get('items', [])
     
+    def list_all_pvcs(self) -> List[dict]:
+        """List all persistent volume claims across namespaces."""
+        result = self._request("GET", "/api/v1/persistentvolumeclaims")
+        return result.get('items', [])
+    
+    def delete_pvc(self, name: str, namespace: str = None) -> dict:
+        """Delete a PersistentVolumeClaim (volume)."""
+        ns = namespace or self.namespace
+        return self._request("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}")
+    
     # === Helper Methods ===
     
     def get_vm_status(self, name: str, namespace: str = None) -> str:
