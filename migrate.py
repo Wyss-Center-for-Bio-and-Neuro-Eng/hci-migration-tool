@@ -13,7 +13,7 @@ import argparse
 # Add lib to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib import Colors, colored, format_size
+from lib import Colors, colored, format_size, format_timestamp
 from lib import NutanixClient, HarvesterClient, MigrationActions
 
 
@@ -299,16 +299,107 @@ class MigrationTool:
                 print(colored(f"❌ Error: {result['error']}", Colors.RED))
             else:
                 print(f"   Files: {len(result['files'])}")
-                for f in result['files']:
-                    if f['type'] == 'file':
-                        print(f"   - {f['name']}: {format_size(f['size'])}")
-                    else:
-                        print(f"   - {f['name']}/ (directory)")
+                print(f"   Total size: {format_size(result['total_size'])}")
         else:
             print(colored("❌ Not mounted", Colors.RED))
             ceph_ip = self.config.get('ceph', {}).get('mon_ip', '10.16.16.140')
             print(f"   Mount command:")
             print(f"   mount -t ceph {ceph_ip}:6789:/volumes/_nogroup/migration-staging {result['path']} -o name=admin,secretfile=/etc/ceph/admin.secret")
+    
+    def list_staging_disks(self):
+        """List all disk images in staging."""
+        self.init_actions()
+        
+        if not self.actions.is_staging_mounted():
+            print(colored(f"❌ Staging not mounted: {self.actions.staging_path}", Colors.RED))
+            return
+        
+        files = self.actions.list_staging_files()
+        
+        if not files:
+            print(colored("\n❌ No files in staging", Colors.YELLOW))
+            return
+        
+        print(f"\n{'='*90}")
+        print(f"{'#':<4} {'Filename':<40} {'Size':<15} {'Modified':<20} {'Type'}")
+        print(f"{'='*90}")
+        
+        total_size = 0
+        for idx, f in enumerate(files, 1):
+            name = f['name'][:39]
+            size = format_size(f['size'])
+            total_size += f['size']
+            mtime = format_timestamp(f['mtime'])
+            
+            # Detect type by extension
+            if f['name'].endswith('.raw'):
+                ftype = colored("RAW", Colors.YELLOW)
+            elif f['name'].endswith('.qcow2'):
+                ftype = colored("QCOW2", Colors.GREEN)
+            elif f['name'].endswith('.vmdk'):
+                ftype = colored("VMDK", Colors.BLUE)
+            elif f['name'].endswith('.vhd') or f['name'].endswith('.vhdx'):
+                ftype = colored("VHD", Colors.BLUE)
+            elif f['name'].endswith('.iso'):
+                ftype = colored("ISO", Colors.CYAN)
+            else:
+                ftype = "Other"
+            
+            print(f"{idx:<4} {name:<40} {size:<15} {mtime:<20} {ftype}")
+        
+        print(f"{'='*90}")
+        print(f"Total: {len(files)} files, {format_size(total_size)}")
+    
+    def show_disk_info(self):
+        """Show detailed info about a disk image."""
+        self.init_actions()
+        
+        if not self.actions.is_staging_mounted():
+            print(colored(f"❌ Staging not mounted", Colors.RED))
+            return
+        
+        files = self.actions.list_staging_files()
+        if not files:
+            print(colored("❌ No files in staging", Colors.YELLOW))
+            return
+        
+        # Show files and prompt for selection
+        print("\nAvailable files:")
+        for idx, f in enumerate(files, 1):
+            print(f"  {idx}. {f['name']} ({format_size(f['size'])})")
+        
+        choice = self.input_prompt("File number")
+        try:
+            idx = int(choice) - 1
+            selected = files[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        # Get detailed info
+        info = self.actions.get_file_info(selected['name'])
+        if not info:
+            print(colored("Could not get file info", Colors.RED))
+            return
+        
+        print(colored(f"\n{'='*60}", Colors.CYAN))
+        print(colored(f" File: {info['name']}", Colors.BOLD))
+        print(colored(f"{'='*60}", Colors.CYAN))
+        
+        print(f"   Path: {info['path']}")
+        print(f"   Size on disk: {format_size(info['size'])}")
+        print(f"   Modified: {format_timestamp(info['mtime'])}")
+        
+        if 'format' in info:
+            print(colored("\n💾 Disk Image Info:", Colors.BOLD))
+            print(f"   Format: {info['format']}")
+            if 'virtual_size' in info:
+                print(f"   Virtual size: {format_size(info['virtual_size'])}")
+            if 'actual_size' in info:
+                print(f"   Actual size: {format_size(info['actual_size'])}")
+                if info['virtual_size']:
+                    ratio = (1 - info['actual_size'] / info['virtual_size']) * 100
+                    print(f"   Sparse savings: {ratio:.1f}%")
     
     def convert_disk(self):
         self.init_actions()
@@ -357,6 +448,40 @@ class MigrationTool:
                         print(colored("✅ RAW file deleted", Colors.GREEN))
             else:
                 print(colored(f"❌ Error: {result['error']}", Colors.RED))
+    
+    def delete_staging_file(self):
+        """Delete a file from staging."""
+        self.init_actions()
+        
+        if not self.actions.is_staging_mounted():
+            print(colored(f"❌ Staging not mounted", Colors.RED))
+            return
+        
+        files = self.actions.list_staging_files()
+        if not files:
+            print(colored("❌ No files in staging", Colors.YELLOW))
+            return
+        
+        print("\nFiles in staging:")
+        for idx, f in enumerate(files, 1):
+            print(f"  {idx}. {f['name']} ({format_size(f['size'])})")
+        
+        choice = self.input_prompt("File number to delete")
+        try:
+            idx = int(choice) - 1
+            selected = files[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        confirm = self.input_prompt(f"Delete '{selected['name']}'? (yes to confirm)")
+        if confirm.lower() == 'yes':
+            if self.actions.delete_file(selected['path']):
+                print(colored(f"✅ Deleted: {selected['name']}", Colors.GREEN))
+            else:
+                print(colored("❌ Failed to delete file", Colors.RED))
+        else:
+            print("Cancelled")
     
     def export_vm(self):
         if not self._selected_vm:
@@ -473,10 +598,13 @@ class MigrationTool:
             self.print_header()
             self.print_menu("MIGRATION", [
                 ("1", "Check staging"),
-                ("2", "Export VM (Nutanix → Staging)"),
-                ("3", "Convert RAW → QCOW2"),
-                ("4", "Import to Harvester"),
-                ("5", "Full migration"),
+                ("2", "List staging disks"),
+                ("3", "Disk image details"),
+                ("4", "Export VM (Nutanix → Staging)"),
+                ("5", "Convert RAW → QCOW2"),
+                ("6", "Import to Harvester"),
+                ("7", "Delete staging file"),
+                ("8", "Full migration"),
                 ("0", "Back")
             ])
             
@@ -486,15 +614,24 @@ class MigrationTool:
                 self.check_staging()
                 self.pause()
             elif choice == "2":
-                self.export_vm()
+                self.list_staging_disks()
                 self.pause()
             elif choice == "3":
-                self.convert_disk()
+                self.show_disk_info()
                 self.pause()
             elif choice == "4":
-                self.import_to_harvester()
+                self.export_vm()
                 self.pause()
             elif choice == "5":
+                self.convert_disk()
+                self.pause()
+            elif choice == "6":
+                self.import_to_harvester()
+                self.pause()
+            elif choice == "7":
+                self.delete_staging_file()
+                self.pause()
+            elif choice == "8":
                 print(colored("\n🚧 Full migration - Under development", Colors.YELLOW))
                 self.pause()
             elif choice == "0":
@@ -575,6 +712,8 @@ def main():
             tool.list_harvester_images()
         elif args.command == "list-networks":
             tool.list_harvester_networks()
+        elif args.command == "list-staging":
+            tool.list_staging_disks()
         elif args.command == "show":
             vm_name = args.args[0] if args.args else None
             tool.show_vm_details(vm_name)

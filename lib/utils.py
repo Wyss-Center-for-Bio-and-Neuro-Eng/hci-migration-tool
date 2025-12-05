@@ -2,6 +2,8 @@
 Utility functions and classes for the migration tool.
 """
 
+import os
+
 class Colors:
     """ANSI color codes."""
     HEADER = '\033[95m'
@@ -28,3 +30,9 @@ def format_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} PB"
+
+
+def format_timestamp(ts: float) -> str:
+    """Format Unix timestamp to readable date."""
+    from datetime import datetime
+    return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')

@@ -8,17 +8,14 @@ import time
 import http.server
 import socketserver
 import threading
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Dict
 from .utils import Colors, colored, format_size
-from .nutanix import NutanixClient
-from .harvester import HarvesterClient
 
 
 class MigrationActions:
     """Handles VM migration operations."""
     
-    def __init__(self, config: dict, nutanix: NutanixClient = None, 
-                 harvester: HarvesterClient = None):
+    def __init__(self, config: dict, nutanix=None, harvester=None):
         """
         Initialize migration actions.
         
@@ -36,6 +33,10 @@ class MigrationActions:
     
     # === Staging Operations ===
     
+    def is_staging_mounted(self) -> bool:
+        """Check if staging is mounted."""
+        return os.path.ismount(self.staging_path)
+    
     def check_staging(self) -> dict:
         """
         Check staging directory status.
@@ -45,7 +46,7 @@ class MigrationActions:
         """
         result = {
             'path': self.staging_path,
-            'mounted': os.path.ismount(self.staging_path),
+            'mounted': self.is_staging_mounted(),
             'files': [],
             'total_size': 0
         }
@@ -73,43 +74,93 @@ class MigrationActions:
         
         return result
     
-    def list_raw_files(self) -> list:
-        """List RAW files in staging."""
-        if not os.path.ismount(self.staging_path):
+    def list_staging_files(self, filter_ext: str = None) -> List[Dict]:
+        """
+        List all files in staging directory.
+        
+        Args:
+            filter_ext: Optional extension filter (e.g., '.raw', '.qcow2')
+        
+        Returns:
+            List of dicts with name, path, size, mtime
+        """
+        if not self.is_staging_mounted():
             return []
         
         files = []
         try:
             for f in os.listdir(self.staging_path):
-                if f.endswith('.raw'):
-                    fpath = os.path.join(self.staging_path, f)
+                fpath = os.path.join(self.staging_path, f)
+                if os.path.isfile(fpath):
+                    if filter_ext and not f.endswith(filter_ext):
+                        continue
+                    stat = os.stat(fpath)
                     files.append({
                         'name': f,
                         'path': fpath,
-                        'size': os.path.getsize(fpath)
+                        'size': stat.st_size,
+                        'mtime': stat.st_mtime,
                     })
-        except:
+        except Exception as e:
             pass
-        return files
+        
+        return sorted(files, key=lambda x: x['name'])
     
-    def list_qcow2_files(self) -> list:
+    def list_raw_files(self) -> List[Dict]:
+        """List RAW files in staging."""
+        return self.list_staging_files(filter_ext='.raw')
+    
+    def list_qcow2_files(self) -> List[Dict]:
         """List QCOW2 files in staging."""
-        if not os.path.ismount(self.staging_path):
-            return []
+        return self.list_staging_files(filter_ext='.qcow2')
+    
+    def get_file_info(self, filename: str) -> Optional[Dict]:
+        """
+        Get detailed info about a file in staging.
         
-        files = []
+        Args:
+            filename: Name of the file
+        
+        Returns:
+            Dict with file info or None
+        """
+        fpath = os.path.join(self.staging_path, filename)
+        if not os.path.exists(fpath):
+            return None
+        
+        stat = os.stat(fpath)
+        info = {
+            'name': filename,
+            'path': fpath,
+            'size': stat.st_size,
+            'mtime': stat.st_mtime,
+        }
+        
+        # Get qemu-img info for disk images
+        if filename.endswith(('.raw', '.qcow2', '.vmdk', '.vhd', '.vhdx')):
+            try:
+                result = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', fpath],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    import json
+                    qemu_info = json.loads(result.stdout)
+                    info['format'] = qemu_info.get('format')
+                    info['virtual_size'] = qemu_info.get('virtual-size')
+                    info['actual_size'] = qemu_info.get('actual-size')
+            except:
+                pass
+        
+        return info
+    
+    def delete_file(self, filepath: str) -> bool:
+        """Delete a file from staging."""
         try:
-            for f in os.listdir(self.staging_path):
-                if f.endswith('.qcow2'):
-                    fpath = os.path.join(self.staging_path, f)
-                    files.append({
-                        'name': f,
-                        'path': fpath,
-                        'size': os.path.getsize(fpath)
-                    })
+            os.remove(filepath)
+            return True
         except:
-            pass
-        return files
+            return False
     
     # === Export Operations ===
     
@@ -159,7 +210,7 @@ class MigrationActions:
         Args:
             raw_file: Path to RAW file
             compress: Whether to compress the output
-            progress_callback: Optional callback for progress
+            progress_callback: Optional callback(percent)
         
         Returns:
             Dict with success, output_file, size_before, size_after
@@ -214,14 +265,6 @@ class MigrationActions:
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    def delete_file(self, filepath: str) -> bool:
-        """Delete a file from staging."""
-        try:
-            os.remove(filepath)
-            return True
-        except:
-            return False
-    
     # === HTTP Server for Image Serving ===
     
     def start_http_server(self, port: int = 8080) -> str:
@@ -253,7 +296,10 @@ class MigrationActions:
         # Get local IP
         import socket
         hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
+        try:
+            local_ip = socket.gethostbyname(hostname)
+        except:
+            local_ip = "127.0.0.1"
         
         return f"http://{local_ip}:{port}"
     
@@ -349,6 +395,8 @@ class MigrationActions:
         Returns:
             Dict with success and details
         """
+        from .nutanix import NutanixClient
+        
         result = {
             'success': False,
             'steps': [],
