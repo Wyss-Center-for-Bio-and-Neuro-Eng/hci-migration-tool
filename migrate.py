@@ -200,7 +200,7 @@ class MigrationTool:
             print(colored("❌ No images found", Colors.YELLOW))
             return
         
-        print("\nAvailable images:")
+        print("\nAvailable images (Enter to cancel):")
         sorted_images = sorted(images, key=lambda x: x.get('spec', {}).get('name', '').lower())
         for i, img in enumerate(sorted_images, 1):
             name = img.get('spec', {}).get('name', 'N/A')
@@ -208,6 +208,8 @@ class MigrationTool:
             print(f"  {i}. {name} ({format_size(size)})")
         
         choice = self.input_prompt("Image number to delete")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_images[idx]
@@ -242,13 +244,15 @@ class MigrationTool:
             print(colored("❌ No powered off VMs found", Colors.YELLOW))
             return
         
-        print("\nPowered OFF VMs:")
+        print("\nPowered OFF VMs (Enter to cancel):")
         sorted_vms = sorted(off_vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
         for i, vm in enumerate(sorted_vms, 1):
             info = NutanixClient.parse_vm_info(vm)
             print(f"  {i}. {info['name']}")
         
         choice = self.input_prompt("VM number to power ON")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_vms[idx]
@@ -285,13 +289,15 @@ class MigrationTool:
             print(colored("❌ No powered on VMs found", Colors.YELLOW))
             return
         
-        print("\nPowered ON VMs:")
+        print("\nPowered ON VMs (Enter to cancel):")
         sorted_vms = sorted(on_vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
         for i, vm in enumerate(sorted_vms, 1):
             info = NutanixClient.parse_vm_info(vm)
             print(f"  {i}. {info['name']}")
         
         choice = self.input_prompt("VM number to power OFF")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_vms[idx]
@@ -416,15 +422,17 @@ class MigrationTool:
             return
         
         vms = self.harvester.list_all_vms()
+        vmis = self.harvester.list_all_vmis()
+        running_names = {vmi.get('metadata', {}).get('name') for vmi in vmis}
         
-        # Filter stopped VMs
-        stopped_vms = [vm for vm in vms if not vm.get('spec', {}).get('running', False)]
+        # Filter stopped VMs (not in VMIs list)
+        stopped_vms = [vm for vm in vms if vm.get('metadata', {}).get('name') not in running_names]
         
         if not stopped_vms:
             print(colored("❌ No stopped VMs found", Colors.YELLOW))
             return
         
-        print("\nStopped VMs:")
+        print("\nStopped VMs (Enter to cancel):")
         sorted_vms = sorted(stopped_vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
         for i, vm in enumerate(sorted_vms, 1):
             name = vm.get('metadata', {}).get('name', 'N/A')
@@ -432,6 +440,8 @@ class MigrationTool:
             print(f"  {i}. {name} ({ns})")
         
         choice = self.input_prompt("VM number to start")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_vms[idx]
@@ -459,15 +469,17 @@ class MigrationTool:
             return
         
         vms = self.harvester.list_all_vms()
+        vmis = self.harvester.list_all_vmis()
+        running_names = {vmi.get('metadata', {}).get('name') for vmi in vmis}
         
-        # Filter running VMs
-        running_vms = [vm for vm in vms if vm.get('spec', {}).get('running', False)]
+        # Filter running VMs (present in VMIs list)
+        running_vms = [vm for vm in vms if vm.get('metadata', {}).get('name') in running_names]
         
         if not running_vms:
             print(colored("❌ No running VMs found", Colors.YELLOW))
             return
         
-        print("\nRunning VMs:")
+        print("\nRunning VMs (Enter to cancel):")
         sorted_vms = sorted(running_vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
         for i, vm in enumerate(sorted_vms, 1):
             name = vm.get('metadata', {}).get('name', 'N/A')
@@ -475,6 +487,8 @@ class MigrationTool:
             print(f"  {i}. {name} ({ns})")
         
         choice = self.input_prompt("VM number to stop")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_vms[idx]
@@ -502,20 +516,25 @@ class MigrationTool:
             return
         
         vms = self.harvester.list_all_vms()
+        vmis = self.harvester.list_all_vmis()
+        running_names = {vmi.get('metadata', {}).get('name') for vmi in vmis}
         
         if not vms:
             print(colored("❌ No VMs found", Colors.YELLOW))
             return
         
-        print("\nAll VMs:")
+        print("\nAll VMs (Enter to cancel):")
         sorted_vms = sorted(vms, key=lambda x: x.get('metadata', {}).get('name', '').lower())
         for i, vm in enumerate(sorted_vms, 1):
             name = vm.get('metadata', {}).get('name', 'N/A')
             ns = vm.get('metadata', {}).get('namespace', 'N/A')
-            running = "🟢" if vm.get('spec', {}).get('running', False) else "🔴"
-            print(f"  {i}. {running} {name} ({ns})")
+            is_running = name in running_names
+            status = "🟢 Running" if is_running else "🔴 Stopped"
+            print(f"  {i}. {status} {name} ({ns})")
         
         choice = self.input_prompt("VM number to delete")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected = sorted_vms[idx]
@@ -525,7 +544,7 @@ class MigrationTool:
         
         vm_name = selected.get('metadata', {}).get('name')
         vm_ns = selected.get('metadata', {}).get('namespace')
-        is_running = selected.get('spec', {}).get('running', False)
+        is_running = vm_name in running_names
         
         if is_running:
             print(colored("⚠️  VM is running! Stop it first.", Colors.YELLOW))
