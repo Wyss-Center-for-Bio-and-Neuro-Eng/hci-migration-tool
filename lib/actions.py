@@ -239,6 +239,8 @@ class MigrationActions:
         Returns:
             Dict with success, output_file, size_before, size_after
         """
+        import re
+        
         if not os.path.exists(raw_file):
             return {'success': False, 'error': f"File not found: {raw_file}"}
         
@@ -256,19 +258,29 @@ class MigrationActions:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                universal_newlines=True
             )
             
-            # Read progress output
-            for line in process.stdout:
-                if progress_callback:
-                    # Parse progress from qemu-img output
-                    if '%' in line:
+            # Read progress output character by character
+            buffer = ""
+            while True:
+                char = process.stdout.read(1)
+                if not char:
+                    break
+                char = char.decode('utf-8', errors='ignore')
+                if char == '\r' or char == '\n':
+                    # Parse progress line
+                    if '%' in buffer and progress_callback:
                         try:
-                            pct = float(line.strip().replace('%', '').split()[-1])
-                            progress_callback(pct)
+                            # Extract percentage (e.g., "(45.23/100%)")
+                            match = re.search(r'([\d.]+)/100%', buffer)
+                            if match:
+                                pct = float(match.group(1))
+                                progress_callback(pct)
                         except:
                             pass
+                    buffer = ""
+                else:
+                    buffer += char
             
             process.wait()
             
