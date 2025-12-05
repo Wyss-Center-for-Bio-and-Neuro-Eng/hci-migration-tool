@@ -380,6 +380,48 @@ class MigrationTool:
         print(f"{'='*80}")
         print(f"Total: {len(images)} images")
     
+    def delete_harvester_image(self):
+        """Delete a Harvester image."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        images = self.harvester.list_all_images()
+        
+        if not images:
+            print(colored("❌ No images found", Colors.YELLOW))
+            return
+        
+        print("\nAvailable images (Enter to cancel):")
+        sorted_images = sorted(images, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        for i, img in enumerate(sorted_images, 1):
+            name = img.get('metadata', {}).get('name', 'N/A')
+            ns = img.get('metadata', {}).get('namespace', 'N/A')
+            size = img.get('status', {}).get('size', 0)
+            print(f"  {i}. {name} ({ns}) - {format_size(size)}")
+        
+        choice = self.input_prompt("Image number to delete")
+        if not choice:
+            return
+        try:
+            idx = int(choice) - 1
+            selected = sorted_images[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        image_name = selected.get('metadata', {}).get('name')
+        image_ns = selected.get('metadata', {}).get('namespace')
+        
+        confirm = self.input_prompt(f"Delete '{image_name}' from {image_ns}? (yes to confirm)")
+        if confirm.lower() == 'yes':
+            try:
+                self.harvester.delete_image(image_name, image_ns)
+                print(colored(f"✅ Deleted: {image_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
     def list_harvester_networks(self):
         if not self.harvester and not self.connect_harvester():
             return
@@ -1242,8 +1284,9 @@ class MigrationTool:
                 ("3", "Stop VM"),
                 ("4", "Delete VM"),
                 ("5", "List images"),
-                ("6", "List networks"),
-                ("7", "List storage classes"),
+                ("6", "Delete image"),
+                ("7", "List networks"),
+                ("8", "List storage classes"),
                 ("0", "Back")
             ])
             
@@ -1265,9 +1308,12 @@ class MigrationTool:
                 self.list_harvester_images()
                 self.pause()
             elif choice == "6":
-                self.list_harvester_networks()
+                self.delete_harvester_image()
                 self.pause()
             elif choice == "7":
+                self.list_harvester_networks()
+                self.pause()
+            elif choice == "8":
                 self.list_harvester_storage()
                 self.pause()
             elif choice == "0":
