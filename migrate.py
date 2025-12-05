@@ -536,6 +536,9 @@ class MigrationTool:
     def import_to_harvester(self):
         self.init_actions()
         
+        if not self.harvester and not self.connect_harvester():
+            return
+        
         qcow2_files = self.actions.list_qcow2_files()
         
         if not qcow2_files:
@@ -558,14 +561,28 @@ class MigrationTool:
         if not image_name:
             image_name = selected_file['name'].replace('.qcow2', '')
         
+        # Get available namespaces
+        namespaces = self.get_harvester_namespaces()
+        
+        print("\nAvailable namespaces:")
+        for i, ns in enumerate(namespaces, 1):
+            print(f"  {i}. {ns}")
+        
+        choice = self.input_prompt("Namespace number [1]")
+        try:
+            idx = int(choice) - 1 if choice else 0
+            namespace = namespaces[idx]
+        except:
+            namespace = namespaces[0]
+        
         print(f"\n🚀 Starting HTTP server...")
         http_url = self.actions.start_http_server(8080)
         print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
         
-        print(f"\n📤 Creating image in Harvester...")
+        print(f"\n📤 Creating image in Harvester ({namespace})...")
         try:
-            result = self.actions.create_harvester_image(image_name, selected_file['name'], http_url)
-            print(colored(f"✅ Image created: {image_name}", Colors.GREEN))
+            result = self.actions.create_harvester_image(image_name, selected_file['name'], http_url, namespace)
+            print(colored(f"✅ Image created: {image_name} in {namespace}", Colors.GREEN))
             print("   Monitor progress in Harvester UI")
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
@@ -573,6 +590,271 @@ class MigrationTool:
         self.input_prompt("Press Enter when image download is complete to stop HTTP server")
         self.actions.stop_http_server()
         print(colored("✅ HTTP server stopped", Colors.GREEN))
+    
+    def get_harvester_namespaces(self) -> list:
+        """Get list of namespaces from Harvester."""
+        try:
+            result = self.harvester._request("GET", "/api/v1/namespaces")
+            namespaces = []
+            # System namespace prefixes to exclude
+            exclude_prefixes = ('kube-', 'cattle-', 'fleet-', 'local', 'longhorn-', 'harvester-system')
+            
+            for ns in result.get('items', []):
+                name = ns.get('metadata', {}).get('name', '')
+                # Keep harvester-public, exclude other system namespaces
+                if name == 'harvester-public':
+                    namespaces.append(name)
+                elif not any(name.startswith(p) for p in exclude_prefixes):
+                    namespaces.append(name)
+            return sorted(namespaces) if namespaces else ['default']
+        except:
+            return ['default']
+    
+    def create_harvester_vm(self):
+        """Create a VM in Harvester from Nutanix specs."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        # Get Nutanix VM specs if selected
+        vm_info = None
+        if self._selected_vm and self.nutanix:
+            print(f"\n📋 Getting specs from Nutanix VM: {self._selected_vm}")
+            vm = self.nutanix.get_vm_by_name(self._selected_vm)
+            if vm:
+                vm_info = NutanixClient.parse_vm_info(vm)
+                print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {format_size(vm_info['memory_mb'] * 1024 * 1024)}, Boot: {vm_info['boot_type']}", Colors.GREEN))
+        
+        # VM Name
+        default_name = self._selected_vm or ""
+        vm_name = self.input_prompt(f"VM name [{default_name}]")
+        if not vm_name:
+            vm_name = default_name
+        if not vm_name:
+            print(colored("❌ VM name required", Colors.RED))
+            return
+        
+        # Get available namespaces
+        namespaces = self.get_harvester_namespaces()
+        
+        print("\nAvailable namespaces:")
+        for i, ns in enumerate(namespaces, 1):
+            print(f"  {i}. {ns}")
+        
+        choice = self.input_prompt("Namespace number [1]")
+        try:
+            idx = int(choice) - 1 if choice else 0
+            namespace = namespaces[idx]
+        except:
+            namespace = namespaces[0]
+        
+        # Get available images
+        images = self.harvester.list_all_images()
+        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100 or 
+                         img.get('metadata', {}).get('state') == 'Active']
+        
+        if not active_images:
+            print(colored("❌ No active images available", Colors.RED))
+            return
+        
+        print("\nAvailable images:")
+        for i, img in enumerate(active_images, 1):
+            name = img.get('metadata', {}).get('name', 'N/A')
+            ns = img.get('metadata', {}).get('namespace', 'N/A')
+            size = img.get('status', {}).get('size', 0)
+            print(f"  {i}. {name} ({ns}) - {format_size(size)}")
+        
+        choice = self.input_prompt("Image number")
+        try:
+            idx = int(choice) - 1
+            selected_image = active_images[idx]
+            image_name = selected_image.get('metadata', {}).get('name')
+            image_ns = selected_image.get('metadata', {}).get('namespace')
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        # Get available networks
+        networks = self.harvester.list_all_networks()
+        
+        print("\nAvailable networks:")
+        for i, net in enumerate(networks, 1):
+            name = net.get('metadata', {}).get('name', 'N/A')
+            ns = net.get('metadata', {}).get('namespace', 'N/A')
+            print(f"  {i}. {name} ({ns})")
+        
+        choice = self.input_prompt("Network number")
+        try:
+            idx = int(choice) - 1
+            selected_net = networks[idx]
+            network_name = f"{selected_net.get('metadata', {}).get('namespace')}/{selected_net.get('metadata', {}).get('name')}"
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        # Get storage classes
+        storage_classes = self.harvester.list_storage_classes()
+        
+        print("\nAvailable storage classes:")
+        for i, sc in enumerate(storage_classes, 1):
+            name = sc.get('metadata', {}).get('name', 'N/A')
+            default = "(default)" if sc.get('metadata', {}).get('annotations', {}).get('storageclass.kubernetes.io/is-default-class') == 'true' else ""
+            print(f"  {i}. {name} {default}")
+        
+        choice = self.input_prompt("Storage class number [1]")
+        try:
+            idx = int(choice) - 1 if choice else 0
+            storage_class = storage_classes[idx].get('metadata', {}).get('name')
+        except:
+            storage_class = storage_classes[0].get('metadata', {}).get('name')
+        
+        # CPU, RAM, Boot type
+        default_cpu = vm_info['vcpu'] if vm_info else 2
+        default_ram = vm_info['memory_mb'] // 1024 if vm_info else 4
+        default_boot = vm_info['boot_type'] if vm_info else 'BIOS'
+        default_disk_size = vm_info['disks'][0]['size_bytes'] // (1024**3) if vm_info and vm_info['disks'] else 50
+        
+        cpu = self.input_prompt(f"CPU cores [{default_cpu}]")
+        cpu = int(cpu) if cpu else default_cpu
+        
+        ram = self.input_prompt(f"RAM in GB [{default_ram}]")
+        ram = int(ram) if ram else default_ram
+        
+        disk_size = self.input_prompt(f"Disk size in GB [{default_disk_size}]")
+        disk_size = int(disk_size) if disk_size else default_disk_size
+        
+        boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
+        boot = boot.upper() if boot else default_boot
+        
+        # Summary
+        print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
+        print(f"   Name: {vm_name}")
+        print(f"   Namespace: {namespace}")
+        print(f"   Image: {image_name} ({image_ns})")
+        print(f"   Network: {network_name}")
+        print(f"   Storage: {storage_class}")
+        print(f"   CPU: {cpu} cores")
+        print(f"   RAM: {ram} GB")
+        print(f"   Disk: {disk_size} GB")
+        print(f"   Boot: {boot}")
+        
+        confirm = self.input_prompt("\nCreate VM? (y/n)")
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            return
+        
+        # Build manifest
+        print("\n🚀 Creating VM...")
+        try:
+            manifest = {
+                "apiVersion": "kubevirt.io/v1",
+                "kind": "VirtualMachine",
+                "metadata": {
+                    "name": vm_name,
+                    "namespace": namespace,
+                    "labels": {
+                        "harvesterhci.io/creator": "harvesterhci"
+                    }
+                },
+                "spec": {
+                    "running": False,
+                    "template": {
+                        "metadata": {
+                            "labels": {
+                                "harvesterhci.io/vmName": vm_name
+                            }
+                        },
+                        "spec": {
+                            "domain": {
+                                "cpu": {
+                                    "cores": cpu,
+                                    "sockets": 1,
+                                    "threads": 1
+                                },
+                                "memory": {
+                                    "guest": f"{ram}Gi"
+                                },
+                                "devices": {
+                                    "disks": [
+                                        {
+                                            "name": "disk-0",
+                                            "disk": {
+                                                "bus": "virtio"
+                                            },
+                                            "bootOrder": 1
+                                        }
+                                    ],
+                                    "interfaces": [
+                                        {
+                                            "name": "nic-0",
+                                            "bridge": {}
+                                        }
+                                    ]
+                                },
+                                "machine": {
+                                    "type": "q35"
+                                }
+                            },
+                            "networks": [
+                                {
+                                    "name": "nic-0",
+                                    "multus": {
+                                        "networkName": network_name
+                                    }
+                                }
+                            ],
+                            "volumes": [
+                                {
+                                    "name": "disk-0",
+                                    "dataVolume": {
+                                        "name": f"{vm_name}-disk-0"
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "dataVolumeTemplates": [
+                        {
+                            "metadata": {
+                                "name": f"{vm_name}-disk-0",
+                                "annotations": {
+                                    "harvesterhci.io/imageId": f"{image_ns}/{image_name}"
+                                }
+                            },
+                            "spec": {
+                                "pvc": {
+                                    "accessModes": ["ReadWriteMany"],
+                                    "resources": {
+                                        "requests": {
+                                            "storage": f"{disk_size}Gi"
+                                        }
+                                    },
+                                    "storageClassName": storage_class
+                                },
+                                "source": {
+                                    "blank": {}
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+            
+            # Add UEFI if needed
+            if boot == "UEFI":
+                manifest['spec']['template']['spec']['domain']['firmware'] = {
+                    "bootloader": {
+                        "efi": {
+                            "secureBoot": False
+                        }
+                    }
+                }
+            
+            result = self.harvester.create_vm(manifest)
+            print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
+            print("   Start it from Harvester UI or wait for disk provisioning")
+            
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
     
     # === Menus ===
     
@@ -645,9 +927,10 @@ class MigrationTool:
                 ("3", "Disk image details"),
                 ("4", "Export VM (Nutanix → Staging)"),
                 ("5", "Convert RAW → QCOW2"),
-                ("6", "Import to Harvester"),
-                ("7", "Delete staging file"),
-                ("8", "Full migration"),
+                ("6", "Import image to Harvester"),
+                ("7", "Create VM in Harvester"),
+                ("8", "Delete staging file"),
+                ("9", "Full migration"),
                 ("0", "Back")
             ])
             
@@ -672,9 +955,12 @@ class MigrationTool:
                 self.import_to_harvester()
                 self.pause()
             elif choice == "7":
-                self.delete_staging_file()
+                self.create_harvester_vm()
                 self.pause()
             elif choice == "8":
+                self.delete_staging_file()
+                self.pause()
+            elif choice == "9":
                 print(colored("\n🚧 Full migration - Under development", Colors.YELLOW))
                 self.pause()
             elif choice == "0":
