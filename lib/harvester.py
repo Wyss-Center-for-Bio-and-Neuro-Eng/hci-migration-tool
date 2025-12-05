@@ -253,6 +253,83 @@ class HarvesterClient:
         ns = namespace or self.namespace
         return self._request("DELETE", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}")
     
+    def clone_pvc(self, source_name: str, clone_name: str, namespace: str = None, storage_class: str = None) -> dict:
+        """Clone a PVC using CSI volume cloning."""
+        ns = namespace or self.namespace
+        
+        # Get source PVC to copy settings
+        source_pvc = self._request("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{source_name}")
+        source_size = source_pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', '10Gi')
+        source_sc = storage_class or source_pvc.get('spec', {}).get('storageClassName', 'harvester-longhorn')
+        access_modes = source_pvc.get('spec', {}).get('accessModes', ['ReadWriteMany'])
+        volume_mode = source_pvc.get('spec', {}).get('volumeMode', 'Block')
+        
+        # Create clone PVC with dataSource pointing to original
+        clone_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": clone_name,
+                "namespace": ns
+            },
+            "spec": {
+                "storageClassName": source_sc,
+                "dataSource": {
+                    "name": source_name,
+                    "kind": "PersistentVolumeClaim"
+                },
+                "accessModes": access_modes,
+                "volumeMode": volume_mode,
+                "resources": {
+                    "requests": {
+                        "storage": source_size
+                    }
+                }
+            }
+        }
+        
+        return self._request("POST", f"/api/v1/namespaces/{ns}/persistentvolumeclaims", clone_manifest)
+    
+    def get_pvc(self, name: str, namespace: str = None) -> dict:
+        """Get a specific PVC."""
+        ns = namespace or self.namespace
+        return self._request("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}")
+    
+    def update_vm_volume(self, vm_name: str, old_volume_name: str, new_volume_name: str, namespace: str = None) -> dict:
+        """Update VM to use a different volume."""
+        ns = namespace or self.namespace
+        
+        # Get current VM
+        vm = self.get_vm(vm_name, ns)
+        
+        # Update dataVolumeTemplates and volumes to point to new volume
+        spec = vm.get('spec', {})
+        template_spec = spec.get('template', {}).get('spec', {})
+        
+        # Update volumes section
+        volumes = template_spec.get('volumes', [])
+        for vol in volumes:
+            if vol.get('dataVolume', {}).get('name') == old_volume_name:
+                vol['dataVolume']['name'] = new_volume_name
+            elif vol.get('persistentVolumeClaim', {}).get('claimName') == old_volume_name:
+                vol['persistentVolumeClaim']['claimName'] = new_volume_name
+        
+        # Remove dataVolumeTemplates (since we're using existing PVC now)
+        if 'dataVolumeTemplates' in spec:
+            spec['dataVolumeTemplates'] = [
+                dvt for dvt in spec['dataVolumeTemplates'] 
+                if dvt.get('metadata', {}).get('name') != old_volume_name
+            ]
+        
+        # Change volume reference to persistentVolumeClaim instead of dataVolume
+        for vol in volumes:
+            if vol.get('dataVolume', {}).get('name') == new_volume_name:
+                vol['persistentVolumeClaim'] = {'claimName': new_volume_name}
+                del vol['dataVolume']
+        
+        # Update the VM
+        return self._request("PUT", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{vm_name}", vm)
+    
     # === Helper Methods ===
     
     def get_vm_status(self, name: str, namespace: str = None) -> str:

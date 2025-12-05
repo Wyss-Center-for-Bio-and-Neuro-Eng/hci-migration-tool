@@ -526,6 +526,148 @@ class MigrationTool:
         else:
             print("Cancelled")
     
+    def dissociate_vm_from_image(self):
+        """Clone VM volume to dissociate it from the source image."""
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        print(colored("\n🔗 Dissociate VM from Image", Colors.BOLD))
+        print("   This will clone the VM's volume(s) to remove the backing image dependency.")
+        print("   After this, you can delete the Harvester image.\n")
+        
+        # List VMs
+        vms = self.harvester.list_all_vms()
+        stopped_vms = []
+        
+        # Check VMIs for running status
+        vmis = self.harvester.list_all_vmis()
+        running_names = {vmi.get('metadata', {}).get('name') for vmi in vmis}
+        
+        for vm in vms:
+            vm_name = vm.get('metadata', {}).get('name')
+            if vm_name not in running_names:
+                stopped_vms.append(vm)
+        
+        if not stopped_vms:
+            print(colored("❌ No stopped VMs found. Stop the VM first!", Colors.YELLOW))
+            return
+        
+        print("Stopped VMs (Enter to cancel):")
+        for i, vm in enumerate(stopped_vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            print(f"  {i}. {name} ({ns})")
+        
+        choice = self.input_prompt("VM number")
+        if not choice:
+            return
+        try:
+            idx = int(choice) - 1
+            selected_vm = stopped_vms[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        vm_name = selected_vm.get('metadata', {}).get('name')
+        vm_ns = selected_vm.get('metadata', {}).get('namespace')
+        
+        # Get VM volumes
+        spec = selected_vm.get('spec', {})
+        template_spec = spec.get('template', {}).get('spec', {})
+        volumes = template_spec.get('volumes', [])
+        data_volume_templates = spec.get('dataVolumeTemplates', [])
+        
+        # Find volumes linked to images
+        volumes_to_clone = []
+        for dvt in data_volume_templates:
+            dvt_name = dvt.get('metadata', {}).get('name')
+            annotations = dvt.get('metadata', {}).get('annotations', {})
+            image_id = annotations.get('harvesterhci.io/imageId')
+            if image_id:
+                volumes_to_clone.append({
+                    'name': dvt_name,
+                    'image_id': image_id
+                })
+        
+        if not volumes_to_clone:
+            print(colored("✅ VM has no image-linked volumes. Nothing to dissociate.", Colors.GREEN))
+            return
+        
+        print(f"\n📋 Found {len(volumes_to_clone)} volume(s) linked to images:")
+        for vol in volumes_to_clone:
+            print(f"   - {vol['name']} → {vol['image_id']}")
+        
+        confirm = self.input_prompt("\nClone these volumes to dissociate from images? (y/n)")
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            return
+        
+        # Clone each volume
+        cloned_volumes = []
+        for vol in volumes_to_clone:
+            old_name = vol['name']
+            new_name = f"{old_name}-standalone"
+            
+            print(f"\n🔄 Cloning {old_name} → {new_name}...")
+            try:
+                self.harvester.clone_pvc(old_name, new_name, vm_ns)
+                print(colored(f"   ✅ Clone created: {new_name}", Colors.GREEN))
+                cloned_volumes.append({
+                    'old': old_name,
+                    'new': new_name
+                })
+            except Exception as e:
+                print(colored(f"   ❌ Clone failed: {e}", Colors.RED))
+                return
+        
+        # Wait for clones to be ready
+        print("\n⏳ Waiting for clones to be ready...")
+        import time
+        for _ in range(60):  # Wait up to 60 seconds
+            all_ready = True
+            for vol in cloned_volumes:
+                try:
+                    pvc = self.harvester.get_pvc(vol['new'], vm_ns)
+                    phase = pvc.get('status', {}).get('phase', '')
+                    if phase != 'Bound':
+                        all_ready = False
+                        break
+                except:
+                    all_ready = False
+                    break
+            
+            if all_ready:
+                print(colored("   ✅ All clones ready!", Colors.GREEN))
+                break
+            time.sleep(2)
+            print("   .", end='', flush=True)
+        else:
+            print(colored("\n   ⚠️  Timeout waiting for clones. Check Harvester UI.", Colors.YELLOW))
+        
+        # Update VM to use cloned volumes
+        print("\n🔧 Updating VM to use cloned volumes...")
+        try:
+            for vol in cloned_volumes:
+                self.harvester.update_vm_volume(vm_name, vol['old'], vol['new'], vm_ns)
+            print(colored(f"   ✅ VM updated to use standalone volumes", Colors.GREEN))
+        except Exception as e:
+            print(colored(f"   ❌ Error updating VM: {e}", Colors.RED))
+            print(colored("   You may need to update the VM manually in Harvester UI", Colors.YELLOW))
+            return
+        
+        # Offer to delete old volumes
+        delete_old = self.input_prompt("\nDelete old image-linked volumes? (y/n)")
+        if delete_old.lower() == 'y':
+            for vol in cloned_volumes:
+                try:
+                    self.harvester.delete_pvc(vol['old'], vm_ns)
+                    print(colored(f"   ✅ Deleted: {vol['old']}", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not delete {vol['old']}: {e}", Colors.YELLOW))
+        
+        print(colored("\n✅ VM is now dissociated from images!", Colors.GREEN))
+        print(colored("   You can now delete the Harvester images (Menu → Delete image)", Colors.CYAN))
+    
     def power_on_harvester_vm(self):
         """Power on a Harvester VM."""
         if not self.harvester and not self.connect_harvester():
@@ -897,6 +1039,8 @@ class MigrationTool:
             print(f"  {i}. {f['name']} ({format_size(f['size'])})")
         
         choice = self.input_prompt("File number to import")
+        if not choice:
+            return
         try:
             idx = int(choice) - 1
             selected_file = qcow2_files[idx]
@@ -922,6 +1066,23 @@ class MigrationTool:
         except:
             namespace = namespaces[0]
         
+        # Choose import method
+        print(colored("\n📤 Import Method:", Colors.BOLD))
+        print("  1. HTTP - Start HTTP server, Harvester downloads from it")
+        print("     (Requires network access from Harvester to this machine)")
+        print("  2. Upload - Push file directly to Harvester")
+        print("     (Uses virtctl or CDI upload proxy)")
+        
+        method = self.input_prompt("Method (1/2) [1]")
+        if not method or method == "1":
+            self._import_via_http(image_name, selected_file, namespace)
+        elif method == "2":
+            self._import_via_upload(image_name, selected_file, namespace)
+        else:
+            print(colored("Invalid choice", Colors.RED))
+    
+    def _import_via_http(self, image_name: str, selected_file: dict, namespace: str):
+        """Import image via HTTP server method."""
         print(f"\n🚀 Starting HTTP server...")
         http_url = self.actions.start_http_server(8080)
         print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
@@ -933,10 +1094,79 @@ class MigrationTool:
             print("   Monitor progress in Harvester UI")
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
+            self.actions.stop_http_server()
+            return
         
         self.input_prompt("Press Enter when image download is complete to stop HTTP server")
         self.actions.stop_http_server()
         print(colored("✅ HTTP server stopped", Colors.GREEN))
+    
+    def _import_via_upload(self, image_name: str, selected_file: dict, namespace: str):
+        """Import image via direct upload to Harvester."""
+        print(colored("\n📤 Upload Method", Colors.BOLD))
+        print("\nThis method requires 'virtctl' to be installed on this machine.")
+        print("Install: https://kubevirt.io/user-guide/operations/virtctl/")
+        
+        # Check if virtctl is available
+        import shutil
+        virtctl_path = shutil.which('virtctl')
+        
+        if not virtctl_path:
+            print(colored("\n⚠️  'virtctl' not found in PATH", Colors.YELLOW))
+            print("\nAlternative: Manual upload via Harvester UI")
+            print(f"  1. Go to Harvester UI → Images → Create")
+            print(f"  2. Select 'Upload' as source type")
+            print(f"  3. Upload file: {selected_file['path']}")
+            print(f"  4. Name: {image_name}")
+            print(f"  5. Namespace: {namespace}")
+            return
+        
+        print(colored(f"✅ virtctl found: {virtctl_path}", Colors.GREEN))
+        
+        # Get kubeconfig path
+        kubeconfig = self.input_prompt("Kubeconfig path [~/.kube/harvester.yaml]")
+        if not kubeconfig:
+            kubeconfig = os.path.expanduser("~/.kube/harvester.yaml")
+        
+        # Build virtctl command
+        file_size = selected_file['size']
+        print(f"\n📤 Uploading {selected_file['name']} ({format_size(file_size)}) to Harvester...")
+        print(colored("   This may take a while for large images...", Colors.YELLOW))
+        
+        # Create image first, then upload
+        import subprocess
+        
+        # Use virtctl to upload
+        cmd = [
+            'virtctl', 'image-upload',
+            f'--image-path={selected_file["path"]}',
+            f'--storage-class=harvester-longhorn',
+            f'--size={file_size}',
+            f'--uploadproxy-url=https://{self.config["harvester"]["api_url"].replace("https://", "").split(":")[0]}:31001',
+            f'--namespace={namespace}',
+            f'--kubeconfig={kubeconfig}',
+            '--insecure',
+            '--force-bind',
+            f'pvc/{image_name}'
+        ]
+        
+        print(f"Command: {' '.join(cmd)}")
+        confirm = self.input_prompt("\nRun upload? (y/n)")
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            return
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(colored(f"✅ Upload complete!", Colors.GREEN))
+                print(result.stdout)
+            else:
+                print(colored(f"❌ Upload failed", Colors.RED))
+                print(result.stderr)
+                print("\nAlternative: Use HTTP method or upload via Harvester UI")
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
     
     def get_harvester_namespaces(self) -> list:
         """Get list of namespaces from Harvester."""
@@ -958,7 +1188,7 @@ class MigrationTool:
             return ['default']
     
     def create_harvester_vm(self):
-        """Create a VM in Harvester from Nutanix specs."""
+        """Create a VM in Harvester from Nutanix specs - using imported Harvester images."""
         if not self.harvester and not self.connect_harvester():
             return
         
@@ -1025,11 +1255,10 @@ class MigrationTool:
         
         # Get available images
         images = self.harvester.list_all_images()
-        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100 or 
-                         img.get('metadata', {}).get('state') == 'Active']
+        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100]
         
         if not active_images:
-            print(colored("❌ No active images available", Colors.RED))
+            print(colored("❌ No active images available. Import images first (Menu 3 → Option 6).", Colors.RED))
             return
         
         # Determine number of disks
@@ -1148,16 +1377,14 @@ class MigrationTool:
         print("   - virtio : Best performance, requires virtio drivers installed in guest")
         print("   - scsi   : Uses virtio-scsi, also requires virtio drivers")
         
-        default_bus = "sata"  # Safe default for migration
+        default_bus = "sata"
         disk_bus = self.input_prompt(f"Disk bus (sata/virtio/scsi) [{default_bus}]")
         disk_bus = disk_bus.lower() if disk_bus else default_bus
         if disk_bus not in ('sata', 'virtio', 'scsi'):
             disk_bus = default_bus
         
         if disk_bus == "sata":
-            print(colored("   ℹ️  Using SATA for compatibility. After boot:", Colors.CYAN))
-            print(colored("      1. Install virtio drivers if needed", Colors.CYAN))
-            print(colored("      2. Shutdown VM, change disk bus to 'virtio' for better performance", Colors.CYAN))
+            print(colored("   ℹ️  Using SATA for compatibility.", Colors.CYAN))
         
         # Summary
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
@@ -1211,7 +1438,7 @@ class MigrationTool:
                 }
             })
             
-            # DataVolumeTemplate
+            # DataVolumeTemplate with image reference
             data_volume_templates.append({
                 "metadata": {
                     "name": f"{vm_name}-{disk_name}",
@@ -1304,7 +1531,6 @@ class MigrationTool:
                         }
                     }
                 }
-                # Also add machine type for better UEFI support
                 manifest['spec']['template']['spec']['domain']['machine'] = {
                     "type": "q35"
                 }
@@ -1317,27 +1543,9 @@ class MigrationTool:
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
             print("   Start it from Harvester UI or wait for disk provisioning")
             
-            # Offer to delete the source images
-            delete_img = self.input_prompt(f"\nDelete source images from Harvester? (y/n)")
-            if delete_img.lower() == 'y':
-                for img in selected_images:
-                    try:
-                        self.harvester.delete_image(img['name'], img['namespace'])
-                        print(colored(f"✅ Image deleted: {img['name']}", Colors.GREEN))
-                    except Exception as e:
-                        print(colored(f"⚠️  Could not delete image {img['name']}: {e}", Colors.YELLOW))
-            
-            # Offer to delete staging files
-            delete_staging = self.input_prompt("\nDelete staging files (RAW/QCOW2)? (y/n)")
-            if delete_staging.lower() == 'y':
-                self.init_actions()
-                staging_files = self.actions.list_staging_files()
-                vm_base = vm_name.lower().replace('-', '')
-                for f in staging_files:
-                    fname_lower = f['name'].lower().replace('-', '')
-                    if f['name'].endswith(('.raw', '.qcow2')) and vm_base in fname_lower:
-                        if self.actions.delete_file(f['path']):
-                            print(colored(f"✅ Deleted: {f['name']}", Colors.GREEN))
+            # Info about dissociate feature
+            print(colored("\n💡 TIP: After VM is running, use 'Dissociate VM from image' (Menu Harvester → Option 5)", Colors.CYAN))
+            print(colored("   to clone volumes and remove image dependency for easier cleanup.", Colors.CYAN))
             
             # Remind about Nutanix image cleanup
             print(colored("\n💡 Don't forget to delete the Nutanix export images (Menu Nutanix → Delete image)", Colors.YELLOW))
@@ -1403,12 +1611,13 @@ class MigrationTool:
                 ("2", "Start VM"),
                 ("3", "Stop VM"),
                 ("4", "Delete VM"),
-                ("5", "List images"),
-                ("6", "Delete image"),
-                ("7", "List volumes"),
-                ("8", "Delete volume"),
-                ("9", "List networks"),
-                ("10", "List storage classes"),
+                ("5", "Dissociate VM from image"),
+                ("6", "List images"),
+                ("7", "Delete image"),
+                ("8", "List volumes"),
+                ("9", "Delete volume"),
+                ("10", "List networks"),
+                ("11", "List storage classes"),
                 ("0", "Back")
             ])
             
@@ -1427,21 +1636,24 @@ class MigrationTool:
                 self.delete_harvester_vm()
                 self.pause()
             elif choice == "5":
-                self.list_harvester_images()
+                self.dissociate_vm_from_image()
                 self.pause()
             elif choice == "6":
-                self.delete_harvester_image()
+                self.list_harvester_images()
                 self.pause()
             elif choice == "7":
-                self.list_harvester_volumes()
+                self.delete_harvester_image()
                 self.pause()
             elif choice == "8":
-                self.delete_harvester_volume()
+                self.list_harvester_volumes()
                 self.pause()
             elif choice == "9":
-                self.list_harvester_networks()
+                self.delete_harvester_volume()
                 self.pause()
             elif choice == "10":
+                self.list_harvester_networks()
+                self.pause()
+            elif choice == "11":
                 self.list_harvester_storage()
                 self.pause()
             elif choice == "0":
