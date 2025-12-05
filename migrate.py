@@ -189,6 +189,45 @@ class MigrationTool:
         print(f"{'='*90}")
         print(f"Total: {len(images)} images")
     
+    def delete_nutanix_image(self):
+        """Delete a Nutanix image (for cleanup after export)."""
+        if not self.nutanix and not self.connect_nutanix():
+            return
+        
+        images = self.nutanix.list_images()
+        
+        if not images:
+            print(colored("❌ No images found", Colors.YELLOW))
+            return
+        
+        print("\nAvailable images:")
+        sorted_images = sorted(images, key=lambda x: x.get('spec', {}).get('name', '').lower())
+        for i, img in enumerate(sorted_images, 1):
+            name = img.get('spec', {}).get('name', 'N/A')
+            size = img.get('status', {}).get('resources', {}).get('size_bytes', 0)
+            print(f"  {i}. {name} ({format_size(size)})")
+        
+        choice = self.input_prompt("Image number to delete")
+        try:
+            idx = int(choice) - 1
+            selected = sorted_images[idx]
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        image_name = selected.get('spec', {}).get('name')
+        image_uuid = selected.get('metadata', {}).get('uuid')
+        
+        confirm = self.input_prompt(f"Delete '{image_name}'? (yes to confirm)")
+        if confirm.lower() == 'yes':
+            try:
+                self.nutanix.delete_image(image_uuid)
+                print(colored(f"✅ Deleted: {image_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"❌ Error: {e}", Colors.RED))
+        else:
+            print("Cancelled")
+    
     # === Harvester Display Methods ===
     
     def list_harvester_vms(self):
@@ -545,6 +584,7 @@ class MigrationTool:
                 ("2", "VM details"),
                 ("3", "Select VM"),
                 ("4", "List images"),
+                ("5", "Delete image (cleanup)"),
                 ("0", "Back")
             ])
             
@@ -561,6 +601,9 @@ class MigrationTool:
                 self.pause()
             elif choice == "4":
                 self.list_nutanix_images()
+                self.pause()
+            elif choice == "5":
+                self.delete_nutanix_image()
                 self.pause()
             elif choice == "0":
                 break

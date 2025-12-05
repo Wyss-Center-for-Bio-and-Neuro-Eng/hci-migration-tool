@@ -93,6 +93,10 @@ class NutanixClient:
         """Return image download URL."""
         return f"https://{self.prism_ip}:9440/api/nutanix/v3/images/{image_uuid}/file"
     
+    def delete_image(self, image_uuid: str) -> dict:
+        """Delete an image."""
+        return self._request("DELETE", f"images/{image_uuid}")
+    
     def download_image(self, image_uuid: str, dest_path: str, 
                        progress_callback=None) -> bool:
         """

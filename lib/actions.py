@@ -162,6 +162,30 @@ class MigrationActions:
         except:
             return False
     
+    def cleanup_nutanix_image(self, image_name: str) -> bool:
+        """
+        Delete a Nutanix image (cleanup after export).
+        
+        Args:
+            image_name: Name of the image to delete
+        
+        Returns:
+            True if successful
+        """
+        if not self.nutanix:
+            raise RuntimeError("Nutanix client not initialized")
+        
+        image = self.nutanix.get_image_by_name(image_name)
+        if not image:
+            return False
+        
+        image_uuid = image.get('metadata', {}).get('uuid')
+        if not image_uuid:
+            return False
+        
+        self.nutanix.delete_image(image_uuid)
+        return True
+    
     # === Export Operations ===
     
     def download_nutanix_image(self, image_uuid: str, filename: str,
