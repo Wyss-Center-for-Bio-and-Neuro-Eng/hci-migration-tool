@@ -121,12 +121,16 @@ class HarvesterClient:
         return self._request("DELETE", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}")
     
     def start_vm(self, name: str, namespace: str = None) -> dict:
-        """Start VM using KubeVirt subresource API."""
+        """Start VM by patching running state."""
         ns = namespace or self.namespace
-        # Use subresource endpoint for starting VM
-        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start"
-        response = requests.put(
+        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}"
+        headers = {'Content-Type': 'application/merge-patch+json'}
+        patch = {"spec": {"running": True}}
+        
+        response = requests.patch(
             url,
+            json=patch,
+            headers=headers,
             cert=self.cert,
             verify=self.verify if self.verify else False
         )
@@ -134,12 +138,16 @@ class HarvesterClient:
         return response.json() if response.text else {}
     
     def stop_vm(self, name: str, namespace: str = None) -> dict:
-        """Stop VM using KubeVirt subresource API."""
+        """Stop VM by patching running state."""
         ns = namespace or self.namespace
-        # Use subresource endpoint for stopping VM
-        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop"
-        response = requests.put(
+        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}"
+        headers = {'Content-Type': 'application/merge-patch+json'}
+        patch = {"spec": {"running": False}}
+        
+        response = requests.patch(
             url,
+            json=patch,
+            headers=headers,
             cert=self.cert,
             verify=self.verify if self.verify else False
         )
