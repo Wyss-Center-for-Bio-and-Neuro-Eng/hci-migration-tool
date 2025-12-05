@@ -898,12 +898,27 @@ class MigrationTool:
         vm_info = None
         source_mac = None
         source_ip = None
+        source_disks = []
         if self._selected_vm and self.nutanix:
             print(f"\n📋 Getting specs from Nutanix VM: {self._selected_vm}")
             vm = self.nutanix.get_vm_by_name(self._selected_vm)
             if vm:
                 vm_info = NutanixClient.parse_vm_info(vm)
                 print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {format_size(vm_info['memory_mb'] * 1024 * 1024)}, Boot: {vm_info['boot_type']}", Colors.GREEN))
+                
+                # Display disk info
+                if vm_info['disks']:
+                    print(colored(f"\n💾 Source Disks ({len(vm_info['disks'])}):", Colors.BOLD))
+                    for i, disk in enumerate(vm_info['disks']):
+                        size_gb = disk['size_bytes'] // (1024**3)
+                        adapter = disk.get('adapter', 'N/A')
+                        index = disk.get('index', i)
+                        print(f"   Disk {i}: {adapter}.{index} - {size_gb} GB")
+                        source_disks.append({
+                            'index': i,
+                            'size_gb': size_gb,
+                            'adapter': adapter
+                        })
                 
                 # Display network info
                 if vm_info['nics']:
@@ -915,10 +930,10 @@ class MigrationTool:
                         print(f"   NIC {i}: {subnet}")
                         print(f"      MAC: {colored(source_mac, Colors.YELLOW)}")
                         print(f"      IP:  {colored(source_ip or 'DHCP/Unknown', Colors.YELLOW)}")
-                    print(colored("\n   ⚠️  Save this info! You may need to reconfigure network in Windows.", Colors.YELLOW))
+                    print(colored("\n   ⚠️  Save this info! You may need to reconfigure network.", Colors.YELLOW))
         
         # VM Name
-        default_name = self._selected_vm or ""
+        default_name = self._selected_vm.split(' - ')[0] if self._selected_vm and ' - ' in self._selected_vm else (self._selected_vm or "")
         vm_name = self.input_prompt(f"VM name [{default_name}]")
         if not vm_name:
             vm_name = default_name
@@ -949,22 +964,46 @@ class MigrationTool:
             print(colored("❌ No active images available", Colors.RED))
             return
         
-        print("\nAvailable images:")
-        for i, img in enumerate(active_images, 1):
-            name = img.get('metadata', {}).get('name', 'N/A')
-            ns = img.get('metadata', {}).get('namespace', 'N/A')
-            size = img.get('status', {}).get('size', 0)
-            print(f"  {i}. {name} ({ns}) - {format_size(size)}")
+        # Determine number of disks
+        num_disks = len(source_disks) if source_disks else 1
+        if not source_disks:
+            num_disks_input = self.input_prompt("Number of disks [1]")
+            num_disks = int(num_disks_input) if num_disks_input else 1
         
-        choice = self.input_prompt("Image number")
-        try:
-            idx = int(choice) - 1
-            selected_image = active_images[idx]
-            image_name = selected_image.get('metadata', {}).get('name')
-            image_ns = selected_image.get('metadata', {}).get('namespace')
-        except:
-            print(colored("Invalid choice", Colors.RED))
-            return
+        print(f"\n💾 Configuring {num_disks} disk(s)...")
+        
+        # Select images for each disk
+        selected_images = []
+        disk_sizes = []
+        
+        for disk_idx in range(num_disks):
+            print(f"\n--- Disk {disk_idx} ---")
+            print("Available images:")
+            for i, img in enumerate(active_images, 1):
+                name = img.get('metadata', {}).get('name', 'N/A')
+                ns = img.get('metadata', {}).get('namespace', 'N/A')
+                size = img.get('status', {}).get('size', 0)
+                print(f"  {i}. {name} ({ns}) - {format_size(size)}")
+            
+            choice = self.input_prompt(f"Image number for disk {disk_idx}")
+            if not choice:
+                print(colored("Cancelled", Colors.YELLOW))
+                return
+            try:
+                idx = int(choice) - 1
+                selected_image = active_images[idx]
+                image_name = selected_image.get('metadata', {}).get('name')
+                image_ns = selected_image.get('metadata', {}).get('namespace')
+                selected_images.append({'name': image_name, 'namespace': image_ns})
+            except:
+                print(colored("Invalid choice", Colors.RED))
+                return
+            
+            # Disk size
+            default_size = source_disks[disk_idx]['size_gb'] if disk_idx < len(source_disks) else 50
+            size_input = self.input_prompt(f"Disk {disk_idx} size in GB [{default_size}]")
+            disk_size = int(size_input) if size_input else default_size
+            disk_sizes.append(disk_size)
         
         # Get available networks
         networks = self.harvester.list_all_networks()
@@ -1020,16 +1059,12 @@ class MigrationTool:
         default_cpu = vm_info['vcpu'] if vm_info else 2
         default_ram = vm_info['memory_mb'] // 1024 if vm_info else 4
         default_boot = vm_info['boot_type'] if vm_info else 'BIOS'
-        default_disk_size = vm_info['disks'][0]['size_bytes'] // (1024**3) if vm_info and vm_info['disks'] else 50
         
         cpu = self.input_prompt(f"CPU cores [{default_cpu}]")
         cpu = int(cpu) if cpu else default_cpu
         
         ram = self.input_prompt(f"RAM in GB [{default_ram}]")
         ram = int(ram) if ram else default_ram
-        
-        disk_size = self.input_prompt(f"Disk size in GB [{default_disk_size}]")
-        disk_size = int(disk_size) if disk_size else default_disk_size
         
         boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
         boot = boot.upper() if boot else default_boot
@@ -1052,15 +1087,18 @@ class MigrationTool:
             disk_bus = default_bus
         
         if disk_bus == "sata":
-            print(colored("   ℹ️  Using SATA for compatibility. After Windows boots:", Colors.CYAN))
-            print(colored("      1. Install virtio drivers: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
+            print(colored("   ℹ️  Using SATA for compatibility. After boot:", Colors.CYAN))
+            print(colored("      1. Install virtio drivers if needed", Colors.CYAN))
             print(colored("      2. Shutdown VM, change disk bus to 'virtio' for better performance", Colors.CYAN))
         
         # Summary
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
         print(f"   Name: {vm_name}")
         print(f"   Namespace: {namespace}")
-        print(f"   Image: {image_name} ({image_ns})")
+        print(f"   Disks: {num_disks}")
+        for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
+            print(f"      Disk {i}: {img['name']} ({img['namespace']}) - {size} GB")
+        print(f"   Disk bus: {disk_bus}")
         print(f"   Network: {network_name}")
         if custom_mac:
             print(f"   MAC: {custom_mac}")
@@ -1071,13 +1109,63 @@ class MigrationTool:
         print(f"   Storage: {storage_class}")
         print(f"   CPU: {cpu} cores")
         print(f"   RAM: {ram} GB")
-        print(f"   Disk: {disk_size} GB (bus: {disk_bus})")
         print(f"   Boot: {boot}")
         
         confirm = self.input_prompt("\nCreate VM? (y/n)")
         if confirm.lower() != 'y':
             print("Cancelled")
             return
+        
+        # Build disks and volumes arrays
+        disks_spec = []
+        volumes_spec = []
+        data_volume_templates = []
+        
+        for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
+            disk_name = f"disk-{i}"
+            
+            # Disk spec
+            disk_spec = {
+                "name": disk_name,
+                "disk": {
+                    "bus": disk_bus
+                }
+            }
+            if i == 0:
+                disk_spec["bootOrder"] = 1
+            disks_spec.append(disk_spec)
+            
+            # Volume spec
+            volumes_spec.append({
+                "name": disk_name,
+                "dataVolume": {
+                    "name": f"{vm_name}-{disk_name}"
+                }
+            })
+            
+            # DataVolumeTemplate
+            data_volume_templates.append({
+                "metadata": {
+                    "name": f"{vm_name}-{disk_name}",
+                    "annotations": {
+                        "harvesterhci.io/imageId": f"{img['namespace']}/{img['name']}"
+                    }
+                },
+                "spec": {
+                    "pvc": {
+                        "accessModes": ["ReadWriteMany"],
+                        "resources": {
+                            "requests": {
+                                "storage": f"{size}Gi"
+                            }
+                        },
+                        "storageClassName": storage_class
+                    },
+                    "source": {
+                        "blank": {}
+                    }
+                }
+            })
         
         # Build manifest
         print("\n🚀 Creating VM...")
@@ -1111,15 +1199,7 @@ class MigrationTool:
                                     "guest": f"{ram}Gi"
                                 },
                                 "devices": {
-                                    "disks": [
-                                        {
-                                            "name": "disk-0",
-                                            "disk": {
-                                                "bus": disk_bus
-                                            },
-                                            "bootOrder": 1
-                                        }
-                                    ],
+                                    "disks": disks_spec,
                                     "interfaces": [
                                         {
                                             "name": "nic-0",
@@ -1139,40 +1219,10 @@ class MigrationTool:
                                     }
                                 }
                             ],
-                            "volumes": [
-                                {
-                                    "name": "disk-0",
-                                    "dataVolume": {
-                                        "name": f"{vm_name}-disk-0"
-                                    }
-                                }
-                            ]
+                            "volumes": volumes_spec
                         }
                     },
-                    "dataVolumeTemplates": [
-                        {
-                            "metadata": {
-                                "name": f"{vm_name}-disk-0",
-                                "annotations": {
-                                    "harvesterhci.io/imageId": f"{image_ns}/{image_name}"
-                                }
-                            },
-                            "spec": {
-                                "pvc": {
-                                    "accessModes": ["ReadWriteMany"],
-                                    "resources": {
-                                        "requests": {
-                                            "storage": f"{disk_size}Gi"
-                                        }
-                                    },
-                                    "storageClassName": storage_class
-                                },
-                                "source": {
-                                    "blank": {}
-                                }
-                            }
-                        }
-                    ]
+                    "dataVolumeTemplates": data_volume_templates
                 }
             }
             
@@ -1199,36 +1249,38 @@ class MigrationTool:
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
             print("   Start it from Harvester UI or wait for disk provisioning")
             
-            # Offer to delete the source image
-            delete_img = self.input_prompt(f"\nDelete source image '{image_name}' from Harvester? (y/n)")
+            # Offer to delete the source images
+            delete_img = self.input_prompt(f"\nDelete source images from Harvester? (y/n)")
             if delete_img.lower() == 'y':
-                try:
-                    self.harvester.delete_image(image_name, image_ns)
-                    print(colored(f"✅ Image deleted: {image_name}", Colors.GREEN))
-                except Exception as e:
-                    print(colored(f"⚠️  Could not delete image: {e}", Colors.YELLOW))
+                for img in selected_images:
+                    try:
+                        self.harvester.delete_image(img['name'], img['namespace'])
+                        print(colored(f"✅ Image deleted: {img['name']}", Colors.GREEN))
+                    except Exception as e:
+                        print(colored(f"⚠️  Could not delete image {img['name']}: {e}", Colors.YELLOW))
             
             # Offer to delete staging files
             delete_staging = self.input_prompt("\nDelete staging files (RAW/QCOW2)? (y/n)")
             if delete_staging.lower() == 'y':
                 self.init_actions()
                 staging_files = self.actions.list_staging_files()
+                vm_base = vm_name.lower().replace('-', '')
                 for f in staging_files:
-                    if f['name'].endswith(('.raw', '.qcow2')) and vm_name.replace('-', '').lower() in f['name'].replace('-', '').lower():
+                    fname_lower = f['name'].lower().replace('-', '')
+                    if f['name'].endswith(('.raw', '.qcow2')) and vm_base in fname_lower:
                         if self.actions.delete_file(f['path']):
                             print(colored(f"✅ Deleted: {f['name']}", Colors.GREEN))
             
             # Remind about Nutanix image cleanup
-            print(colored("\n💡 Don't forget to delete the Nutanix export image (Menu Nutanix → Delete image)", Colors.YELLOW))
+            print(colored("\n💡 Don't forget to delete the Nutanix export images (Menu Nutanix → Delete image)", Colors.YELLOW))
             
             # Remind about virtio drivers if using SATA
             if disk_bus == "sata":
                 print(colored("\n📝 POST-MIGRATION STEPS:", Colors.BOLD))
-                print(colored("   1. Boot VM and verify Windows works", Colors.CYAN))
-                print(colored("   2. Download virtio drivers ISO: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
-                print(colored("   3. Mount ISO in VM, run virtio-win-gt-x64.msi", Colors.CYAN))
-                print(colored("   4. Shutdown VM, edit config: change disk bus from 'sata' to 'virtio'", Colors.CYAN))
-                print(colored("   5. Start VM - now with better disk performance!", Colors.CYAN))
+                print(colored("   1. Boot VM and verify it works", Colors.CYAN))
+                print(colored("   2. For Windows: Install virtio drivers from https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
+                print(colored("   3. Shutdown VM, edit config: change disk bus from 'sata' to 'virtio'", Colors.CYAN))
+                print(colored("   4. Start VM - now with better disk performance!", Colors.CYAN))
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
