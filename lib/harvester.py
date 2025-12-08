@@ -121,16 +121,14 @@ class HarvesterClient:
         return self._request("DELETE", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}")
     
     def start_vm(self, name: str, namespace: str = None) -> dict:
-        """Start VM by patching running state."""
+        """Start VM using KubeVirt subresources API."""
         ns = namespace or self.namespace
-        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}"
-        headers = {'Content-Type': 'application/merge-patch+json'}
-        patch = {"spec": {"running": True}}
+        # Use subresources.kubevirt.io API for start/stop/restart
+        url = f"{self.base_url}/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start"
         
-        response = requests.patch(
+        response = requests.put(
             url,
-            json=patch,
-            headers=headers,
+            json={},  # Empty body for start
             cert=self.cert,
             verify=self.verify if self.verify else False
         )
@@ -138,16 +136,28 @@ class HarvesterClient:
         return response.json() if response.text else {}
     
     def stop_vm(self, name: str, namespace: str = None) -> dict:
-        """Stop VM by patching running state."""
+        """Stop VM using KubeVirt subresources API."""
         ns = namespace or self.namespace
-        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}"
-        headers = {'Content-Type': 'application/merge-patch+json'}
-        patch = {"spec": {"running": False}}
+        # Use subresources.kubevirt.io API for start/stop/restart
+        url = f"{self.base_url}/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop"
         
-        response = requests.patch(
+        response = requests.put(
             url,
-            json=patch,
-            headers=headers,
+            json={},  # Empty body for stop
+            cert=self.cert,
+            verify=self.verify if self.verify else False
+        )
+        response.raise_for_status()
+        return response.json() if response.text else {}
+    
+    def restart_vm(self, name: str, namespace: str = None) -> dict:
+        """Restart VM using KubeVirt subresources API."""
+        ns = namespace or self.namespace
+        url = f"{self.base_url}/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/restart"
+        
+        response = requests.put(
+            url,
+            json={},
             cert=self.cert,
             verify=self.verify if self.verify else False
         )
