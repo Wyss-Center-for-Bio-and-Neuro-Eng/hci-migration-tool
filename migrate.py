@@ -1935,12 +1935,24 @@ class MigrationTool:
             return
         
         # Build disks and volumes arrays
+        import random
+        import string
+        
         disks_spec = []
         volumes_spec = []
-        data_volume_templates = []
+        volume_claim_templates = []
         
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
             disk_name = f"disk-{i}"
+            
+            # Generate random suffix for volume names (like Harvester does)
+            suffix = ''.join(random.choices(string.ascii_lowercase, k=5))
+            
+            # Volume claim name
+            volume_name = f"{vm_name}-disk{i}-{suffix}"
+            
+            # For Harvester, when using an image, we must use the image's storageClass
+            image_storage_class = f"longhorn-{img['name']}"
             
             # Disk spec
             disk_spec = {
@@ -1953,37 +1965,31 @@ class MigrationTool:
                 disk_spec["bootOrder"] = 1
             disks_spec.append(disk_spec)
             
-            # Volume spec
+            # Volume spec - use persistentVolumeClaim (not dataVolume!)
             volumes_spec.append({
                 "name": disk_name,
-                "dataVolume": {
-                    "name": f"{vm_name}-{disk_name}"
+                "persistentVolumeClaim": {
+                    "claimName": volume_name
                 }
             })
             
-            # For Harvester, when using an image, we must use the image's storageClass
-            # The storageClass is automatically created as "longhorn-<image-name>"
-            image_storage_class = f"longhorn-{img['name']}"
-            
-            # DataVolumeTemplate with image reference
-            # Note: No apiVersion/kind needed inside dataVolumeTemplates
-            data_volume_templates.append({
+            # VolumeClaimTemplate for annotation (Harvester-specific format)
+            volume_claim_templates.append({
                 "metadata": {
-                    "name": f"{vm_name}-{disk_name}",
+                    "name": volume_name,
                     "annotations": {
                         "harvesterhci.io/imageId": f"{img['namespace']}/{img['name']}"
                     }
                 },
                 "spec": {
-                    "pvc": {
-                        "accessModes": ["ReadWriteMany"],
-                        "resources": {
-                            "requests": {
-                                "storage": f"{size}Gi"
-                            }
-                        },
-                        "storageClassName": image_storage_class
-                    }
+                    "accessModes": ["ReadWriteMany"],
+                    "resources": {
+                        "requests": {
+                            "storage": f"{size}Gi"
+                        }
+                    },
+                    "volumeMode": "Block",
+                    "storageClassName": image_storage_class
                 }
             })
         
@@ -1994,9 +2000,13 @@ class MigrationTool:
         for i, nic in enumerate(nic_configs):
             nic_name = f"nic-{i}"
             
-            # Interface spec
+            # Interface spec - use e1000 for SATA (compatibility) or virtio
+            # e1000 works without drivers, virtio requires virtio-net driver
+            net_model = "e1000" if disk_bus == "sata" else "virtio"
+            
             iface_spec = {
                 "name": nic_name,
+                "model": net_model,
                 "bridge": {}
             }
             if nic['mac']:
@@ -2018,10 +2028,17 @@ class MigrationTool:
         print(f"   Disks spec: {len(disks_spec)} disk(s)")
         print(f"   Volumes spec: {len(volumes_spec)} volume(s)")
         print(f"   Networks spec: {len(networks_spec)} network(s)")
-        print(f"   DataVolumeTemplates: {len(data_volume_templates)} template(s)")
+        print(f"   VolumeClaimTemplates: {len(volume_claim_templates)} template(s)")
         
-        for i, dvt in enumerate(data_volume_templates):
-            print(f"      DVT {i}: {dvt['metadata']['name']} → {dvt['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')}")
+        for i, vct in enumerate(volume_claim_templates):
+            print(f"      VCT {i}: {vct['metadata']['name']} → {vct['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')}")
+        
+        # Build MAC address annotation
+        mac_annotation = {}
+        for i, nic in enumerate(nic_configs):
+            nic_name = f"nic-{i}"
+            if nic['mac']:
+                mac_annotation[nic_name] = nic['mac']
         
         try:
             manifest = {
@@ -2031,11 +2048,17 @@ class MigrationTool:
                     "name": vm_name,
                     "namespace": namespace,
                     "labels": {
-                        "harvesterhci.io/creator": "harvesterhci"
+                        "harvesterhci.io/creator": "harvesterhci",
+                        "harvesterhci.io/os": "windows"
+                    },
+                    "annotations": {
+                        "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
+                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
+                        "network.harvesterhci.io/ips": "[]"
                     }
                 },
                 "spec": {
-                    "running": False,
+                    "runStrategy": "RerunOnFailure",
                     "template": {
                         "metadata": {
                             "labels": {
@@ -2054,19 +2077,37 @@ class MigrationTool:
                                 },
                                 "devices": {
                                     "disks": disks_spec,
-                                    "interfaces": interfaces_spec
+                                    "interfaces": interfaces_spec,
+                                    "inputs": [
+                                        {"bus": "usb", "name": "tablet", "type": "tablet"}
+                                    ]
+                                },
+                                "features": {
+                                    "acpi": {"enabled": True}
                                 },
                                 "machine": {
                                     "type": "q35"
+                                },
+                                "resources": {
+                                    "limits": {
+                                        "cpu": str(cpu),
+                                        "memory": f"{ram}Gi"
+                                    }
                                 }
                             },
+                            "evictionStrategy": "LiveMigrateIfPossible",
+                            "hostname": vm_name,
                             "networks": networks_spec,
-                            "volumes": volumes_spec
+                            "volumes": volumes_spec,
+                            "terminationGracePeriodSeconds": 120
                         }
-                    },
-                    "dataVolumeTemplates": data_volume_templates
+                    }
                 }
             }
+            
+            # Add MAC address annotation if any
+            if mac_annotation:
+                manifest['metadata']['annotations']['harvesterhci.io/mac-address'] = json.dumps(mac_annotation)
             
             # Add UEFI firmware if needed
             if boot == "UEFI":
@@ -2077,9 +2118,6 @@ class MigrationTool:
                             "persistent": False
                         }
                     }
-                }
-                manifest['spec']['template']['spec']['domain']['machine'] = {
-                    "type": "q35"
                 }
             
             result = self.harvester.create_vm(manifest)
