@@ -945,6 +945,36 @@ class MigrationTool:
                     ratio = (1 - info['actual_size'] / info['virtual_size']) * 100
                     print(f"   Sparse savings: {ratio:.1f}%")
     
+    def _convert_single_file(self, raw_path: str):
+        """Convert a single RAW file to QCOW2."""
+        self.init_actions()
+        
+        if not os.path.exists(raw_path):
+            print(colored(f"   ❌ File not found: {raw_path}", Colors.RED))
+            return False
+        
+        filename = os.path.basename(raw_path)
+        size = os.path.getsize(raw_path)
+        print(f"\n🔄 Converting: {filename} ({format_size(size)})")
+        
+        def progress(pct):
+            print(f"\r   Progress: {pct:.1f}%", end='', flush=True)
+        
+        result = self.actions.convert_raw_to_qcow2(raw_path, compress=True, progress_callback=progress)
+        print()  # New line after progress
+        
+        if result['success']:
+            print(colored(f"   ✅ Done: {format_size(result['size_before'])} → {format_size(result['size_after'])} ({result['reduction_pct']:.1f}% reduction)", Colors.GREEN))
+            
+            delete = self.input_prompt("   Delete RAW file? (y/n) [y]")
+            if delete.lower() != 'n':
+                if self.actions.delete_file(raw_path):
+                    print(colored("   ✅ RAW file deleted", Colors.GREEN))
+            return True
+        else:
+            print(colored(f"   ❌ Error: {result['error']}", Colors.RED))
+            return False
+    
     def convert_disk(self):
         self.init_actions()
         
@@ -1028,15 +1058,200 @@ class MigrationTool:
             print("Cancelled")
     
     def export_vm(self):
+        """Export VM disks from Nutanix to staging."""
         if not self._selected_vm:
             print(colored("❌ No VM selected. Use 'Select VM' first.", Colors.RED))
             return
         
-        print(colored(f"\n🚧 Export of '{self._selected_vm}' - Under development", Colors.YELLOW))
-        print("\nPlanned steps:")
-        print("  1. Create images from VM disks (via acli)")
-        print("  2. Download images to staging")
-        print("  3. Convert to QCOW2 sparse")
+        if not self.nutanix:
+            self.connect_nutanix()
+            if not self.nutanix:
+                return
+        
+        print(colored(f"\n📤 Export VM: {self._selected_vm}", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        # Get VM details
+        vm = self.nutanix.get_vm_by_name(self._selected_vm)
+        if not vm:
+            print(colored(f"❌ VM not found: {self._selected_vm}", Colors.RED))
+            return
+        
+        vm_info = NutanixClient.parse_vm_info(vm)
+        vm_uuid = vm.get('metadata', {}).get('uuid')
+        
+        # Check power state
+        power_state = vm.get('status', {}).get('resources', {}).get('power_state', 'UNKNOWN')
+        if power_state != 'OFF':
+            print(colored(f"⚠️  VM is {power_state}. It's recommended to power off before export.", Colors.YELLOW))
+            proceed = self.input_prompt("Continue anyway? (y/n)")
+            if proceed.lower() != 'y':
+                return
+        
+        # Get disk list
+        disks = vm_info.get('disks', [])
+        if not disks:
+            print(colored("❌ No disks found on VM", Colors.RED))
+            return
+        
+        print(colored(f"\n💾 Found {len(disks)} disk(s):", Colors.BOLD))
+        for i, disk in enumerate(disks):
+            size_gb = disk['size_bytes'] // (1024**3)
+            print(f"   Disk {i}: {disk.get('adapter', 'N/A')}.{disk.get('index', i)} - {size_gb} GB")
+            print(f"      UUID: {disk.get('uuid', 'N/A')}")
+        
+        # Select disks to export
+        export_all = self.input_prompt(f"\nExport all {len(disks)} disk(s)? (y/n) [y]")
+        if export_all.lower() == 'n':
+            disk_nums = self.input_prompt("Enter disk numbers to export (comma-separated, e.g., 0,1)")
+            try:
+                selected_indices = [int(x.strip()) for x in disk_nums.split(',')]
+                disks_to_export = [disks[i] for i in selected_indices]
+            except:
+                print(colored("Invalid input", Colors.RED))
+                return
+        else:
+            disks_to_export = disks
+        
+        # Staging directory
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        vm_name_clean = self._selected_vm.lower().replace(' ', '-').replace('/', '-')
+        
+        print(colored(f"\n🚀 Starting export to {staging_dir}", Colors.CYAN))
+        print(colored("   This may take a while depending on disk size...\n", Colors.CYAN))
+        
+        created_images = []
+        
+        for i, disk in enumerate(disks_to_export):
+            disk_uuid = disk.get('uuid')
+            if not disk_uuid:
+                print(colored(f"   ⚠️  Disk {i} has no UUID, skipping", Colors.YELLOW))
+                continue
+            
+            image_name = f"{vm_name_clean}-disk{i}-export"
+            disk_idx = disk.get('index', i)
+            size_gb = disk['size_bytes'] // (1024**3)
+            
+            print(colored(f"   📀 Disk {i} ({size_gb} GB):", Colors.BOLD))
+            
+            # Check if image already exists
+            existing = self.nutanix.get_image_by_name(image_name)
+            if existing:
+                print(f"      Image '{image_name}' already exists")
+                reuse = self.input_prompt("      Use existing image? (y/n) [y]")
+                if reuse.lower() != 'n':
+                    image_uuid = existing.get('metadata', {}).get('uuid')
+                    created_images.append({
+                        'name': image_name,
+                        'uuid': image_uuid,
+                        'disk_index': disk_idx,
+                        'size_gb': size_gb
+                    })
+                    continue
+                else:
+                    # Delete and recreate
+                    print("      Deleting existing image...")
+                    self.nutanix.delete_image(existing.get('metadata', {}).get('uuid'))
+                    import time
+                    time.sleep(5)
+            
+            # Create image from disk
+            print(f"      Creating image from disk...")
+            try:
+                result = self.nutanix.create_image_from_disk(
+                    image_name=image_name,
+                    vmdisk_uuid=disk_uuid,
+                    description=f"Migration export of {self._selected_vm} disk {disk_idx}"
+                )
+                image_uuid = result.get('metadata', {}).get('uuid')
+                print(f"      Image UUID: {image_uuid}")
+            except Exception as e:
+                print(colored(f"      ❌ Failed to create image: {e}", Colors.RED))
+                continue
+            
+            # Wait for image to be ready
+            print(f"      Waiting for image to be ready...")
+            
+            def progress_cb(state, pct):
+                print(f"\r      State: {state} ({pct}%)   ", end='', flush=True)
+            
+            ready = self.nutanix.wait_for_image_ready(
+                image_uuid, 
+                timeout=7200,  # 2 hours max
+                progress_callback=progress_cb
+            )
+            print()  # New line after progress
+            
+            if not ready:
+                print(colored(f"      ❌ Image creation failed or timed out", Colors.RED))
+                continue
+            
+            print(colored(f"      ✅ Image ready", Colors.GREEN))
+            created_images.append({
+                'name': image_name,
+                'uuid': image_uuid,
+                'disk_index': disk_idx,
+                'size_gb': size_gb
+            })
+        
+        if not created_images:
+            print(colored("\n❌ No images created", Colors.RED))
+            return
+        
+        # Download images
+        print(colored(f"\n📥 Downloading {len(created_images)} image(s)...", Colors.BOLD))
+        
+        downloaded_files = []
+        
+        for img in created_images:
+            dest_file = os.path.join(staging_dir, f"{vm_name_clean}-disk{img['disk_index']}.raw")
+            print(f"\n   Downloading {img['name']} → {dest_file}")
+            print(f"   Size: ~{img['size_gb']} GB")
+            
+            if os.path.exists(dest_file):
+                overwrite = self.input_prompt(f"   File exists. Overwrite? (y/n)")
+                if overwrite.lower() != 'y':
+                    downloaded_files.append(dest_file)
+                    continue
+            
+            def download_progress(downloaded, total):
+                if total > 0:
+                    pct = (downloaded / total) * 100
+                    dl_gb = downloaded / (1024**3)
+                    total_gb = total / (1024**3)
+                    print(f"\r   Progress: {pct:.1f}% ({dl_gb:.2f} / {total_gb:.2f} GB)   ", end='', flush=True)
+            
+            try:
+                self.nutanix.download_image(
+                    img['uuid'],
+                    dest_file,
+                    progress_callback=download_progress
+                )
+                print()  # New line
+                print(colored(f"   ✅ Downloaded: {dest_file}", Colors.GREEN))
+                downloaded_files.append(dest_file)
+            except Exception as e:
+                print()
+                print(colored(f"   ❌ Download failed: {e}", Colors.RED))
+        
+        # Summary
+        print(colored(f"\n✅ Export complete!", Colors.GREEN))
+        print(f"   Files in staging: {len(downloaded_files)}")
+        for f in downloaded_files:
+            size = os.path.getsize(f) if os.path.exists(f) else 0
+            print(f"      {f} ({size // (1024**3)} GB)")
+        
+        # Offer to convert to QCOW2
+        if downloaded_files:
+            convert = self.input_prompt("\nConvert to QCOW2 now? (y/n) [y]")
+            if convert.lower() != 'n':
+                for raw_file in downloaded_files:
+                    self._convert_single_file(raw_file)
+        
+        # Cleanup reminder
+        print(colored("\n💡 TIP: After successful migration, delete the Nutanix export images:", Colors.YELLOW))
+        for img in created_images:
+            print(f"      - {img['name']} ({img['uuid']})")
     
     def import_to_harvester(self):
         self.init_actions()

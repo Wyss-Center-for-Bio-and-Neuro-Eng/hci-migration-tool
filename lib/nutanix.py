@@ -117,6 +117,77 @@ class NutanixClient:
         """Delete an image."""
         return self._request("DELETE", f"images/{image_uuid}")
     
+    def create_image_from_disk(self, image_name: str, vmdisk_uuid: str, 
+                                description: str = "") -> dict:
+        """
+        Create an image from a VM disk.
+        
+        Args:
+            image_name: Name for the new image
+            vmdisk_uuid: UUID of the VM disk to clone
+            description: Optional description
+        
+        Returns:
+            Created image entity
+        """
+        payload = {
+            "spec": {
+                "name": image_name,
+                "description": description or f"Migration export of {image_name}",
+                "resources": {
+                    "image_type": "DISK_IMAGE",
+                    "data_source_reference": {
+                        "kind": "vm_disk",
+                        "uuid": vmdisk_uuid
+                    }
+                }
+            },
+            "metadata": {
+                "kind": "image"
+            }
+        }
+        return self._request("POST", "images", payload)
+    
+    def wait_for_image_ready(self, image_uuid: str, timeout: int = 3600, 
+                              progress_callback=None) -> bool:
+        """
+        Wait for image to be ready (COMPLETE state).
+        
+        Args:
+            image_uuid: UUID of the image
+            timeout: Max wait time in seconds (default 1 hour)
+            progress_callback: Optional callback(state, progress_pct)
+        
+        Returns:
+            True if image is ready, False if timeout or error
+        """
+        import time
+        start = time.time()
+        
+        while time.time() - start < timeout:
+            try:
+                image = self.get_image(image_uuid)
+                state = image.get('status', {}).get('state', 'PENDING')
+                
+                # Try to get progress percentage
+                progress = image.get('status', {}).get('resources', {}).get(
+                    'retrieval_uri_list', [{}])[0].get('progress_percentage', 0)
+                
+                if progress_callback:
+                    progress_callback(state, progress)
+                
+                if state == 'COMPLETE':
+                    return True
+                elif state in ('ERROR', 'FAILED'):
+                    return False
+                
+                time.sleep(10)  # Check every 10 seconds
+                
+            except Exception as e:
+                time.sleep(10)
+        
+        return False  # Timeout
+
     def download_image(self, image_uuid: str, dest_path: str, 
                        progress_callback=None) -> bool:
         """
