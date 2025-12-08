@@ -167,21 +167,41 @@ class NutanixClient:
         while time.time() - start < timeout:
             try:
                 image = self.get_image(image_uuid)
-                state = image.get('status', {}).get('state', 'PENDING')
                 
-                # Try to get progress percentage
-                progress = image.get('status', {}).get('resources', {}).get(
-                    'retrieval_uri_list', [{}])[0].get('progress_percentage', 0)
+                # State can be in different locations depending on API version
+                state = image.get('status', {}).get('state', '')
+                if not state:
+                    state = image.get('state', '')
+                if not state:
+                    # Check execution_context for task state
+                    state = image.get('status', {}).get('execution_context', {}).get('task_status', '')
+                
+                # Normalize state to uppercase for comparison
+                state = state.upper() if state else 'PENDING'
+                
+                # Try to get progress percentage from various locations
+                progress = 0
+                resources = image.get('status', {}).get('resources', {})
+                if 'retrieval_uri_list' in resources:
+                    uri_list = resources.get('retrieval_uri_list', [{}])
+                    if uri_list:
+                        progress = uri_list[0].get('progress_percentage', 0)
+                
+                # Check size_bytes as indicator of completion
+                size_bytes = resources.get('size_bytes', 0)
+                if size_bytes > 0 and state in ('COMPLETE', 'SUCCEEDED', 'AVAILABLE'):
+                    progress = 100
                 
                 if progress_callback:
                     progress_callback(state, progress)
                 
-                if state == 'COMPLETE':
+                # Check for completion - handle various state names
+                if state in ('COMPLETE', 'SUCCEEDED', 'AVAILABLE', 'ACTIVE'):
                     return True
-                elif state in ('ERROR', 'FAILED'):
+                elif state in ('ERROR', 'FAILED', 'FAILURE'):
                     return False
                 
-                time.sleep(10)  # Check every 10 seconds
+                time.sleep(5)  # Check every 5 seconds
                 
             except Exception as e:
                 time.sleep(10)
