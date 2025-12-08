@@ -82,6 +82,16 @@ class HarvesterClient:
             cert=self.cert,
             verify=self.verify if self.verify else False
         )
+        
+        if not response.ok:
+            # Try to get detailed error message
+            try:
+                error_detail = response.json()
+                error_msg = error_detail.get('message', response.text)
+                print(f"API Error: {error_msg}")
+            except:
+                print(f"API Error: {response.text}")
+        
         response.raise_for_status()
         return response.json() if response.text else {}
     

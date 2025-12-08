@@ -1966,9 +1966,8 @@ class MigrationTool:
             image_storage_class = f"longhorn-{img['name']}"
             
             # DataVolumeTemplate with image reference
+            # Note: No apiVersion/kind needed inside dataVolumeTemplates
             data_volume_templates.append({
-                "apiVersion": "cdi.kubevirt.io/v1beta1",
-                "kind": "DataVolume",
                 "metadata": {
                     "name": f"{vm_name}-{disk_name}",
                     "annotations": {
@@ -1985,7 +1984,6 @@ class MigrationTool:
                         },
                         "storageClassName": image_storage_class
                     }
-                    # No source specified - Harvester uses the imageId annotation to clone from image
                 }
             })
         
