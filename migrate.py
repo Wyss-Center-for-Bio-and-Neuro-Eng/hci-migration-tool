@@ -1519,12 +1519,103 @@ class MigrationTool:
         if not self.harvester and not self.connect_harvester():
             return
         
-        # Get Nutanix VM specs if selected
+        print(colored("\n🖥️  Create VM in Harvester", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        # Get available images first
+        images = self.harvester.list_all_images()
+        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100]
+        
+        if not active_images:
+            print(colored("❌ No active images available. Import images first.", Colors.RED))
+            return
+        
+        # Detect VM names from images (e.g., "wlchgvaopefs1-disk0" → "wlchgvaopefs1")
+        detected_vms = {}
+        for img in active_images:
+            name = img.get('metadata', {}).get('name', '')
+            if '-disk' in name:
+                vm_base = name.rsplit('-disk', 1)[0]
+                if vm_base not in detected_vms:
+                    detected_vms[vm_base] = []
+                detected_vms[vm_base].append(img)
+        
+        # Look for saved VM configs
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        migrations_dir = os.path.join(staging_dir, 'migrations')
+        
+        # If no VM selected, try to auto-detect from saved configs
         vm_info = None
         source_mac = None
         source_ip = None
         source_disks = []
-        if self._selected_vm and self.nutanix:
+        loaded_config = None
+        
+        if not self._selected_vm:
+            # Show detected VMs with their configs
+            if detected_vms:
+                print(colored("\n🔍 Detected VMs from imported images:", Colors.BOLD))
+                detected_list = list(detected_vms.keys())
+                for i, vm_base in enumerate(detected_list, 1):
+                    disk_count = len(detected_vms[vm_base])
+                    config_path = os.path.join(migrations_dir, vm_base.lower(), 'vm-config.json')
+                    has_config = os.path.exists(config_path)
+                    status = colored("✓ config found", Colors.GREEN) if has_config else colored("○ no config", Colors.YELLOW)
+                    print(f"   {i}. {vm_base} ({disk_count} disk(s)) {status}")
+                print(f"   0. Enter manually")
+                
+                choice = self.input_prompt("\nSelect VM [1]")
+                try:
+                    idx = int(choice) - 1 if choice else 0
+                    if idx >= 0 and idx < len(detected_list):
+                        self._selected_vm = detected_list[idx]
+                except:
+                    pass
+        
+        # Load vm-config.json if available
+        if self._selected_vm:
+            config_path = os.path.join(migrations_dir, self._selected_vm.lower(), 'vm-config.json')
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path) as f:
+                        loaded_config = json.load(f)
+                    print(colored(f"\n✅ Loaded saved config: {config_path}", Colors.GREEN))
+                    
+                    # Build vm_info from loaded config
+                    vm_info = {
+                        'vcpu': loaded_config.get('cpu_cores', 2),
+                        'memory_mb': loaded_config.get('memory_mb', 4096),
+                        'boot_type': loaded_config.get('boot_type', 'BIOS'),
+                        'disks': [],
+                        'nics': []
+                    }
+                    
+                    # Extract disk info
+                    for disk in loaded_config.get('disks', []):
+                        size_gb = disk.get('size_bytes', 0) // (1024**3)
+                        vm_info['disks'].append({
+                            'size_bytes': disk.get('size_bytes', 0),
+                            'adapter': disk.get('controller_type', 'SCSI'),
+                            'index': disk.get('index', 0)
+                        })
+                        source_disks.append({
+                            'index': disk.get('index', 0),
+                            'size_gb': size_gb,
+                            'adapter': disk.get('controller_type', 'SCSI')
+                        })
+                    
+                    # Extract network info
+                    for nic in loaded_config.get('network_interfaces', []):
+                        vm_info['nics'].append(nic)
+                    
+                    print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}", Colors.GREEN))
+                    print(f"   Disks: {len(source_disks)}, NICs: {len(vm_info['nics'])}")
+                    
+                except Exception as e:
+                    print(colored(f"   ⚠️  Error loading config: {e}", Colors.YELLOW))
+        
+        # Fallback: Get Nutanix VM specs if connected
+        if not vm_info and self._selected_vm and self.nutanix:
             print(f"\n📋 Getting specs from Nutanix VM: {self._selected_vm}")
             vm = self.nutanix.get_vm_by_name(self._selected_vm)
             if vm:
@@ -1596,20 +1687,48 @@ class MigrationTool:
         
         print(f"\n💾 Configuring {num_disks} disk(s)...")
         
+        # Auto-detect images matching VM name
+        vm_images = []
+        if vm_name:
+            # Find images matching pattern: vmname-disk0, vmname-disk1, etc.
+            for disk_idx in range(num_disks):
+                expected_name = f"{vm_name.lower()}-disk{disk_idx}"
+                for img in active_images:
+                    img_name = img.get('metadata', {}).get('name', '').lower()
+                    if img_name == expected_name:
+                        vm_images.append(img)
+                        break
+        
         # Select images for each disk
         selected_images = []
         disk_sizes = []
         
         for disk_idx in range(num_disks):
             print(f"\n--- Disk {disk_idx} ---")
+            
+            # Check if we have an auto-detected image
+            auto_image = None
+            auto_image_idx = None
+            if disk_idx < len(vm_images):
+                auto_image = vm_images[disk_idx]
+                # Find its index in active_images
+                for i, img in enumerate(active_images):
+                    if img.get('metadata', {}).get('name') == auto_image.get('metadata', {}).get('name'):
+                        auto_image_idx = i + 1
+                        break
+            
             print("Available images:")
             for i, img in enumerate(active_images, 1):
                 name = img.get('metadata', {}).get('name', 'N/A')
                 ns = img.get('metadata', {}).get('namespace', 'N/A')
                 size = img.get('status', {}).get('size', 0)
-                print(f"  {i}. {name} ({ns}) - {format_size(size)}")
+                marker = colored(" ← auto-detected", Colors.GREEN) if auto_image and name == auto_image.get('metadata', {}).get('name') else ""
+                print(f"  {i}. {name} ({ns}) - {format_size(size)}{marker}")
             
-            choice = self.input_prompt(f"Image number for disk {disk_idx}")
+            default_choice = str(auto_image_idx) if auto_image_idx else ""
+            choice = self.input_prompt(f"Image number for disk {disk_idx} [{default_choice}]")
+            if not choice:
+                choice = default_choice
             if not choice:
                 print(colored("Cancelled", Colors.YELLOW))
                 return
@@ -1619,6 +1738,7 @@ class MigrationTool:
                 image_name = selected_image.get('metadata', {}).get('name')
                 image_ns = selected_image.get('metadata', {}).get('namespace')
                 selected_images.append({'name': image_name, 'namespace': image_ns})
+                print(colored(f"   ✓ Selected: {image_name}", Colors.GREEN))
             except:
                 print(colored("Invalid choice", Colors.RED))
                 return
