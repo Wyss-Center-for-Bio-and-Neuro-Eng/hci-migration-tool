@@ -1,0 +1,50 @@
+# Nutanix to Harvester Migration Tool Configuration
+# =================================================
+
+nutanix:
+  prism_ip: "10.16.22.46"
+  username: "admin"
+  password: "your_password_here"
+
+harvester:
+  api_url: "https://10.16.16.130:6443"
+  token: "your_token_here"
+  # Optional: path to kubeconfig file (alternative to token)
+  # kubeconfig: "~/.kube/harvester.yaml"
+  namespace: "harvester-public"
+  verify_ssl: false
+
+ceph:
+  mon_ip: "10.16.16.140"
+  # Optional: Ceph credentials if needed
+  # user: "admin"
+  # keyring: "/etc/ceph/ceph.client.admin.keyring"
+
+transfer:
+  staging_mount: "/mnt/data"
+  # SSH access to staging server (if remote)
+  # staging_host: "10.16.16.140"
+  # staging_user: "root"
+  convert_to_qcow2: true
+  compress: true
+
+# Windows Remote Management Settings
+windows:
+  # Active Directory domain
+  domain: "AD.WYSSCENTER.CH"
+  
+  # Use Kerberos authentication (requires kinit)
+  use_kerberos: true
+  
+  # Vault backend for credential storage
+  # Options: "pass" (password-store), "keyring", "env", "prompt"
+  vault_backend: "pass"
+  vault_path: "migration/windows"
+  
+  # WinRM settings
+  winrm_port: 5985       # HTTP
+  winrm_port_ssl: 5986   # HTTPS
+  winrm_transport: "kerberos"  # kerberos, ntlm, or basic
+  
+  # Pre-migration tools (will be downloaded if not present)
+  tools_dir: "/mnt/data/tools"

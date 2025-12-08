@@ -9,12 +9,18 @@ import os
 import sys
 import yaml
 import argparse
+import json
 
 # Add lib to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib import Colors, colored, format_size, format_timestamp
 from lib import NutanixClient, HarvesterClient, MigrationActions
+from lib.vault import Vault, VaultError, get_kerberos_auth, kinit
+from lib.windows import (
+    WinRMClient, WindowsPreCheck, WindowsPostConfig, VMConfig,
+    download_virtio_tools, check_winrm_available, WINRM_AVAILABLE
+)
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -32,6 +38,16 @@ class MigrationTool:
         self.harvester = None
         self.actions = None
         self._selected_vm = None
+        
+        # Initialize vault for credentials
+        windows_config = self.config.get('windows', {})
+        vault_backend = windows_config.get('vault_backend', 'prompt')
+        vault_path = windows_config.get('vault_path', 'migration/windows')
+        try:
+            self.vault = Vault(backend=vault_backend, vault_path=vault_path)
+        except VaultError:
+            # Fallback to prompt if vault not configured
+            self.vault = Vault(backend='prompt', vault_path=vault_path)
     
     def clear_screen(self):
         os.system('clear' if os.name == 'posix' else 'cls')
@@ -1707,6 +1723,455 @@ class MigrationTool:
             elif choice == "0":
                 break
     
+    # === Windows Tools Menu ===
+    
+    def menu_windows(self):
+        """Windows tools menu."""
+        while True:
+            self.print_header()
+            self.print_menu("WINDOWS TOOLS", [
+                ("1", "Check WinRM/Prerequisites"),
+                ("2", "Pre-migration check (collect config)"),
+                ("3", "View VM config"),
+                ("4", "Download virtio/qemu-ga tools"),
+                ("5", "Generate post-migration script"),
+                ("6", "Vault management"),
+                ("0", "Back")
+            ])
+            
+            choice = self.input_prompt()
+            
+            if choice == "1":
+                self.check_winrm_prereqs()
+                self.pause()
+            elif choice == "2":
+                self.windows_precheck()
+                self.pause()
+            elif choice == "3":
+                self.view_vm_config()
+                self.pause()
+            elif choice == "4":
+                self.download_tools()
+                self.pause()
+            elif choice == "5":
+                self.generate_postmig_script()
+                self.pause()
+            elif choice == "6":
+                self.menu_vault()
+            elif choice == "0":
+                break
+    
+    def check_winrm_prereqs(self):
+        """Check WinRM prerequisites."""
+        print(colored("\n🔍 Checking Windows Remote Management Prerequisites", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        # Check pywinrm
+        available, msg = check_winrm_available()
+        if available:
+            print(colored(f"   ✅ {msg}", Colors.GREEN))
+        else:
+            print(colored(f"   ❌ {msg}", Colors.RED))
+            return
+        
+        # Check Kerberos
+        print("\n   Checking Kerberos...")
+        if get_kerberos_auth():
+            print(colored("   ✅ Valid Kerberos ticket found", Colors.GREEN))
+        else:
+            print(colored("   ⚠️  No valid Kerberos ticket", Colors.YELLOW))
+            print("      Run: kinit your_user@AD.WYSSCENTER.CH")
+        
+        # Check vault
+        print("\n   Checking Vault...")
+        try:
+            creds = self.vault.list_credentials()
+            if creds:
+                print(colored(f"   ✅ Vault configured with {len(creds)} credential(s)", Colors.GREEN))
+                for c in creds:
+                    print(f"      - {c}")
+            else:
+                print(colored("   ⚠️  Vault empty or not configured", Colors.YELLOW))
+        except VaultError as e:
+            print(colored(f"   ⚠️  Vault not configured: {e}", Colors.YELLOW))
+        
+        # Check tools directory
+        print("\n   Checking tools...")
+        tools_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data') + '/tools'
+        if os.path.exists(tools_dir):
+            tools = os.listdir(tools_dir)
+            if tools:
+                print(colored(f"   ✅ Tools directory: {tools_dir}", Colors.GREEN))
+                for t in tools:
+                    size = os.path.getsize(os.path.join(tools_dir, t)) / (1024*1024)
+                    print(f"      - {t} ({size:.1f} MB)")
+            else:
+                print(colored(f"   ⚠️  Tools directory empty: {tools_dir}", Colors.YELLOW))
+        else:
+            print(colored(f"   ⚠️  Tools directory not found: {tools_dir}", Colors.YELLOW))
+            print("      Run 'Download virtio/qemu-ga tools' to populate")
+    
+    def windows_precheck(self):
+        """Run pre-migration check on Windows VM."""
+        print(colored("\n🔍 Windows Pre-Migration Check", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        if not WINRM_AVAILABLE:
+            print(colored("❌ pywinrm not installed. Run: pip install pywinrm[kerberos]", Colors.RED))
+            return
+        
+        # Get target host
+        if self._selected_vm:
+            print(f"   Selected VM: {self._selected_vm}")
+        
+        host = self.input_prompt("Windows hostname or IP")
+        if not host:
+            return
+        
+        # Determine authentication method
+        windows_config = self.config.get('windows', {})
+        use_kerberos = windows_config.get('use_kerberos', True)
+        
+        username = None
+        password = None
+        transport = "kerberos"
+        
+        if use_kerberos and get_kerberos_auth():
+            print(colored("   Using Kerberos authentication", Colors.GREEN))
+            transport = "kerberos"
+        else:
+            print("   Using NTLM authentication")
+            transport = "ntlm"
+            try:
+                username, password = self.vault.get_credential("local-admin")
+                print(f"   Username: {username}")
+            except VaultError:
+                username = self.input_prompt("Username [Administrator]") or "Administrator"
+                import getpass
+                password = getpass.getpass("Password: ")
+        
+        # Connect
+        print(f"\n   Connecting to {host}...")
+        try:
+            client = WinRMClient(
+                host=host,
+                username=username,
+                password=password,
+                transport=transport
+            )
+            
+            if not client.test_connection():
+                print(colored("❌ Connection failed", Colors.RED))
+                return
+            
+            print(colored("   ✅ Connected!", Colors.GREEN))
+            
+            # Run pre-check
+            print("\n   Running pre-migration checks...")
+            checker = WindowsPreCheck(client)
+            config = checker.run_full_check()
+            
+            # Display results
+            print(colored("\n📋 SYSTEM INFORMATION", Colors.BOLD))
+            print(f"   Hostname: {config.hostname}")
+            print(f"   OS: {config.os_name}")
+            print(f"   Version: {config.os_version}")
+            print(f"   Architecture: {config.architecture}")
+            print(f"   Domain: {config.domain}")
+            print(f"   Domain Joined: {config.domain_joined}")
+            
+            print(colored("\n🌐 NETWORK CONFIGURATION", Colors.BOLD))
+            for nic in config.network_interfaces:
+                print(f"   Interface: {nic.name}")
+                print(f"      MAC: {nic.mac}")
+                print(f"      DHCP: {nic.dhcp}")
+                if not nic.dhcp:
+                    print(f"      IP: {nic.ip}/{nic.prefix}")
+                    print(f"      Gateway: {nic.gateway}")
+                    print(f"      DNS: {', '.join(nic.dns or [])}")
+            
+            print(colored("\n💾 STORAGE", Colors.BOLD))
+            for disk in config.disks:
+                print(f"   Disk {disk.number}: {disk.size_gb} GB")
+                for part in disk.partitions:
+                    letter = part.get('Letter', '?')
+                    label = part.get('Label', '')
+                    size = part.get('SizeGB', 0)
+                    print(f"      {letter}: {label} ({size} GB)")
+            
+            print(colored("\n🔧 AGENTS STATUS", Colors.BOLD))
+            agents = config.agents
+            print(f"   NGT Installed: {'✅' if agents.ngt_installed else '❌'} {agents.ngt_version or ''}")
+            print(f"   VirtIO (Nutanix): {'✅' if agents.virtio_nutanix else '❌'}")
+            print(f"   VirtIO (Fedora): {'✅' if agents.virtio_fedora else '❌'}")
+            print(f"   QEMU Guest Agent: {'✅' if agents.qemu_guest_agent else '❌'}")
+            
+            print(colored("\n⚙️  SERVICES", Colors.BOLD))
+            print(f"   WinRM: {'✅' if config.winrm_enabled else '❌'}")
+            print(f"   RDP: {'✅' if config.rdp_enabled else '❌'}")
+            
+            # Migration readiness
+            print(colored("\n📊 MIGRATION READINESS", Colors.BOLD))
+            if config.migration_ready:
+                print(colored("   ✅ VM is ready for migration!", Colors.GREEN))
+            else:
+                print(colored("   ⚠️  Missing prerequisites:", Colors.YELLOW))
+                for prereq in config.missing_prerequisites:
+                    print(f"      - {prereq}")
+            
+            # Save config
+            staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+            vm_dir = os.path.join(staging_dir, 'migrations', config.hostname.lower())
+            os.makedirs(vm_dir, exist_ok=True)
+            config_path = os.path.join(vm_dir, 'vm-config.json')
+            config.save(config_path)
+            print(colored(f"\n   💾 Configuration saved: {config_path}", Colors.GREEN))
+            
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def view_vm_config(self):
+        """View saved VM configuration."""
+        print(colored("\n📋 View VM Configuration", Colors.BOLD))
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        migrations_dir = os.path.join(staging_dir, 'migrations')
+        
+        if not os.path.exists(migrations_dir):
+            print(colored("❌ No migrations directory found", Colors.YELLOW))
+            return
+        
+        # List available configs
+        configs = []
+        for vm_dir in os.listdir(migrations_dir):
+            config_path = os.path.join(migrations_dir, vm_dir, 'vm-config.json')
+            if os.path.exists(config_path):
+                configs.append((vm_dir, config_path))
+        
+        if not configs:
+            print(colored("❌ No VM configurations found", Colors.YELLOW))
+            return
+        
+        print("\nAvailable configurations:")
+        for i, (name, path) in enumerate(configs, 1):
+            mtime = os.path.getmtime(path)
+            from datetime import datetime
+            mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+            print(f"  {i}. {name} (saved: {mtime_str})")
+        
+        choice = self.input_prompt("Config number to view")
+        if not choice:
+            return
+        
+        try:
+            idx = int(choice) - 1
+            name, path = configs[idx]
+            
+            with open(path, 'r') as f:
+                data = json.load(f)
+            
+            print(colored(f"\n--- {name} ---", Colors.BOLD))
+            print(json.dumps(data, indent=2))
+            
+        except (ValueError, IndexError):
+            print(colored("Invalid choice", Colors.RED))
+    
+    def download_tools(self):
+        """Download virtio-win and QEMU guest agent tools."""
+        print(colored("\n⬇️  Download VirtIO and QEMU Guest Agent Tools", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        tools_dir = os.path.join(staging_dir, 'tools')
+        
+        print(f"\n   Destination: {tools_dir}")
+        print("\n   Files to download:")
+        print("   - virtio-win.iso (~500 MB)")
+        print("   - virtio-win-gt-x64.msi (~15 MB)")
+        print("   - qemu-ga-x86_64.msi (~2 MB)")
+        
+        confirm = self.input_prompt("\nStart download? (y/n)")
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            return
+        
+        print("\n")
+        downloaded = download_virtio_tools(tools_dir, verbose=True)
+        
+        print(colored(f"\n✅ Downloaded {len(downloaded)} file(s) to {tools_dir}", Colors.GREEN))
+    
+    def generate_postmig_script(self):
+        """Generate post-migration PowerShell script."""
+        print(colored("\n📜 Generate Post-Migration Script", Colors.BOLD))
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        migrations_dir = os.path.join(staging_dir, 'migrations')
+        
+        if not os.path.exists(migrations_dir):
+            print(colored("❌ No migrations directory found", Colors.YELLOW))
+            return
+        
+        # List available configs
+        configs = []
+        for vm_dir in os.listdir(migrations_dir):
+            config_path = os.path.join(migrations_dir, vm_dir, 'vm-config.json')
+            if os.path.exists(config_path):
+                configs.append((vm_dir, config_path))
+        
+        if not configs:
+            print(colored("❌ No VM configurations found. Run pre-migration check first.", Colors.YELLOW))
+            return
+        
+        print("\nAvailable configurations:")
+        for i, (name, path) in enumerate(configs, 1):
+            print(f"  {i}. {name}")
+        
+        choice = self.input_prompt("Config number")
+        if not choice:
+            return
+        
+        try:
+            idx = int(choice) - 1
+            name, config_path = configs[idx]
+            
+            # Load config
+            vm_config = VMConfig.load(config_path)
+            
+            # Generate script
+            post_config = WindowsPostConfig(None)  # No client needed for script generation
+            script = post_config.generate_reconfig_script(vm_config)
+            
+            # Save script
+            script_path = os.path.join(os.path.dirname(config_path), 'reconfigure-network.ps1')
+            with open(script_path, 'w') as f:
+                f.write(script)
+            
+            print(colored(f"\n✅ Script generated: {script_path}", Colors.GREEN))
+            print("\n--- Script Preview ---")
+            print(script[:1000])
+            if len(script) > 1000:
+                print("...")
+            
+        except (ValueError, IndexError):
+            print(colored("Invalid choice", Colors.RED))
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def menu_vault(self):
+        """Vault management submenu."""
+        while True:
+            self.print_header()
+            self.print_menu("VAULT MANAGEMENT", [
+                ("1", "List credentials"),
+                ("2", "Add credential"),
+                ("3", "Test credential"),
+                ("4", "Check Kerberos ticket"),
+                ("5", "Get Kerberos ticket (kinit)"),
+                ("0", "Back")
+            ])
+            
+            choice = self.input_prompt()
+            
+            if choice == "1":
+                self._vault_list()
+                self.pause()
+            elif choice == "2":
+                self._vault_add()
+                self.pause()
+            elif choice == "3":
+                self._vault_test()
+                self.pause()
+            elif choice == "4":
+                self._kerberos_check()
+                self.pause()
+            elif choice == "5":
+                self._kerberos_kinit()
+                self.pause()
+            elif choice == "0":
+                break
+    
+    def _vault_list(self):
+        """List vault credentials."""
+        print(colored("\n🔐 Vault Credentials", Colors.BOLD))
+        try:
+            creds = self.vault.list_credentials()
+            if creds:
+                for c in creds:
+                    print(f"   - {c}")
+            else:
+                print("   No credentials stored")
+        except VaultError as e:
+            print(colored(f"   Error: {e}", Colors.RED))
+    
+    def _vault_add(self):
+        """Add credential to vault."""
+        print(colored("\n🔐 Add Credential", Colors.BOLD))
+        
+        name = self.input_prompt("Credential name (e.g., local-admin)")
+        if not name:
+            return
+        
+        username = self.input_prompt("Username")
+        if not username:
+            return
+        
+        import getpass
+        password = getpass.getpass("Password: ")
+        if not password:
+            return
+        
+        try:
+            self.vault.set_credential(name, username, password)
+            print(colored(f"✅ Credential '{name}' saved", Colors.GREEN))
+        except VaultError as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def _vault_test(self):
+        """Test credential retrieval."""
+        print(colored("\n🔐 Test Credential", Colors.BOLD))
+        
+        name = self.input_prompt("Credential name to test")
+        if not name:
+            return
+        
+        try:
+            username, password = self.vault.get_credential(name)
+            print(colored(f"✅ Retrieved: {username} / {'*' * len(password)}", Colors.GREEN))
+        except VaultError as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def _kerberos_check(self):
+        """Check Kerberos ticket status."""
+        print(colored("\n🎫 Kerberos Ticket Status", Colors.BOLD))
+        
+        import subprocess
+        result = subprocess.run(["klist"], capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(colored("✅ Valid Kerberos tickets:", Colors.GREEN))
+            print(result.stdout)
+        else:
+            print(colored("❌ No valid Kerberos tickets", Colors.YELLOW))
+            print("   Run: kinit user@AD.WYSSCENTER.CH")
+    
+    def _kerberos_kinit(self):
+        """Get Kerberos ticket."""
+        print(colored("\n🎫 Get Kerberos Ticket", Colors.BOLD))
+        
+        principal = self.input_prompt("Principal (e.g., adm_user@AD.WYSSCENTER.CH)")
+        if not principal:
+            return
+        
+        import getpass
+        password = getpass.getpass("Password: ")
+        
+        if kinit(principal, password):
+            print(colored("✅ Kerberos ticket obtained", Colors.GREEN))
+            import subprocess
+            subprocess.run(["klist"])
+        else:
+            print(colored("❌ Failed to get Kerberos ticket", Colors.RED))
+    
     def menu_config(self):
         self.print_header()
         print(colored("\n⚙️  CURRENT CONFIGURATION", Colors.BOLD))
@@ -1741,7 +2206,8 @@ class MigrationTool:
                 ("1", "Nutanix"),
                 ("2", "Harvester"),
                 ("3", "Migration"),
-                ("4", "Configuration"),
+                ("4", "Windows Tools"),
+                ("5", "Configuration"),
                 ("q", "Quit")
             ])
             
@@ -1754,6 +2220,8 @@ class MigrationTool:
             elif choice == "3":
                 self.menu_migration()
             elif choice == "4":
+                self.menu_windows()
+            elif choice == "5":
                 self.menu_config()
             elif choice.lower() == "q":
                 print(colored("\nGoodbye! 👋", Colors.CYAN))
