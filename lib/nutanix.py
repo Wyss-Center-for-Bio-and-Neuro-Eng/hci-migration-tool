@@ -163,48 +163,54 @@ class NutanixClient:
         """
         import time
         start = time.time()
+        first_check = True
         
         while time.time() - start < timeout:
             try:
                 image = self.get_image(image_uuid)
+                status = image.get('status', {})
+                resources = status.get('resources', {})
                 
-                # State can be in different locations depending on API version
-                state = image.get('status', {}).get('state', '')
-                if not state:
-                    state = image.get('state', '')
-                if not state:
-                    # Check execution_context for task state
-                    state = image.get('status', {}).get('execution_context', {}).get('task_status', '')
+                # Debug on first check
+                if first_check:
+                    first_check = False
+                    print(f"\n      [DEBUG] API response status.state = '{status.get('state')}'")
+                    print(f"      [DEBUG] status.resources.size_bytes = {resources.get('size_bytes', 'N/A')}")
                 
-                # Normalize state to uppercase for comparison
-                state = state.upper() if state else 'PENDING'
+                # PRIMARY CHECK: If size_bytes > 0, image is ready
+                # This is the most reliable indicator for Prism Element
+                size_bytes = resources.get('size_bytes', 0)
+                if size_bytes and size_bytes > 0:
+                    if progress_callback:
+                        progress_callback('COMPLETE', 100)
+                    return True
                 
-                # Try to get progress percentage from various locations
+                # SECONDARY CHECK: state field
+                state = status.get('state', '') or ''
+                state = state.upper()
+                
+                # Progress estimation
                 progress = 0
-                resources = image.get('status', {}).get('resources', {})
                 if 'retrieval_uri_list' in resources:
                     uri_list = resources.get('retrieval_uri_list', [{}])
                     if uri_list:
                         progress = uri_list[0].get('progress_percentage', 0)
                 
-                # Check size_bytes as indicator of completion
-                size_bytes = resources.get('size_bytes', 0)
-                if size_bytes > 0 and state in ('COMPLETE', 'SUCCEEDED', 'AVAILABLE'):
-                    progress = 100
-                
                 if progress_callback:
-                    progress_callback(state, progress)
+                    progress_callback(state or 'PENDING', progress)
                 
-                # Check for completion - handle various state names
+                # Check state-based completion
                 if state in ('COMPLETE', 'SUCCEEDED', 'AVAILABLE', 'ACTIVE'):
                     return True
                 elif state in ('ERROR', 'FAILED', 'FAILURE'):
                     return False
                 
-                time.sleep(5)  # Check every 5 seconds
+                time.sleep(5)
                 
             except Exception as e:
-                time.sleep(10)
+                if first_check:
+                    print(f"\n      [DEBUG] Exception: {e}")
+                time.sleep(5)
         
         return False  # Timeout
 
