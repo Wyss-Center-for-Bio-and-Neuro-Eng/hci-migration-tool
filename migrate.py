@@ -1214,14 +1214,29 @@ class MigrationTool:
                     downloaded_files.append(dest_file)
                     continue
             
+            last_print_pct = -10  # Track last printed percentage
+            last_print_gb = -1   # Track last printed GB
+            
             def download_progress(downloaded, total):
+                nonlocal last_print_pct, last_print_gb
+                dl_gb = downloaded / (1024**3)
+                
                 if total > 0:
                     pct = (downloaded / total) * 100
-                    dl_gb = downloaded / (1024**3)
                     total_gb = total / (1024**3)
-                    print(f"\r   Progress: {pct:.1f}% ({dl_gb:.2f} / {total_gb:.2f} GB)   ", end='', flush=True)
+                    # Print every 5% or every 1GB
+                    if pct - last_print_pct >= 5 or int(dl_gb) > last_print_gb:
+                        print(f"   Progress: {pct:.1f}% ({dl_gb:.1f} / {total_gb:.1f} GB)")
+                        last_print_pct = pct
+                        last_print_gb = int(dl_gb)
+                else:
+                    # No total size - print every 1GB
+                    if int(dl_gb) > last_print_gb:
+                        print(f"   Downloaded: {dl_gb:.1f} GB")
+                        last_print_gb = int(dl_gb)
             
             try:
+                print(f"   Starting download...")
                 self.nutanix.download_image(
                     img['uuid'],
                     dest_file,

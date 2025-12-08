@@ -163,7 +163,6 @@ class NutanixClient:
         """
         import time
         start = time.time()
-        first_check = True
         
         while time.time() - start < timeout:
             try:
@@ -171,14 +170,7 @@ class NutanixClient:
                 status = image.get('status', {})
                 resources = status.get('resources', {})
                 
-                # Debug on first check
-                if first_check:
-                    first_check = False
-                    print(f"\n      [DEBUG] API response status.state = '{status.get('state')}'")
-                    print(f"      [DEBUG] status.resources.size_bytes = {resources.get('size_bytes', 'N/A')}")
-                
                 # PRIMARY CHECK: If size_bytes > 0, image is ready
-                # This is the most reliable indicator for Prism Element
                 size_bytes = resources.get('size_bytes', 0)
                 if size_bytes and size_bytes > 0:
                     if progress_callback:
@@ -208,8 +200,6 @@ class NutanixClient:
                 time.sleep(5)
                 
             except Exception as e:
-                if first_check:
-                    print(f"\n      [DEBUG] Exception: {e}")
                 time.sleep(5)
         
         return False  # Timeout
