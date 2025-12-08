@@ -1967,6 +1967,8 @@ class MigrationTool:
             
             # DataVolumeTemplate with image reference
             data_volume_templates.append({
+                "apiVersion": "cdi.kubevirt.io/v1beta1",
+                "kind": "DataVolume",
                 "metadata": {
                     "name": f"{vm_name}-{disk_name}",
                     "annotations": {
@@ -1982,10 +1984,8 @@ class MigrationTool:
                             }
                         },
                         "storageClassName": image_storage_class
-                    },
-                    "source": {
-                        "blank": {}
                     }
+                    # No source specified - Harvester uses the imageId annotation to clone from image
                 }
             })
         
@@ -2015,6 +2015,16 @@ class MigrationTool:
         
         # Build manifest
         print("\n🚀 Creating VM...")
+        
+        # Debug: show what we're creating
+        print(f"   Disks spec: {len(disks_spec)} disk(s)")
+        print(f"   Volumes spec: {len(volumes_spec)} volume(s)")
+        print(f"   Networks spec: {len(networks_spec)} network(s)")
+        print(f"   DataVolumeTemplates: {len(data_volume_templates)} template(s)")
+        
+        for i, dvt in enumerate(data_volume_templates):
+            print(f"      DVT {i}: {dvt['metadata']['name']} → {dvt['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')}")
+        
         try:
             manifest = {
                 "apiVersion": "kubevirt.io/v1",
@@ -2084,19 +2094,20 @@ class MigrationTool:
             print(colored("   via Harvester UI: Volumes → Select volume → Dissociate Image", Colors.CYAN))
             
             # Remind about Nutanix image cleanup
-            print(colored("\n💡 Don't forget to delete the Nutanix export images (Menu Nutanix → Delete image)", Colors.YELLOW))
-            print(colored("   And the Harvester images (Menu Harvester → Delete image)", Colors.YELLOW))
+            print(colored("\n💡 Don't forget to delete the Nutanix export images after VM is working", Colors.YELLOW))
             
-            # Remind about virtio drivers if using SATA
-            if disk_bus == "sata":
-                print(colored("\n📝 POST-MIGRATION STEPS:", Colors.BOLD))
-                print(colored("   1. Boot VM and verify it works", Colors.CYAN))
-                print(colored("   2. For Windows: Install virtio drivers from https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
-                print(colored("   3. Shutdown VM, edit config: change disk bus from 'sata' to 'virtio'", Colors.CYAN))
-                print(colored("   4. Start VM - now with better disk performance!", Colors.CYAN))
+            # Save manifest for debug
+            staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+            manifest_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-manifest.json')
+            os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2)
+            print(colored(f"   📄 Manifest saved: {manifest_path}", Colors.CYAN))
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
+            import traceback
+            traceback.print_exc()
     
     def _auto_dissociate_volumes(self, vm_name: str, namespace: str, data_volume_templates: list):
         """
