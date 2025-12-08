@@ -1332,9 +1332,20 @@ class MigrationTool:
         """Import image via HTTP server method."""
         import time
         
+        # Get HTTP server IP from config if specified
+        transfer_config = self.config.get('transfer', {})
+        http_server_ip = transfer_config.get('http_server_ip', None)
+        
         print(f"\n🚀 Starting HTTP server...")
-        http_url = self.actions.start_http_server(8080)
+        http_url = self.actions.start_http_server(8080, bind_ip=http_server_ip)
         print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
+        
+        # Verify the URL is reachable from Harvester perspective
+        if "127.0" in http_url:
+            print(colored("⚠️  Warning: URL contains localhost address!", Colors.YELLOW))
+            print(colored("   Harvester cannot reach this. Add to config.yaml:", Colors.YELLOW))
+            print(colored("   transfer:", Colors.YELLOW))
+            print(colored("     http_server_ip: 10.16.16.167  # Your Debian IP", Colors.YELLOW))
         
         print(f"\n📤 Creating image in Harvester ({namespace})...")
         try:

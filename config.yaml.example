@@ -27,6 +27,9 @@ transfer:
   # staging_user: "root"
   convert_to_qcow2: true
   compress: true
+  # HTTP server IP for Harvester image import
+  # If not set, auto-detect. Set this if auto-detect fails.
+  http_server_ip: "10.16.16.167"
 
 # Windows Remote Management Settings
 windows:

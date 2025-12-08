@@ -303,12 +303,13 @@ class MigrationActions:
     
     # === HTTP Server for Image Serving ===
     
-    def start_http_server(self, port: int = 8080) -> str:
+    def start_http_server(self, port: int = 8080, bind_ip: str = None) -> str:
         """
         Start HTTP server to serve images.
         
         Args:
             port: Port to listen on
+            bind_ip: Optional IP to bind to (if None, auto-detect)
         
         Returns:
             Base URL for serving files
@@ -329,13 +330,61 @@ class MigrationActions:
         self._http_thread.daemon = True
         self._http_thread.start()
         
-        # Get local IP
+        # Get local IP - use a reliable method that gets the actual network IP
         import socket
-        hostname = socket.gethostname()
-        try:
-            local_ip = socket.gethostbyname(hostname)
-        except:
+        import subprocess
+        local_ip = bind_ip
+        
+        # Method 1: Connect to external host to determine local IP (most reliable)
+        if not local_ip:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(2)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                pass
+        
+        # Method 2: Parse ip route to get default interface IP
+        if not local_ip or local_ip.startswith("127."):
+            try:
+                result = subprocess.run(
+                    ["ip", "route", "get", "1.1.1.1"],
+                    capture_output=True, text=True, timeout=5
+                )
+                # Output: "1.1.1.1 via X.X.X.X dev ethX src 10.16.16.167 uid 0"
+                for part in result.stdout.split():
+                    if part.startswith("10.") or part.startswith("192.168.") or part.startswith("172."):
+                        # Check if it looks like an IP
+                        parts = part.split(".")
+                        if len(parts) == 4:
+                            local_ip = part
+                            break
+            except:
+                pass
+        
+        # Method 3: Get first non-localhost IP from hostname -I
+        if not local_ip or local_ip.startswith("127."):
+            try:
+                result = subprocess.run(
+                    ["hostname", "-I"],
+                    capture_output=True, text=True, timeout=5
+                )
+                ips = result.stdout.strip().split()
+                for ip in ips:
+                    if not ip.startswith("127.") and ":" not in ip:  # Skip localhost and IPv6
+                        local_ip = ip
+                        break
+            except:
+                pass
+        
+        # Method 4: Last resort fallback
+        if not local_ip or local_ip.startswith("127."):
             local_ip = "127.0.0.1"
+            print(colored("⚠️  Warning: Could not detect network IP. Using localhost.", "yellow"))
+            print(colored("   Harvester may not be able to reach this server.", "yellow"))
+            print(colored("   Try specifying IP manually in config.yaml (http_server_ip)", "yellow"))
         
         return f"http://{local_ip}:{port}"
     
