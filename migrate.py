@@ -1582,6 +1582,7 @@ class MigrationTool:
                     print(colored(f"\n✅ Loaded saved config: {config_path}", Colors.GREEN))
                     
                     # Build vm_info from loaded config
+                    # The vm-config.json format uses nested structure: storage.disks, network.interfaces
                     vm_info = {
                         'vcpu': loaded_config.get('cpu_cores', 2),
                         'memory_mb': loaded_config.get('memory_mb', 4096),
@@ -1590,8 +1591,9 @@ class MigrationTool:
                         'nics': []
                     }
                     
-                    # Extract disk info
-                    for disk in loaded_config.get('disks', []):
+                    # Extract disk info from storage.disks
+                    storage_disks = loaded_config.get('storage', {}).get('disks', [])
+                    for disk in storage_disks:
                         size_gb = disk.get('size_bytes', 0) // (1024**3)
                         vm_info['disks'].append({
                             'size_bytes': disk.get('size_bytes', 0),
@@ -1604,8 +1606,9 @@ class MigrationTool:
                             'adapter': disk.get('controller_type', 'SCSI')
                         })
                     
-                    # Extract network info
-                    for nic in loaded_config.get('network_interfaces', []):
+                    # Extract network info from network.interfaces
+                    network_interfaces = loaded_config.get('network', {}).get('interfaces', [])
+                    for nic in network_interfaces:
                         vm_info['nics'].append(nic)
                     
                     print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}", Colors.GREEN))
