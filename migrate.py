@@ -1957,6 +1957,33 @@ class MigrationTool:
                 print(colored("   ⚠️  Missing prerequisites:", Colors.YELLOW))
                 for prereq in config.missing_prerequisites:
                     print(f"      - {prereq}")
+                
+                # Offer to install missing prerequisites
+                install = self.input_prompt("\n   Install missing prerequisites now? (y/n)")
+                if install.lower() == 'y':
+                    self._install_windows_prerequisites(client, config, host)
+                    
+                    # Re-check after installation
+                    print("\n   🔄 Re-checking agents...")
+                    new_agents = checker.collect_agent_status()
+                    config.agents.virtio_fedora = new_agents.get('VirtIOFedora', False)
+                    config.agents.qemu_guest_agent = new_agents.get('QEMUGuestAgent', False)
+                    
+                    # Update missing prerequisites
+                    config.missing_prerequisites = []
+                    if not config.agents.virtio_fedora:
+                        config.missing_prerequisites.append("virtio_fedora")
+                    if not config.agents.qemu_guest_agent:
+                        config.missing_prerequisites.append("qemu_guest_agent")
+                    
+                    config.migration_ready = len(config.missing_prerequisites) == 0
+                    
+                    if config.migration_ready:
+                        print(colored("\n   ✅ VM is now ready for migration!", Colors.GREEN))
+                    else:
+                        print(colored("\n   ⚠️  Some prerequisites still missing (may need reboot):", Colors.YELLOW))
+                        for prereq in config.missing_prerequisites:
+                            print(f"      - {prereq}")
             
             # Save config
             staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
@@ -1968,6 +1995,162 @@ class MigrationTool:
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def _install_windows_prerequisites(self, client, config, host):
+        """Install missing prerequisites on Windows VM via WinRM."""
+        self.init_actions()
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        tools_dir = os.path.join(staging_dir, 'tools')
+        
+        # Check what needs to be installed
+        install_qemu_ga = not config.agents.qemu_guest_agent
+        install_virtio = not config.agents.virtio_fedora
+        
+        # Verify tools exist
+        qemu_ga_msi = os.path.join(tools_dir, 'qemu-ga-x86_64.msi')
+        virtio_msi = os.path.join(tools_dir, 'virtio-win-gt-x64.msi')
+        
+        if install_qemu_ga and not os.path.exists(qemu_ga_msi):
+            print(colored(f"   ❌ QEMU GA MSI not found: {qemu_ga_msi}", Colors.RED))
+            print(colored("      Run 'Download virtio/qemu-ga tools' first", Colors.YELLOW))
+            return
+        
+        if install_virtio and not os.path.exists(virtio_msi):
+            print(colored(f"   ❌ VirtIO MSI not found: {virtio_msi}", Colors.RED))
+            print(colored("      Run 'Download virtio/qemu-ga tools' first", Colors.YELLOW))
+            return
+        
+        # Start HTTP server to serve MSI files
+        print(colored("\n   🚀 Starting HTTP server for file transfer...", Colors.CYAN))
+        
+        # Get local IP that the Windows server can reach
+        import socket
+        try:
+            # Get the IP by creating a connection to the target
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Resolve the target hostname
+            try:
+                target_ip = socket.gethostbyname(host)
+            except:
+                # If full FQDN fails, try short name
+                target_ip = socket.gethostbyname(host.split('.')[0])
+            s.connect((target_ip, 5985))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception as e:
+            # Fallback - ask user
+            print(colored(f"   ⚠️  Could not auto-detect local IP: {e}", Colors.YELLOW))
+            local_ip = self.input_prompt("   Enter this machine's IP (reachable from Windows)")
+            if not local_ip:
+                print(colored("   ❌ Cancelled", Colors.RED))
+                return
+        
+        http_port = 8888
+        http_url = f"http://{local_ip}:{http_port}"
+        
+        print(f"   Local IP: {local_ip}")
+        
+        # Start HTTP server in tools directory
+        import threading
+        import http.server
+        import socketserver
+        
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=tools_dir, **kwargs)
+            def log_message(self, format, *args):
+                pass  # Suppress logging
+        
+        httpd = socketserver.TCPServer(("", http_port), QuietHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        
+        print(colored(f"   ✅ HTTP server running at {http_url}", Colors.GREEN))
+        
+        try:
+            # Install QEMU Guest Agent
+            if install_qemu_ga:
+                print(colored("\n   📦 Installing QEMU Guest Agent...", Colors.CYAN))
+                
+                ps_script = f'''
+$ErrorActionPreference = "Stop"
+$msiUrl = "{http_url}/qemu-ga-x86_64.msi"
+$msiPath = "$env:TEMP\\qemu-ga-x86_64.msi"
+
+# Download MSI
+Write-Host "Downloading QEMU Guest Agent..."
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+
+# Install silently
+Write-Host "Installing QEMU Guest Agent..."
+$process = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru -NoNewWindow
+if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
+    Write-Host "QEMU Guest Agent installed successfully"
+    # Start the service
+    Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+    Start-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue
+}} else {{
+    Write-Host "Installation failed with exit code: $($process.ExitCode)"
+}}
+
+# Cleanup
+Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
+'''
+                stdout, stderr, rc = client.run_powershell(ps_script)
+                if rc == 0:
+                    print(colored("   ✅ QEMU Guest Agent installed", Colors.GREEN))
+                    if stdout.strip():
+                        for line in stdout.strip().split('\n'):
+                            print(f"      {line}")
+                else:
+                    print(colored(f"   ❌ Installation failed (exit code: {rc})", Colors.RED))
+                    if stderr.strip():
+                        print(f"      {stderr.strip()}")
+            
+            # Install VirtIO drivers
+            if install_virtio:
+                print(colored("\n   📦 Installing VirtIO drivers...", Colors.CYAN))
+                
+                ps_script = f'''
+$ErrorActionPreference = "Stop"
+$msiUrl = "{http_url}/virtio-win-gt-x64.msi"
+$msiPath = "$env:TEMP\\virtio-win-gt-x64.msi"
+
+# Download MSI
+Write-Host "Downloading VirtIO drivers..."
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+
+# Install silently
+Write-Host "Installing VirtIO drivers..."
+$process = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru -NoNewWindow
+if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
+    Write-Host "VirtIO drivers installed successfully"
+}} else {{
+    Write-Host "Installation failed with exit code: $($process.ExitCode)"
+}}
+
+# Cleanup
+Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
+'''
+                stdout, stderr, rc = client.run_powershell(ps_script)
+                if rc == 0:
+                    print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                    if stdout.strip():
+                        for line in stdout.strip().split('\n'):
+                            print(f"      {line}")
+                else:
+                    print(colored(f"   ❌ Installation failed (exit code: {rc})", Colors.RED))
+                    if stderr.strip():
+                        print(f"      {stderr.strip()}")
+        
+        finally:
+            # Stop HTTP server
+            httpd.shutdown()
+            print(colored("\n   ✅ HTTP server stopped", Colors.GREEN))
     
     def view_vm_config(self):
         """View saved VM configuration."""
