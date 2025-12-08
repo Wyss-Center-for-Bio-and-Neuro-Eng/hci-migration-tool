@@ -408,3 +408,49 @@ MIT License - Wyss Center for Bio and Neuro Engineering
 ## Contributors
 
 - Infrastructure Team @ Wyss Center
+
+## Known Issues & Future Improvements
+
+### NFS Direct Access (To Investigate)
+
+**Goal:** Mount Nutanix container directly via NFS for faster vDisk export (~500+ MB/s vs 107 MB/s HTTP)
+
+**Current Status:** NOT WORKING
+
+**Configuration Done:**
+- Filesystem whitelist: Added Debian IP (10.16.16.167/255.255.255.255)
+- Container whitelist: Inherited from filesystem
+- Sophos XGS firewall: Rules created for NFS (TCP/UDP 111, 2049, 20048)
+- CVM iptables: Rules exist for 10.16.16.167 on port 2049 (CUSTOM chain)
+
+**Test Results:**
+- Ping to CVM: ✅ OK
+- SSH (22) to CVM: ✅ OK  
+- API (9440) to CVM: ✅ OK
+- NFS (2049) to CVM: ❌ Connection timeout
+- Port 111 (portmapper): ✅ OK
+- Port 20048 (mountd): ❌ Connection timeout
+
+**CVM IPs:**
+- nxchgvaimgt1: 10.16.22.81
+- nxchgvaimgt2: 10.16.22.82
+- nxchgvaimgt3: 10.16.22.83
+
+**iptables on CVM shows:**
+```
+ACCEPT tcp -- eth0 * 10.16.16.167 0.0.0.0/0 tcp dpt:2049
+```
+But packet counter stays at 0 - packets not reaching CVM despite firewall logs showing "Allowed"
+
+**Possible Causes:**
+1. Sophos XGS Application Control or IPS blocking NFS protocol
+2. NAT issue between VLANs (Debian: 10.16.16.x, CVMs: 10.16.22.x)
+3. Nutanix NFS only exposed on internal interface (eth1/eth2), not external (eth0)
+
+**Workaround:** Use HTTP API download (working at ~107 MB/s)
+
+**Future Investigation:**
+- Check Sophos IPS/Application Control settings
+- Test with Debian on same VLAN as CVMs (no firewall)
+- Contact Nutanix support about NFS external access requirements
+- Consider SCP via SSH (requires key management)

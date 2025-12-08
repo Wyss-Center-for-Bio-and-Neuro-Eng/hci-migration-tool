@@ -1882,14 +1882,13 @@ class MigrationTool:
             
             result = self.harvester.create_vm(manifest)
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
-            print("   Start it from Harvester UI or wait for disk provisioning")
             
-            # Info about dissociate feature
-            print(colored("\n💡 TIP: After VM is running, use 'Dissociate VM from image' (Menu Harvester → Option 5)", Colors.CYAN))
-            print(colored("   to clone volumes and remove image dependency for easier cleanup.", Colors.CYAN))
+            # Auto-dissociate volumes from images
+            self._auto_dissociate_volumes(vm_name, namespace, data_volume_templates)
             
             # Remind about Nutanix image cleanup
             print(colored("\n💡 Don't forget to delete the Nutanix export images (Menu Nutanix → Delete image)", Colors.YELLOW))
+            print(colored("   And the Harvester images (Menu Harvester → Delete image)", Colors.YELLOW))
             
             # Remind about virtio drivers if using SATA
             if disk_bus == "sata":
@@ -1901,6 +1900,119 @@ class MigrationTool:
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def _auto_dissociate_volumes(self, vm_name: str, namespace: str, data_volume_templates: list):
+        """
+        Automatically dissociate VM volumes from images after creation.
+        This clones the volumes to remove the backing image dependency.
+        """
+        import time
+        
+        if not data_volume_templates:
+            return
+        
+        print(colored("\n🔗 Auto-dissociating volumes from images...", Colors.BOLD))
+        
+        # Step 1: Wait for DataVolumes to be provisioned (PVCs created and Bound)
+        print("   ⏳ Waiting for volumes to be provisioned...")
+        volume_names = [dvt.get('metadata', {}).get('name') for dvt in data_volume_templates]
+        
+        max_wait = 300  # 5 minutes max
+        wait_interval = 5
+        elapsed = 0
+        
+        while elapsed < max_wait:
+            all_bound = True
+            for vol_name in volume_names:
+                try:
+                    pvc = self.harvester.get_pvc(vol_name, namespace)
+                    phase = pvc.get('status', {}).get('phase', '')
+                    if phase != 'Bound':
+                        all_bound = False
+                        break
+                except Exception:
+                    all_bound = False
+                    break
+            
+            if all_bound:
+                print(colored("   ✅ All volumes provisioned!", Colors.GREEN))
+                break
+            
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+            print(f"   ... waiting ({elapsed}s)", end='\r')
+        else:
+            print(colored(f"\n   ⚠️  Timeout waiting for volumes. Skipping auto-dissociate.", Colors.YELLOW))
+            print(colored("   Use 'Dissociate VM from image' (Menu Harvester → Option 5) manually.", Colors.YELLOW))
+            return
+        
+        # Step 2: Clone each volume to standalone version
+        print("\n   🔄 Cloning volumes to standalone...")
+        cloned_volumes = []
+        
+        for vol_name in volume_names:
+            new_name = f"{vol_name}-standalone"
+            try:
+                self.harvester.clone_pvc(vol_name, new_name, namespace)
+                print(colored(f"      ✅ Cloned: {vol_name} → {new_name}", Colors.GREEN))
+                cloned_volumes.append({
+                    'old': vol_name,
+                    'new': new_name
+                })
+            except Exception as e:
+                print(colored(f"      ❌ Clone failed for {vol_name}: {e}", Colors.RED))
+                print(colored("   Use 'Dissociate VM from image' manually after fixing.", Colors.YELLOW))
+                return
+        
+        # Step 3: Wait for clones to be Bound
+        print("\n   ⏳ Waiting for clones to be ready...")
+        elapsed = 0
+        while elapsed < max_wait:
+            all_ready = True
+            for vol in cloned_volumes:
+                try:
+                    pvc = self.harvester.get_pvc(vol['new'], namespace)
+                    phase = pvc.get('status', {}).get('phase', '')
+                    if phase != 'Bound':
+                        all_ready = False
+                        break
+                except Exception:
+                    all_ready = False
+                    break
+            
+            if all_ready:
+                print(colored("   ✅ All clones ready!", Colors.GREEN))
+                break
+            
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+            print(f"   ... waiting ({elapsed}s)", end='\r')
+        else:
+            print(colored(f"\n   ⚠️  Timeout waiting for clones.", Colors.YELLOW))
+            return
+        
+        # Step 4: Update VM to use cloned volumes
+        print("\n   🔧 Updating VM to use standalone volumes...")
+        try:
+            for vol in cloned_volumes:
+                self.harvester.update_vm_volume(vm_name, vol['old'], vol['new'], namespace)
+            print(colored("   ✅ VM updated to use standalone volumes", Colors.GREEN))
+        except Exception as e:
+            print(colored(f"   ❌ Error updating VM: {e}", Colors.RED))
+            print(colored("   You may need to update the VM manually in Harvester UI", Colors.YELLOW))
+            return
+        
+        # Step 5: Delete old image-linked volumes
+        print("\n   🗑️  Cleaning up old volumes...")
+        for vol in cloned_volumes:
+            try:
+                self.harvester.delete_pvc(vol['old'], namespace)
+                print(colored(f"      ✅ Deleted: {vol['old']}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"      ⚠️  Could not delete {vol['old']}: {e}", Colors.YELLOW))
+        
+        print(colored("\n✅ VM volumes are now independent from images!", Colors.GREEN))
+        print(colored("   VM is ready to start. Images can be safely deleted.", Colors.CYAN))
     
     # === Menus ===
     
