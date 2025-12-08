@@ -1824,14 +1824,36 @@ class MigrationTool:
         if self._selected_vm:
             print(f"   Selected VM: {self._selected_vm}")
         
-        host = self.input_prompt("Windows hostname or IP")
+        windows_config = self.config.get('windows', {})
+        domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
+        use_kerberos = windows_config.get('use_kerberos', True)
+        
+        print(colored("   ℹ️  Use FQDN for Kerberos (e.g., servername.ad.wysscenter.ch)", Colors.CYAN))
+        host = self.input_prompt("Windows hostname (FQDN)")
         if not host:
             return
         
-        # Determine authentication method
-        windows_config = self.config.get('windows', {})
-        use_kerberos = windows_config.get('use_kerberos', True)
+        # Check if IP address was provided
+        import re
+        is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host))
         
+        if is_ip and use_kerberos:
+            print(colored("\n   ⚠️  IP address detected but Kerberos requires hostname (FQDN)", Colors.YELLOW))
+            print(colored("   Kerberos uses Service Principal Names based on DNS names, not IPs.", Colors.YELLOW))
+            host = self.input_prompt(f"Enter FQDN (e.g., servername.{domain})")
+            if not host:
+                return
+            is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host))
+            if is_ip:
+                print(colored("❌ FQDN required for Kerberos authentication", Colors.RED))
+                return
+        
+        # Add domain suffix if not present (for short hostnames)
+        if not is_ip and '.' not in host:
+            host = f"{host}.{domain}"
+            print(colored(f"   → Using FQDN: {host}", Colors.CYAN))
+        
+        # Determine authentication method
         username = None
         password = None
         transport = "kerberos"
@@ -1862,6 +1884,11 @@ class MigrationTool:
             
             if not client.test_connection():
                 print(colored("❌ Connection failed", Colors.RED))
+                if transport == "kerberos":
+                    print(colored("   💡 Tips:", Colors.YELLOW))
+                    print(colored("      - Verify FQDN is correct and resolvable", Colors.YELLOW))
+                    print(colored("      - Check Kerberos ticket: klist", Colors.YELLOW))
+                    print(colored("      - Renew ticket if expired: kinit user@AD.WYSSCENTER.CH", Colors.YELLOW))
                 return
             
             print(colored("   ✅ Connected!", Colors.GREEN))
@@ -1894,10 +1921,22 @@ class MigrationTool:
             for disk in config.disks:
                 print(f"   Disk {disk.number}: {disk.size_gb} GB")
                 for part in disk.partitions:
-                    letter = part.get('Letter', '?')
-                    label = part.get('Label', '')
+                    letter = part.get('Letter')
+                    label = part.get('Label') or ''
                     size = part.get('SizeGB', 0)
-                    print(f"      {letter}: {label} ({size} GB)")
+                    # Skip tiny system partitions without drive letter
+                    if not letter and size < 1:
+                        continue
+                    # Format display
+                    if letter:
+                        if label:
+                            print(f"      {letter}: {label} ({size} GB)")
+                        else:
+                            print(f"      {letter}: ({size} GB)")
+                    else:
+                        # Partition without letter (recovery, reserved, etc.)
+                        part_type = label if label else "System"
+                        print(f"      [{part_type}] ({size} GB)")
             
             print(colored("\n🔧 AGENTS STATUS", Colors.BOLD))
             agents = config.agents
