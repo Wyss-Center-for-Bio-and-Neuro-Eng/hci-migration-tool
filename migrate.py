@@ -1593,6 +1593,21 @@ class MigrationTool:
                     
                     # Extract disk info from storage.disks
                     storage_disks = loaded_config.get('storage', {}).get('disks', [])
+                    
+                    # Auto-detect UEFI from EFI System Partition (typically 100MB on disk 0)
+                    # GPT/UEFI disks have: EFI (100MB) + MSR (16MB) + Windows + Recovery
+                    if storage_disks:
+                        first_disk = storage_disks[0]
+                        partitions = first_disk.get('partitions', [])
+                        for part in partitions:
+                            size_gb = part.get('SizeGB', 0)
+                            # EFI partition is typically 100MB (0.1GB) or 260MB (0.25GB)
+                            if 0.08 <= size_gb <= 0.3 and part.get('Letter') is None:
+                                # Found EFI-like partition, assume UEFI
+                                vm_info['boot_type'] = 'UEFI'
+                                print(colored(f"   🔍 Auto-detected UEFI boot (EFI partition found)", Colors.CYAN))
+                                break
+                    
                     for disk in storage_disks:
                         size_gb = disk.get('size_bytes', 0) // (1024**3)
                         vm_info['disks'].append({
@@ -2053,12 +2068,12 @@ class MigrationTool:
                     },
                     "annotations": {
                         "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
-                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
+                        "harvesterhci.io/vmRunStrategy": "Halted",
                         "network.harvesterhci.io/ips": "[]"
                     }
                 },
                 "spec": {
-                    "runStrategy": "RerunOnFailure",
+                    "runStrategy": "Halted",
                     "template": {
                         "metadata": {
                             "labels": {
@@ -2123,15 +2138,6 @@ class MigrationTool:
             result = self.harvester.create_vm(manifest)
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
             
-            # Auto-dissociate disabled for now - can be done manually in Harvester UI
-            # The volumes will remain linked to images until manually dissociated
-            # self._auto_dissociate_volumes(vm_name, namespace, data_volume_templates)
-            print(colored("\n💡 TIP: After VM is running, you can dissociate volumes from images", Colors.CYAN))
-            print(colored("   via Harvester UI: Volumes → Select volume → Dissociate Image", Colors.CYAN))
-            
-            # Remind about Nutanix image cleanup
-            print(colored("\n💡 Don't forget to delete the Nutanix export images after VM is working", Colors.YELLOW))
-            
             # Save manifest for debug
             staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
             manifest_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-manifest.json')
@@ -2139,6 +2145,214 @@ class MigrationTool:
             with open(manifest_path, 'w') as f:
                 json.dump(manifest, f, indent=2)
             print(colored(f"   📄 Manifest saved: {manifest_path}", Colors.CYAN))
+            
+            # === FULL MIGRATION WORKFLOW ===
+            # Ask to continue with start + network config
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("🚀 COMPLETE MIGRATION WORKFLOW", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
+            print("\nNext steps:")
+            print("  1. Start VM")
+            print("  2. Wait for DHCP IP (via QEMU Guest Agent)")
+            print("  3. Connect via WinRM")
+            print("  4. Reconfigure static network")
+            
+            continue_migration = self.input_prompt("\nContinue with full migration? (y/n) [y]")
+            if continue_migration.lower() == 'n':
+                print(colored("\n💡 To complete migration later:", Colors.YELLOW))
+                print("   1. Start VM manually in Harvester UI")
+                print("   2. Use Menu Windows → Post-migration auto-configure")
+                return
+            
+            # Step 1: Start VM
+            print(colored("\n▶️  Step 1: Starting VM...", Colors.BOLD))
+            try:
+                self.harvester.start_vm(vm_name, namespace)
+                print(colored("   ✅ Start command sent", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"   ❌ Error starting VM: {e}", Colors.RED))
+                return
+            
+            # Step 2: Wait for IP from QEMU Guest Agent
+            print(colored("\n▶️  Step 2: Waiting for VM to boot and get IP...", Colors.BOLD))
+            print("   (This may take 1-3 minutes)")
+            
+            import time
+            vm_ip = None
+            max_wait = 180  # 3 minutes
+            start_time = time.time()
+            last_print = 0
+            
+            while time.time() - start_time < max_wait:
+                elapsed = int(time.time() - start_time)
+                
+                try:
+                    interfaces = self.harvester.get_vm_ip(vm_name, namespace)
+                    for iface in interfaces:
+                        ip = iface.get('ip', '')
+                        if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                            vm_ip = ip
+                            break
+                    
+                    if vm_ip:
+                        break
+                except:
+                    pass
+                
+                # Print progress every 10 seconds
+                if elapsed - last_print >= 10:
+                    print(f"   ⏳ Waiting... ({elapsed}s)")
+                    last_print = elapsed
+                
+                time.sleep(5)
+            
+            if not vm_ip:
+                print(colored("\n   ❌ Could not get IP from QEMU Guest Agent", Colors.RED))
+                manual_ip = self.input_prompt("   Enter IP manually (or Enter to skip)")
+                if not manual_ip:
+                    print(colored("\n💡 Complete migration later with Menu Windows → Post-migration auto-configure", Colors.YELLOW))
+                    return
+                vm_ip = manual_ip
+            
+            print(colored(f"\n   ✅ VM IP (DHCP): {vm_ip}", Colors.GREEN))
+            
+            # Step 3: Load network config and connect via WinRM
+            print(colored("\n▶️  Step 3: Connecting via WinRM...", Colors.BOLD))
+            
+            # Load vm-config.json for network settings
+            config_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-config.json')
+            if not os.path.exists(config_path):
+                print(colored(f"   ❌ Config not found: {config_path}", Colors.RED))
+                return
+            
+            with open(config_path) as f:
+                vm_config = json.load(f)
+            
+            # Get static interfaces to configure
+            interfaces = vm_config.get('network', {}).get('interfaces', [])
+            static_interfaces = [i for i in interfaces if not i.get('dhcp', True)]
+            
+            if not static_interfaces:
+                print(colored("   ✅ All interfaces use DHCP - no reconfiguration needed!", Colors.GREEN))
+                print(colored("\n🎉 MIGRATION COMPLETE!", Colors.GREEN))
+                return
+            
+            # Show what we'll configure
+            print("\n   Network configuration to apply:")
+            for iface in static_interfaces:
+                print(f"      {iface.get('name')}: {iface.get('ip')}/{iface.get('prefix')}")
+                print(f"         Gateway: {iface.get('gateway')}")
+                print(f"         DNS: {', '.join(iface.get('dns', []))}")
+            
+            # Get credentials
+            if not WINRM_AVAILABLE:
+                print(colored("\n   ❌ pywinrm not installed - cannot configure network", Colors.RED))
+                print(colored("   Install with: pip install pywinrm --break-system-packages", Colors.YELLOW))
+                return
+            
+            try:
+                username, password = self.vault.get_credential("local-admin")
+                print(f"\n   Using credential: {username}")
+            except:
+                print("\n   Credentials required for WinRM:")
+                username = self.input_prompt("   Username [Administrator]") or "Administrator"
+                import getpass
+                password = getpass.getpass("   Password: ")
+            
+            # Wait a bit more for WinRM to be ready
+            print("\n   Waiting 15s for WinRM service to be ready...")
+            time.sleep(15)
+            
+            # Connect
+            try:
+                client = WinRMClient(
+                    host=vm_ip,
+                    username=username,
+                    password=password,
+                    transport="ntlm"
+                )
+                
+                if not client.test_connection():
+                    print(colored("   ❌ WinRM connection failed", Colors.RED))
+                    print(colored("   Try: Menu Windows → Post-migration auto-configure", Colors.YELLOW))
+                    return
+                
+                print(colored("   ✅ Connected!", Colors.GREEN))
+                
+            except Exception as e:
+                print(colored(f"   ❌ Connection error: {e}", Colors.RED))
+                return
+            
+            # Step 4: Apply network configuration
+            print(colored("\n▶️  Step 4: Applying network configuration...", Colors.BOLD))
+            
+            for iface in static_interfaces:
+                iface_name = iface.get('name', 'Ethernet')
+                ip = iface.get('ip')
+                prefix = iface.get('prefix', 24)
+                gateway = iface.get('gateway', '')
+                dns_list = iface.get('dns', [])
+                
+                print(f"\n   Configuring {iface_name}...")
+                
+                ps_script = f'''
+$ErrorActionPreference = "Stop"
+$ifName = "{iface_name}"
+$ip = "{ip}"
+$prefix = {prefix}
+$gateway = "{gateway}"
+$dns = @({','.join([f'"{d}"' for d in dns_list])})
+
+Write-Host "Configuring $ifName..."
+
+# Get adapter - try exact name first, then partial match
+$adapter = Get-NetAdapter -Name $ifName -ErrorAction SilentlyContinue
+if (-not $adapter) {{
+    $adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
+    if ($adapter) {{
+        $ifName = $adapter.Name
+        Write-Host "Using adapter: $ifName"
+    }}
+}}
+
+# Remove existing IP config
+Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+
+# Set new IP
+New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
+Write-Host "IP set: $ip/$prefix via $gateway"
+
+# Set DNS
+Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
+Write-Host "DNS set: $($dns -join ', ')"
+
+Write-Host "SUCCESS"
+'''
+                try:
+                    stdout, stderr, rc = client.run_powershell(ps_script)
+                    
+                    if rc == 0 and "SUCCESS" in stdout:
+                        print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                    else:
+                        print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
+                        if stdout:
+                            print(f"      {stdout[:200]}")
+                except Exception as e:
+                    print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
+                    print("      Network may have changed - this is expected")
+            
+            # Final message
+            print(colored("\n" + "="*50, Colors.GREEN))
+            print(colored("🎉 MIGRATION COMPLETE!", Colors.GREEN))
+            print(colored("="*50, Colors.GREEN))
+            print(f"\n   VM: {vm_name}")
+            print(f"   Original IP: {static_interfaces[0].get('ip') if static_interfaces else 'N/A'}")
+            print(colored("\n   The VM should now be accessible at its original IP address.", Colors.CYAN))
+            print(colored("\n💡 Don't forget to:", Colors.YELLOW))
+            print("   - Test connectivity to the VM")
+            print("   - Delete Nutanix export images when confirmed working")
+            print("   - Delete Harvester source images when confirmed working")
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
@@ -3394,7 +3608,7 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
             if start.lower() == 'y':
                 print("   Starting VM...")
                 try:
-                    self.harvester.start_vm(namespace, vm_name)
+                    self.harvester.start_vm(vm_name, namespace)
                     print(colored("   ✅ Start command sent. Waiting 30s for boot...", Colors.GREEN))
                     import time
                     time.sleep(30)

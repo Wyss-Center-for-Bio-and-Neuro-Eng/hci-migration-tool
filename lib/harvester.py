@@ -160,6 +160,52 @@ class HarvesterClient:
         response.raise_for_status()
         return response.json() if response.text else {}
     
+    def get_vmi(self, name: str, namespace: str = None) -> dict:
+        """Get VirtualMachineInstance (running VM) by name."""
+        ns = namespace or self.namespace
+        return self._request("GET", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}")
+    
+    def get_vm_ip(self, name: str, namespace: str = None) -> List[dict]:
+        """
+        Get VM IP addresses from QEMU guest agent via VMI status.
+        Returns list of interfaces with IP info.
+        """
+        ns = namespace or self.namespace
+        try:
+            vmi = self.get_vmi(name, ns)
+            interfaces = vmi.get('status', {}).get('interfaces', [])
+            
+            result = []
+            for iface in interfaces:
+                result.append({
+                    'name': iface.get('name', ''),
+                    'mac': iface.get('mac', ''),
+                    'ip': iface.get('ipAddress', ''),
+                    'ips': iface.get('ipAddresses', [])
+                })
+            return result
+        except Exception as e:
+            return []
+    
+    def wait_for_vm_ip(self, name: str, namespace: str = None, timeout: int = 300) -> str:
+        """
+        Wait for VM to get an IP address from QEMU guest agent.
+        Returns the first non-empty IP found, or empty string on timeout.
+        """
+        import time
+        ns = namespace or self.namespace
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            interfaces = self.get_vm_ip(name, ns)
+            for iface in interfaces:
+                if iface.get('ip'):
+                    return iface['ip']
+            time.sleep(5)
+        
+        return ""
+    
+    
     def restart_vm(self, name: str, namespace: str = None) -> dict:
         """Restart VM using KubeVirt subresources API."""
         ns = namespace or self.namespace
