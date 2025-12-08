@@ -10,6 +10,7 @@ import sys
 import yaml
 import argparse
 import json
+from datetime import datetime
 
 # Add lib to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +19,7 @@ from lib import Colors, colored, format_size, format_timestamp
 from lib import NutanixClient, HarvesterClient, MigrationActions
 from lib.vault import Vault, VaultError, get_kerberos_auth, kinit
 from lib.windows import (
-    WinRMClient, WindowsPreCheck, WindowsPostConfig, VMConfig,
+    WinRMClient, WindowsPreCheck, WindowsPostConfig, VMConfig, ListeningService,
     download_virtio_tools, check_winrm_available, WINRM_AVAILABLE
 )
 
@@ -2171,9 +2172,11 @@ class MigrationTool:
                 ("2", "Pre-migration check (collect config)"),
                 ("3", "View VM config"),
                 ("4", "Download virtio/qemu-ga tools"),
-                ("5", "Generate post-migration script"),
-                ("6", "Post-migration auto-configure"),
-                ("7", "Vault management"),
+                ("5", "Stop services (pre-migration)"),
+                ("6", "Start services (post-migration)"),
+                ("7", "Generate post-migration script"),
+                ("8", "Post-migration auto-configure"),
+                ("9", "Vault management"),
                 ("0", "Back")
             ])
             
@@ -2192,12 +2195,18 @@ class MigrationTool:
                 self.download_tools()
                 self.pause()
             elif choice == "5":
-                self.generate_postmig_script()
+                self.stop_windows_services()
                 self.pause()
             elif choice == "6":
-                self.postmig_autoconfigure()
+                self.start_windows_services()
                 self.pause()
             elif choice == "7":
+                self.generate_postmig_script()
+                self.pause()
+            elif choice == "8":
+                self.postmig_autoconfigure()
+                self.pause()
+            elif choice == "9":
                 self.menu_vault()
             elif choice == "0":
                 break
@@ -2251,6 +2260,330 @@ class MigrationTool:
         else:
             print(colored(f"   ⚠️  Tools directory not found: {tools_dir}", Colors.YELLOW))
             print("      Run 'Download virtio/qemu-ga tools' to populate")
+    
+    def _connect_windows(self, prompt_host: bool = True) -> tuple:
+        """
+        Helper to establish WinRM connection.
+        
+        Returns:
+            Tuple of (client, config, vm_dir) or (None, None, None) on failure
+        """
+        if not WINRM_AVAILABLE:
+            print(colored("❌ pywinrm not installed. Run: pip install pywinrm[kerberos]", Colors.RED))
+            return None, None, None
+        
+        windows_config = self.config.get('windows', {})
+        domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
+        use_kerberos = windows_config.get('use_kerberos', True)
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        
+        # List available VM configs
+        migrations_dir = os.path.join(staging_dir, 'migrations')
+        if os.path.exists(migrations_dir):
+            configs = []
+            for d in os.listdir(migrations_dir):
+                config_path = os.path.join(migrations_dir, d, 'vm-config.json')
+                if os.path.exists(config_path):
+                    configs.append((d, config_path))
+            
+            if configs:
+                print("\n   Available VM configurations:")
+                for i, (name, path) in enumerate(configs, 1):
+                    print(f"      {i}. {name}")
+                
+                choice = self.input_prompt("Select VM number (or Enter for manual)")
+                if choice:
+                    try:
+                        idx = int(choice) - 1
+                        selected_name, config_path = configs[idx]
+                        config = VMConfig.load(config_path)
+                        host = f"{config.hostname.lower()}.{domain}"
+                        print(f"   → Using: {host}")
+                    except (ValueError, IndexError):
+                        print(colored("Invalid choice", Colors.RED))
+                        return None, None, None
+                else:
+                    config = None
+                    host = self.input_prompt("Windows hostname (FQDN)")
+                    if not host:
+                        return None, None, None
+            else:
+                config = None
+                host = self.input_prompt("Windows hostname (FQDN)")
+                if not host:
+                    return None, None, None
+        else:
+            config = None
+            host = self.input_prompt("Windows hostname (FQDN)")
+            if not host:
+                return None, None, None
+        
+        # Add domain suffix if needed
+        if '.' not in host:
+            host = f"{host}.{domain}"
+        
+        # Determine auth method
+        username = None
+        password = None
+        transport = "kerberos"
+        
+        if use_kerberos and get_kerberos_auth():
+            print(colored("   Using Kerberos authentication", Colors.GREEN))
+            transport = "kerberos"
+        else:
+            print("   Using NTLM authentication")
+            transport = "ntlm"
+            try:
+                username, password = self.vault.get_credential("local-admin")
+            except:
+                username = self.input_prompt("Username [Administrator]") or "Administrator"
+                import getpass
+                password = getpass.getpass("Password: ")
+        
+        # Connect
+        print(f"\n   Connecting to {host}...")
+        try:
+            client = WinRMClient(
+                host=host,
+                username=username,
+                password=password,
+                transport=transport
+            )
+            
+            if not client.test_connection():
+                print(colored("❌ Connection failed", Colors.RED))
+                return None, None, None
+            
+            print(colored("   ✅ Connected!", Colors.GREEN))
+            
+            # Get vm_dir from hostname
+            hostname = host.split('.')[0].lower()
+            vm_dir = os.path.join(staging_dir, 'migrations', hostname)
+            
+            # Load config if not already loaded
+            if not config:
+                config_path = os.path.join(vm_dir, 'vm-config.json')
+                if os.path.exists(config_path):
+                    config = VMConfig.load(config_path)
+            
+            return client, config, vm_dir
+            
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+            return None, None, None
+    
+    def stop_windows_services(self):
+        """Stop listening services before migration."""
+        print(colored("\n🛑 Stop Services (Pre-Migration)", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        client, config, vm_dir = self._connect_windows()
+        if not client:
+            return
+        
+        if not config or not config.listening_services:
+            print(colored("❌ No VM config or no listening services found.", Colors.YELLOW))
+            print("   Run pre-migration check first to collect service information.")
+            return
+        
+        # Get unique service names
+        service_names = list(set(s.name for s in config.listening_services))
+        
+        # Categorize services
+        dc_service_names = ['NTDS', 'DNS', 'Netlogon', 'Kdc', 'DHCPServer', 'IsmServ', 'DFSR', 'NtFrs', 'W32Time']
+        
+        dc_services = []
+        app_services = []
+        
+        for name in service_names:
+            svc = next((s for s in config.listening_services if s.name == name), None)
+            if name in dc_service_names:
+                dc_services.append((name, svc.display_name if svc else name))
+            else:
+                app_services.append((name, svc.display_name if svc else name))
+        
+        # Display services by category
+        if dc_services:
+            print(colored("\n   ⚠️  DOMAIN CONTROLLER SERVICES (critical):", Colors.YELLOW))
+            for name, display_name in dc_services:
+                print(colored(f"      • {display_name} ({name})", Colors.YELLOW))
+            print(colored("\n   ⚠️  WARNING: This is a Domain Controller!", Colors.RED))
+            print(colored("   Stopping these services will affect AD authentication and DNS.", Colors.RED))
+        
+        if app_services:
+            print(colored("\n   📦 APPLICATION SERVICES:", Colors.CYAN))
+            for name, display_name in app_services:
+                print(f"      • {display_name} ({name})")
+        
+        print(f"\n   Total: {len(service_names)} service(s) to stop")
+        
+        # Confirmation
+        if dc_services:
+            confirm = self.input_prompt("\n   ⚠️  Type 'STOP DC' to confirm stopping Domain Controller services")
+            if confirm != 'STOP DC':
+                print("   Cancelled - DC services require explicit confirmation")
+                return
+        else:
+            confirm = self.input_prompt("\n   Stop these services? (y/n)")
+            if confirm.lower() != 'y':
+                print("   Cancelled")
+                return
+        
+        # Stop services in order: applications first, then DC services
+        all_stopped = []
+        all_failed = []
+        
+        if app_services:
+            print("\n   🛑 Stopping application services...")
+            app_names = [name for name, _ in app_services]
+            results = client.stop_services(app_names)
+            for name, success in results.items():
+                if success:
+                    print(colored(f"      ✅ Stopped: {name}", Colors.GREEN))
+                    all_stopped.append(name)
+                else:
+                    print(colored(f"      ❌ Failed: {name}", Colors.RED))
+                    all_failed.append(name)
+        
+        if dc_services:
+            print(colored("\n   🛑 Stopping Domain Controller services...", Colors.YELLOW))
+            # Stop DC services in specific order for clean shutdown
+            dc_stop_order = ['DHCPServer', 'DNS', 'Netlogon', 'Kdc', 'DFSR', 'NtFrs', 'IsmServ', 'NTDS', 'W32Time']
+            dc_names = [name for name, _ in dc_services]
+            # Sort by stop order
+            dc_names_sorted = sorted(dc_names, key=lambda x: dc_stop_order.index(x) if x in dc_stop_order else 999)
+            
+            results = client.stop_services(dc_names_sorted)
+            for name, success in results.items():
+                if success:
+                    print(colored(f"      ✅ Stopped: {name}", Colors.GREEN))
+                    all_stopped.append(name)
+                else:
+                    print(colored(f"      ❌ Failed: {name}", Colors.RED))
+                    all_failed.append(name)
+        
+        # Save stopped services list for later restart
+        if all_stopped:
+            stopped_file = os.path.join(vm_dir, 'stopped-services.json')
+            os.makedirs(vm_dir, exist_ok=True)
+            with open(stopped_file, 'w') as f:
+                json.dump({
+                    'stopped_services': all_stopped,
+                    'dc_services': [name for name, _ in dc_services],
+                    'app_services': [name for name, _ in app_services],
+                    'stopped_at': datetime.utcnow().isoformat()
+                }, f, indent=2)
+            print(colored(f"\n   💾 Saved stopped services list: {stopped_file}", Colors.GREEN))
+        
+        if all_failed:
+            print(colored(f"\n   ⚠️  {len(all_failed)} service(s) failed to stop", Colors.YELLOW))
+        else:
+            print(colored(f"\n   ✅ All {len(all_stopped)} services stopped successfully!", Colors.GREEN))
+            print(colored("   VM is ready for shutdown and migration.", Colors.CYAN))
+    
+    def start_windows_services(self):
+        """Start services after migration."""
+        print(colored("\n▶️  Start Services (Post-Migration)", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        client, config, vm_dir = self._connect_windows()
+        if not client:
+            return
+        
+        # Load stopped services list
+        stopped_file = os.path.join(vm_dir, 'stopped-services.json')
+        dc_services = []
+        app_services = []
+        
+        if not os.path.exists(stopped_file):
+            print(colored("❌ No stopped services file found.", Colors.YELLOW))
+            print("   Either services were not stopped, or file was deleted.")
+            
+            # Offer to use config's listening_services
+            if config and config.listening_services:
+                use_config = self.input_prompt("   Use services from VM config? (y/n)")
+                if use_config.lower() == 'y':
+                    service_names = list(set(s.name for s in config.listening_services))
+                    # Categorize
+                    dc_service_names = ['NTDS', 'DNS', 'Netlogon', 'Kdc', 'DHCPServer', 'IsmServ', 'DFSR', 'NtFrs', 'W32Time']
+                    dc_services = [n for n in service_names if n in dc_service_names]
+                    app_services = [n for n in service_names if n not in dc_service_names]
+                else:
+                    return
+            else:
+                return
+        else:
+            with open(stopped_file, 'r') as f:
+                data = json.load(f)
+            dc_services = data.get('dc_services', [])
+            app_services = data.get('app_services', [])
+            stopped_at = data.get('stopped_at', 'unknown')
+            print(f"   📋 Services stopped at: {stopped_at}")
+        
+        total_services = len(dc_services) + len(app_services)
+        if total_services == 0:
+            print(colored("   No services to start.", Colors.YELLOW))
+            return
+        
+        # Display services by category
+        if dc_services:
+            print(colored("\n   ⚠️  DOMAIN CONTROLLER SERVICES:", Colors.YELLOW))
+            for name in dc_services:
+                print(colored(f"      • {name}", Colors.YELLOW))
+        
+        if app_services:
+            print(colored("\n   📦 APPLICATION SERVICES:", Colors.CYAN))
+            for name in app_services:
+                print(f"      • {name}")
+        
+        print(f"\n   Total: {total_services} service(s) to start")
+        
+        confirm = self.input_prompt("\n   Start these services? (y/n)")
+        if confirm.lower() != 'y':
+            print("   Cancelled")
+            return
+        
+        all_started = []
+        all_failed = []
+        
+        # Start DC services FIRST (reverse order of shutdown)
+        if dc_services:
+            print(colored("\n   ▶️  Starting Domain Controller services...", Colors.YELLOW))
+            # Start DC services in specific order for clean startup
+            dc_start_order = ['W32Time', 'NTDS', 'IsmServ', 'NtFrs', 'DFSR', 'Kdc', 'Netlogon', 'DNS', 'DHCPServer']
+            dc_services_sorted = sorted(dc_services, key=lambda x: dc_start_order.index(x) if x in dc_start_order else 999)
+            
+            results = client.start_services(dc_services_sorted)
+            for name, success in results.items():
+                if success:
+                    print(colored(f"      ✅ Started: {name}", Colors.GREEN))
+                    all_started.append(name)
+                else:
+                    print(colored(f"      ❌ Failed: {name}", Colors.RED))
+                    all_failed.append(name)
+        
+        # Then start application services
+        if app_services:
+            print("\n   ▶️  Starting application services...")
+            results = client.start_services(app_services)
+            for name, success in results.items():
+                if success:
+                    print(colored(f"      ✅ Started: {name}", Colors.GREEN))
+                    all_started.append(name)
+                else:
+                    print(colored(f"      ❌ Failed: {name}", Colors.RED))
+                    all_failed.append(name)
+        
+        if all_failed:
+            print(colored(f"\n   ⚠️  {len(all_failed)} service(s) failed to start", Colors.YELLOW))
+            print("   Check Windows Event Log for details.")
+        else:
+            print(colored(f"\n   ✅ All {len(all_started)} services started successfully!", Colors.GREEN))
+            
+            # Clean up stopped services file
+            if os.path.exists(stopped_file):
+                os.remove(stopped_file)
+                print(colored("   🗑️  Cleaned up stopped-services.json", Colors.CYAN))
     
     def windows_precheck(self):
         """Run pre-migration check on Windows VM."""
@@ -2389,6 +2722,56 @@ class MigrationTool:
             print(colored("\n⚙️  SERVICES", Colors.BOLD))
             print(f"   WinRM: {'✅' if config.winrm_enabled else '❌'}")
             print(f"   RDP: {'✅' if config.rdp_enabled else '❌'}")
+            
+            # Display listening services
+            if config.listening_services:
+                print(colored("\n🔌 SERVICES TO STOP BEFORE MIGRATION", Colors.BOLD))
+                
+                # Group by service name to avoid duplicates
+                unique_services = {}
+                for svc in config.listening_services:
+                    if svc.name not in unique_services:
+                        unique_services[svc.name] = {
+                            'display_name': svc.display_name,
+                            'ports': []
+                        }
+                    unique_services[svc.name]['ports'].append(f"{svc.protocol}/{svc.local_port}")
+                
+                # Categorize services
+                dc_services = ['NTDS', 'DNS', 'Netlogon', 'Kdc', 'DHCPServer', 'IsmServ', 'DFSR', 'NtFrs', 'W32Time']
+                
+                dc_found = {}
+                other_found = {}
+                
+                for name, info in unique_services.items():
+                    if name in dc_services:
+                        dc_found[name] = info
+                    else:
+                        other_found[name] = info
+                
+                # Display DC services first (critical)
+                if dc_found:
+                    print(colored("\n   ⚠️  DOMAIN CONTROLLER SERVICES (critical):", Colors.YELLOW))
+                    for name, info in dc_found.items():
+                        ports_str = ', '.join(info['ports'])
+                        print(colored(f"   • {info['display_name']}", Colors.YELLOW))
+                        print(f"     Service: {name} | Ports: {ports_str}")
+                
+                # Display other services
+                if other_found:
+                    print(colored("\n   📦 APPLICATION SERVICES:", Colors.CYAN))
+                    for name, info in other_found.items():
+                        ports_str = ', '.join(info['ports'])
+                        print(f"   • {info['display_name']}")
+                        print(f"     Service: {name} | Ports: {ports_str}")
+                
+                print(colored(f"\n   ℹ️  {len(unique_services)} service(s) to stop before migration", Colors.CYAN))
+                if dc_found:
+                    print(colored("   ⚠️  This is a Domain Controller - stopping AD services is REQUIRED!", Colors.YELLOW))
+                print(colored("   Services will be restarted after network reconfiguration on Harvester", Colors.CYAN))
+            else:
+                print(colored("\n🔌 LISTENING SERVICES", Colors.BOLD))
+                print("   No application services listening (only WinRM/RDP)")
             
             # Migration readiness
             print(colored("\n📊 MIGRATION READINESS", Colors.BOLD))

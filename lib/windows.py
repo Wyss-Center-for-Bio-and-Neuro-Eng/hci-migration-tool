@@ -51,6 +51,17 @@ class AgentStatus:
 
 
 @dataclass
+class ListeningService:
+    """Service listening on a network port."""
+    name: str
+    display_name: str
+    state: str
+    pid: int
+    local_port: int
+    protocol: str  # TCP or UDP
+
+
+@dataclass
 class VMConfig:
     """Complete VM configuration for migration."""
     collected_at: str
@@ -68,6 +79,11 @@ class VMConfig:
     rdp_enabled: bool
     migration_ready: bool
     missing_prerequisites: List[str]
+    listening_services: List[ListeningService] = None
+    
+    def __post_init__(self):
+        if self.listening_services is None:
+            self.listening_services = []
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -93,6 +109,7 @@ class VMConfig:
                 "winrm_enabled": self.winrm_enabled,
                 "rdp_enabled": self.rdp_enabled
             },
+            "listening_services": [asdict(s) for s in self.listening_services],
             "migration_ready": self.migration_ready,
             "missing_prerequisites": self.missing_prerequisites
         }
@@ -118,6 +135,10 @@ class VMConfig:
         
         agents = AgentStatus(**data.get('agents', {}))
         
+        listening_services = [
+            ListeningService(**s) for s in data.get('listening_services', [])
+        ]
+        
         system = data.get('system', {})
         services = data.get('services', {})
         
@@ -136,7 +157,8 @@ class VMConfig:
             winrm_enabled=services.get('winrm_enabled', False),
             rdp_enabled=services.get('rdp_enabled', False),
             migration_ready=data.get('migration_ready', False),
-            missing_prerequisites=data.get('missing_prerequisites', [])
+            missing_prerequisites=data.get('missing_prerequisites', []),
+            listening_services=listening_services
         )
 
 
@@ -235,6 +257,170 @@ class WinRMClient:
         """Test WinRM connection."""
         stdout, stderr, rc = self.run_powershell("$env:COMPUTERNAME")
         return rc == 0
+    
+    def get_listening_services(self) -> List[Dict]:
+        """
+        Get Windows services that are listening on network ports.
+        Only excludes services essential for WinRM connectivity.
+        
+        Returns:
+            List of service dictionaries with name, display_name, state, pid, port, protocol
+        """
+        script = '''
+# Get TCP connections in Listen state
+$tcpListeners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | 
+    Select-Object OwningProcess, LocalPort
+
+# Get UDP listeners
+$udpListeners = Get-NetUDPEndpoint -ErrorAction SilentlyContinue | 
+    Select-Object OwningProcess, LocalPort
+
+# Combine and get unique PIDs
+$allPids = @()
+$portMap = @{}
+
+foreach ($l in $tcpListeners) {
+    $allPids += $l.OwningProcess
+    $key = "$($l.OwningProcess)"
+    if (-not $portMap.ContainsKey($key)) { $portMap[$key] = @() }
+    $portMap[$key] += @{Port = $l.LocalPort; Protocol = "TCP"}
+}
+
+foreach ($l in $udpListeners) {
+    $allPids += $l.OwningProcess
+    $key = "$($l.OwningProcess)"
+    if (-not $portMap.ContainsKey($key)) { $portMap[$key] = @() }
+    $portMap[$key] += @{Port = $l.LocalPort; Protocol = "UDP"}
+}
+
+$allPids = $allPids | Select-Object -Unique
+
+# Get services for these PIDs
+$services = Get-CimInstance Win32_Service | Where-Object { 
+    $_.ProcessId -in $allPids -and $_.State -eq 'Running'
+}
+
+# ONLY exclude services essential for WinRM connectivity
+# All other services (AD, DNS, DHCP, etc.) CAN and SHOULD be stopped before DC migration
+$excludeServices = @(
+    'WinRM',           # WinRM - Required for remote connection
+    'TermService',     # RDP - Backup access method
+    'RpcSs',           # RPC - Required for WinRM
+    'RpcEptMapper',    # RPC Endpoint Mapper - Required for WinRM
+    'DcomLaunch',      # DCOM - Required for WinRM
+    'EventLog',        # Event Log - System logging
+    'PlugPlay',        # Plug and Play - Hardware detection
+    'Power',           # Power Management
+    'BFE',             # Base Filtering Engine - Firewall
+    'MpsSvc'           # Windows Firewall
+)
+
+$result = @()
+foreach ($svc in $services) {
+    if ($svc.Name -notin $excludeServices) {
+        $pid = $svc.ProcessId
+        $ports = $portMap["$pid"]
+        foreach ($p in $ports) {
+            $result += @{
+                Name = $svc.Name
+                DisplayName = $svc.DisplayName
+                State = $svc.State
+                PID = $pid
+                LocalPort = $p.Port
+                Protocol = $p.Protocol
+            }
+        }
+    }
+}
+
+$result | ConvertTo-Json -Depth 3
+'''
+        stdout, stderr, rc = self.run_powershell(script)
+        if rc == 0 and stdout.strip():
+            try:
+                data = json.loads(stdout)
+                # Ensure it's always a list
+                if isinstance(data, dict):
+                    data = [data]
+                return data if data else []
+            except json.JSONDecodeError:
+                return []
+        return []
+    
+    def stop_services(self, service_names: List[str]) -> Dict[str, bool]:
+        """
+        Stop specified Windows services.
+        
+        Args:
+            service_names: List of service names to stop
+            
+        Returns:
+            Dict mapping service name to success status
+        """
+        results = {}
+        for name in service_names:
+            script = f'''
+try {{
+    Stop-Service -Name "{name}" -Force -ErrorAction Stop
+    "SUCCESS"
+}} catch {{
+    "FAILED: $($_.Exception.Message)"
+}}
+'''
+            stdout, stderr, rc = self.run_powershell(script)
+            results[name] = stdout.strip() == "SUCCESS"
+        return results
+    
+    def start_services(self, service_names: List[str]) -> Dict[str, bool]:
+        """
+        Start specified Windows services.
+        
+        Args:
+            service_names: List of service names to start
+            
+        Returns:
+            Dict mapping service name to success status
+        """
+        results = {}
+        for name in service_names:
+            script = f'''
+try {{
+    Start-Service -Name "{name}" -ErrorAction Stop
+    "SUCCESS"
+}} catch {{
+    "FAILED: $($_.Exception.Message)"
+}}
+'''
+            stdout, stderr, rc = self.run_powershell(script)
+            results[name] = stdout.strip() == "SUCCESS"
+        return results
+    
+    def get_service_status(self, service_names: List[str]) -> Dict[str, str]:
+        """
+        Get status of specified services.
+        
+        Args:
+            service_names: List of service names
+            
+        Returns:
+            Dict mapping service name to status (Running, Stopped, etc.)
+        """
+        names_str = "','".join(service_names)
+        script = f'''
+$services = Get-Service -Name @('{names_str}') -ErrorAction SilentlyContinue
+$result = @{{}}
+foreach ($s in $services) {{
+    $result[$s.Name] = $s.Status.ToString()
+}}
+$result | ConvertTo-Json
+'''
+        stdout, stderr, rc = self.run_powershell(script)
+        if rc == 0 and stdout.strip():
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                return {}
+        return {}
 
 
 class WindowsPreCheck:
@@ -420,6 +606,9 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
         print("   ⚙️  Checking services...")
         services = self.collect_service_status()
         
+        print("   🔌 Collecting listening services...")
+        listening_svc_data = self.client.get_listening_services()
+        
         # Build network interfaces
         network_interfaces = []
         for nic in network:
@@ -452,6 +641,18 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
             qemu_guest_agent=agents.get('QEMUGuestAgent', False)
         )
         
+        # Build listening services list
+        listening_services = []
+        for svc in listening_svc_data:
+            listening_services.append(ListeningService(
+                name=svc.get('Name', ''),
+                display_name=svc.get('DisplayName', ''),
+                state=svc.get('State', ''),
+                pid=svc.get('PID', 0),
+                local_port=svc.get('LocalPort', 0),
+                protocol=svc.get('Protocol', 'TCP')
+            ))
+        
         # Determine missing prerequisites
         missing = []
         if not agent_status.virtio_fedora:
@@ -476,7 +677,8 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
             winrm_enabled=services.get('WinRMEnabled', False),
             rdp_enabled=services.get('RDPEnabled', False),
             migration_ready=migration_ready,
-            missing_prerequisites=missing
+            missing_prerequisites=missing,
+            listening_services=listening_services
         )
 
 
