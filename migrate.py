@@ -1330,6 +1330,8 @@ class MigrationTool:
     
     def _import_via_http(self, image_name: str, selected_file: dict, namespace: str):
         """Import image via HTTP server method."""
+        import time
+        
         print(f"\n🚀 Starting HTTP server...")
         http_url = self.actions.start_http_server(8080)
         print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
@@ -1338,15 +1340,82 @@ class MigrationTool:
         try:
             result = self.actions.create_harvester_image(image_name, selected_file['name'], http_url, namespace)
             print(colored(f"✅ Image created: {image_name} in {namespace}", Colors.GREEN))
-            print("   Monitor progress in Harvester UI")
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
             self.actions.stop_http_server()
             return
         
-        self.input_prompt("Press Enter when image download is complete to stop HTTP server")
-        self.actions.stop_http_server()
-        print(colored("✅ HTTP server stopped", Colors.GREEN))
+        # Wait for image to be ready
+        print(f"\n⏳ Waiting for Harvester to download the image...")
+        print(f"   (Checking every 5 seconds, press Ctrl+C to abort)")
+        
+        max_wait = 3600  # 1 hour max
+        check_interval = 5
+        elapsed = 0
+        last_progress = -1
+        
+        try:
+            while elapsed < max_wait:
+                try:
+                    image = self.harvester.get_image(image_name, namespace)
+                    status = image.get('status', {})
+                    
+                    # Check progress
+                    progress = status.get('progress', 0)
+                    if progress != last_progress:
+                        print(f"   Progress: {progress}%")
+                        last_progress = progress
+                    
+                    # Check conditions for completion
+                    conditions = status.get('conditions', [])
+                    
+                    # Look for "Imported" or "Ready" condition
+                    is_ready = False
+                    is_failed = False
+                    error_msg = None
+                    
+                    for cond in conditions:
+                        cond_type = cond.get('type', '')
+                        cond_status = cond.get('status', '')
+                        
+                        if cond_type == 'Imported' and cond_status == 'True':
+                            is_ready = True
+                            break
+                        elif cond_type == 'Initialized' and cond_status == 'True' and progress == 100:
+                            is_ready = True
+                            break
+                        elif cond_status == 'False' and cond.get('reason') == 'ImportFailed':
+                            is_failed = True
+                            error_msg = cond.get('message', 'Unknown error')
+                            break
+                    
+                    # Also check if progress is 100
+                    if progress == 100:
+                        is_ready = True
+                    
+                    if is_ready:
+                        print(colored(f"\n   ✅ Image download complete!", Colors.GREEN))
+                        break
+                    
+                    if is_failed:
+                        print(colored(f"\n   ❌ Image import failed: {error_msg}", Colors.RED))
+                        break
+                    
+                except Exception as e:
+                    print(f"   ⚠️  Error checking status: {e}")
+                
+                time.sleep(check_interval)
+                elapsed += check_interval
+            
+            else:
+                print(colored(f"\n   ⚠️  Timeout after {max_wait}s. Check Harvester UI.", Colors.YELLOW))
+        
+        except KeyboardInterrupt:
+            print(colored("\n   ⚠️  Interrupted by user", Colors.YELLOW))
+        
+        finally:
+            self.actions.stop_http_server()
+            print(colored("✅ HTTP server stopped", Colors.GREEN))
     
     def _import_via_upload(self, image_name: str, selected_file: dict, namespace: str):
         """Import image via direct upload to Harvester."""
