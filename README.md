@@ -1,298 +1,373 @@
 # HCI Migration Tool
 
-**Nutanix AHV to SUSE Harvester VM Migration Tool**
+Outil de migration de VMs de Nutanix AHV vers Harvester HCI.
 
-A Python-based CLI tool for migrating virtual machines from Nutanix AHV to SUSE Harvester HCI.
+## Fonctionnalités
 
-## Features
+- **Export** : Extraction des disques VM depuis Nutanix (via acli)
+- **Conversion** : RAW → QCOW2 avec compression
+- **Import** : Upload vers Harvester (HTTP ou virtctl)
+- **Création VM** : Configuration automatique depuis les specs Nutanix
+- **Dissociation** : Clonage des volumes pour supprimer la dépendance aux images
+- **Windows Tools** : Pre-check, collecte config réseau, post-migration
+- **Vault** : Stockage sécurisé des credentials avec `pass`
 
-- **Nutanix Management**
-  - List VMs with status, vCPU, RAM, disk count
-  - View detailed VM specifications
-  - Power on/off VMs (experimental)
-  - List and delete images
+## Prérequis
 
-- **Harvester Management**
-  - List VMs with running status
-  - Start/stop/delete VMs
-  - List images, networks, storage classes
+### Système (Debian/Ubuntu)
 
-- **Migration Operations**
-  - Export VM disks from Nutanix (via Prism API)
-  - Convert RAW images to QCOW2 with compression (70-90% size reduction)
-  - Import images to Harvester via HTTP server
-  - Create VMs with original specifications:
-    - CPU cores and sockets
-    - Memory
-    - Boot type (BIOS/UEFI)
-    - Disk bus (SATA/virtio/SCSI)
-    - Network with MAC address preservation
-  - Cleanup: delete staging files, Nutanix export images, Harvester images
+```bash
+# Packages système
+sudo apt install -y \
+    python3 python3-pip \
+    qemu-utils \
+    sshpass \
+    pass gnupg2 \
+    krb5-user libkrb5-dev \
+    realmd sssd sssd-tools adcli
 
-## Requirements
+# Packages Python
+pip install pyyaml requests pywinrm[kerberos] --break-system-packages
+```
 
-- Python 3.8+
-- `requests` library
-- `pyyaml` library
-- `qemu-utils` (for qemu-img)
-- Access to:
-  - Nutanix Prism API
-  - Harvester Kubernetes API
-  - Staging storage (CephFS, NFS, or local)
+### Jonction au domaine AD (pour Kerberos)
+
+```bash
+# Joindre le domaine
+sudo realm join -U administrator AD.WYSSCENTER.CH
+
+# Vérifier
+realm list
+id votre_user@ad.wysscenter.ch
+```
+
+### Configuration du Vault (pass)
+
+```bash
+# Générer une clé GPG
+gpg --batch --gen-key <<EOF
+Key-Type: RSA
+Key-Length: 4096
+Name-Real: HCI Migration Tool
+Name-Email: migration@ad.wysscenter.ch
+Expire-Date: 0
+%no-protection
+%commit
+EOF
+
+# Initialiser pass
+pass init "migration@ad.wysscenter.ch"
+
+# Ajouter les credentials Windows (pour machines hors domaine)
+pass insert migration/windows/local-admin
+```
+
+### Authentification Kerberos
+
+```bash
+# Obtenir un ticket (valide 10h)
+kinit votre_admin@AD.WYSSCENTER.CH
+
+# Vérifier le ticket
+klist
+
+# Renouveler si expiré
+kinit -R
+```
 
 ## Installation
 
 ```bash
-# Clone or extract the tool
+# Cloner le repo
+git clone https://github.com/Wyss-Center-for-Bio-and-Neuro-Eng/hci-migration-tool.git
 cd hci-migration-tool
 
-# Install dependencies
-pip install requests pyyaml
-
-# Install qemu-utils (Debian/Ubuntu)
-apt install qemu-utils
+# Copier et éditer la config
+cp config.yaml.example config.yaml
+nano config.yaml
 ```
 
 ## Configuration
 
-Copy and edit `config.yaml`:
+### config.yaml
 
 ```yaml
 nutanix:
   prism_ip: "10.16.22.46"
   username: "admin"
-  password: "YOUR_PASSWORD"
-  verify_ssl: false
+  password: "votre_mot_de_passe"
 
 harvester:
   api_url: "https://10.16.16.130:6443"
-  namespace: "default"
-  # From kubeconfig - base64 encoded
-  certificate_authority_data: "LS0tLS1C..."
-  client_certificate_data: "LS0tLS1C..."
-  client_key_data: "LS0tLS1C..."
+  token: "votre_token_bearer"
+  namespace: "harvester-public"
   verify_ssl: false
 
 transfer:
-  staging_mount: "/mnt/staging"
+  staging_mount: "/mnt/data"
   convert_to_qcow2: true
   compress: true
+
+windows:
+  domain: "AD.WYSSCENTER.CH"
+  use_kerberos: true
+  vault_backend: "pass"
+  vault_path: "migration/windows"
+  winrm_port: 5985
+  winrm_transport: "kerberos"
 ```
 
-### Getting Harvester Credentials
-
-Extract from your kubeconfig:
+### Obtenir le token Harvester
 
 ```bash
-# Get cluster certificate
-kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}'
-
-# Get client certificate
-kubectl config view --raw -o jsonpath='{.users[0].user.client-certificate-data}'
-
-# Get client key
-kubectl config view --raw -o jsonpath='{.users[0].user.client-key-data}'
+# Via kubectl sur le cluster Harvester
+kubectl -n cattle-system get secret \
+  $(kubectl -n cattle-system get sa rancher -o jsonpath='{.secrets[0].name}') \
+  -o jsonpath='{.data.token}' | base64 -d
 ```
 
-## Usage
-
-### Interactive Mode
+## Utilisation
 
 ```bash
 python3 migrate.py
 ```
 
-Navigate through menus:
-- **1. Nutanix** - Manage source VMs and images
-- **2. Harvester** - Manage target VMs and resources
-- **3. Migration** - Perform migration operations
-- **4. Configuration** - View current settings
+### Menu Principal
 
-### Command Line
+```
+╔══════════════════════════════════════════════════════════════╗
+║              NUTANIX → HARVESTER MIGRATION TOOL              ║
+╠══════════════════════════════════════════════════════════════╣
+║                         MAIN MENU                            ║
+╠══════════════════════════════════════════════════════════════╣
+║  1. Nutanix                                                  ║
+║  2. Harvester                                                ║
+║  3. Migration                                                ║
+║  4. Windows Tools                                            ║
+║  5. Configuration                                            ║
+║  q. Quit                                                     ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+## Workflow de Migration
+
+### Migration Standard
+
+1. **Sélectionner la VM source** (Menu 1 → Option 3)
+2. **Éteindre la VM source** (Menu 1 → Option 5)
+3. **Créer image Nutanix** (via Prism ou acli)
+4. **Exporter le disque** (Menu 3 → Option 4)
+5. **Convertir RAW → QCOW2** (Menu 3 → Option 5)
+6. **Importer dans Harvester** (Menu 3 → Option 6)
+7. **Créer la VM** (Menu 3 → Option 7)
+8. **Démarrer et tester** (Menu 2 → Option 2)
+9. **Dissocier de l'image** (Menu 2 → Option 5) - Optionnel
+10. **Cleanup** : Supprimer images et fichiers staging
+
+### Migration Windows (avec reconfiguration réseau)
+
+#### Pré-migration
+
+1. **Télécharger les outils** (Menu 4 → Option 4)
+   - virtio-win.iso
+   - virtio-win-gt-x64.msi
+   - qemu-ga-x86_64.msi
+
+2. **Installer sur la VM source** (manuellement ou via GPO) :
+   - VirtIO drivers Fedora/Red Hat
+   - QEMU Guest Agent
+
+3. **Collecter la configuration** (Menu 4 → Option 2)
+   - Connexion WinRM via Kerberos
+   - Collecte : IP, DNS, Gateway, Hostname, Agents
+   - Sauvegarde dans `/mnt/data/migrations/<hostname>/vm-config.json`
+
+4. **Vérifier la préparation** (Menu 4 → Option 3)
+   - Affiche le JSON de configuration
+   - Indique les prérequis manquants
+
+#### Post-migration
+
+1. **Démarrer la VM migrée** sur Harvester
+2. **Générer le script de reconfiguration** (Menu 4 → Option 5)
+3. **Appliquer la configuration** :
+   - Via console VNC : exécuter le script PowerShell généré
+   - Ou via WinRM si accessible
+
+## Menus Détaillés
+
+### Menu Nutanix (1)
+
+| Option | Description |
+|--------|-------------|
+| 1 | Lister les VMs |
+| 2 | Détails d'une VM |
+| 3 | Sélectionner une VM |
+| 4 | Démarrer une VM |
+| 5 | Éteindre une VM |
+| 6 | Lister les images |
+| 7 | Supprimer une image |
+
+### Menu Harvester (2)
+
+| Option | Description |
+|--------|-------------|
+| 1 | Lister les VMs |
+| 2 | Démarrer une VM |
+| 3 | Éteindre une VM |
+| 4 | Supprimer une VM |
+| 5 | **Dissocier VM de l'image** |
+| 6 | Lister les images |
+| 7 | Supprimer une image |
+| 8 | Lister les volumes |
+| 9 | Supprimer un volume |
+| 10 | Lister les réseaux |
+| 11 | Lister les storage classes |
+
+### Menu Migration (3)
+
+| Option | Description |
+|--------|-------------|
+| 1 | Vérifier le staging |
+| 2 | Lister les disques staging |
+| 3 | Détails d'une image disque |
+| 4 | Exporter VM (Nutanix → Staging) |
+| 5 | Convertir RAW → QCOW2 |
+| 6 | **Importer image dans Harvester** (HTTP ou Upload) |
+| 7 | Créer VM dans Harvester |
+| 8 | Supprimer fichier staging |
+| 9 | Migration complète |
+
+### Menu Windows Tools (4)
+
+| Option | Description |
+|--------|-------------|
+| 1 | Vérifier WinRM/Prérequis |
+| 2 | Pre-migration check (collecter config) |
+| 3 | Voir la configuration VM |
+| 4 | Télécharger virtio/qemu-ga |
+| 5 | Générer script post-migration |
+| 6 | Gestion du Vault |
+
+## Dissociation des Images
+
+### Problème
+
+Harvester utilise des "backing images" pour le thin provisioning. Les volumes créés depuis une image restent liés à celle-ci, empêchant sa suppression.
+
+### Solution
+
+L'option "Dissocier VM de l'image" (Menu 2 → Option 5) :
+
+1. Clone le(s) volume(s) de la VM via CSI
+2. Met à jour la VM pour utiliser les clones
+3. Supprime les anciens volumes
+4. L'image peut maintenant être supprimée
+
+```
+Avant:  VM → Volume → Backing Image (lié)
+Après:  VM → Volume Clone (indépendant)
+```
+
+## Structure du Staging
+
+```
+/mnt/data/
+├── tools/                          # Outils à déployer
+│   ├── virtio-win.iso
+│   ├── virtio-win-gt-x64.msi
+│   └── qemu-ga-x86_64.msi
+│
+├── migrations/                     # Configs par VM
+│   └── <hostname>/
+│       ├── vm-config.json          # Config collectée
+│       └── reconfig-network.ps1    # Script post-migration
+│
+├── <vm>-disk0.raw                  # Disques exportés
+└── <vm>-disk0.qcow2                # Disques convertis
+```
+
+## Format vm-config.json
+
+```json
+{
+  "collected_at": "2025-12-08T10:30:00Z",
+  "source_platform": "nutanix",
+  "system": {
+    "hostname": "SRV-APP01",
+    "os_name": "Microsoft Windows Server 2019 Standard",
+    "os_version": "10.0.17763",
+    "architecture": "64-bit",
+    "domain": "AD.WYSSCENTER.CH",
+    "domain_joined": true
+  },
+  "network": {
+    "interfaces": [
+      {
+        "name": "Ethernet0",
+        "mac": "50:6b:8d:aa:bb:cc",
+        "dhcp": false,
+        "ip": "10.16.20.50",
+        "prefix": 24,
+        "gateway": "10.16.20.1",
+        "dns": ["10.16.20.10", "10.16.20.11"]
+      }
+    ]
+  },
+  "agents": {
+    "ngt_installed": true,
+    "virtio_fedora": false,
+    "qemu_guest_agent": false
+  },
+  "migration_ready": false,
+  "missing_prerequisites": ["virtio_fedora", "qemu_guest_agent"]
+}
+```
+
+## Dépannage
+
+### Erreur WinRM "Access Denied"
 
 ```bash
-# List Nutanix VMs
-python3 migrate.py list
+# Vérifier le ticket Kerberos
+klist
 
-# List Harvester VMs
-python3 migrate.py list-harvester
-
-# List Harvester images
-python3 migrate.py list-images
-
-# List Harvester networks
-python3 migrate.py list-networks
-
-# List staging files
-python3 migrate.py list-staging
-
-# Show VM details
-python3 migrate.py show <vm_name>
-
-# Test Harvester connection
-python3 migrate.py test-harvester
+# Renouveler si expiré
+kinit votre_admin@AD.WYSSCENTER.CH
 ```
 
-## Migration Workflow
+### Erreur "422 Unprocessable Entity" sur Harvester
 
-### 1. Prepare Source VM
+Les opérations start/stop utilisent l'API subresources de KubeVirt :
+```
+PUT /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start
+PUT /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop
+```
 
-1. **Power off** the VM in Nutanix (recommended for consistency)
-2. **Create disk images** via Nutanix acli:
-   ```bash
-   # On Nutanix CVM
-   acli image.create <vm_name>-disk0 clone_from_vmdisk=<vm_name>:scsi.0 image_type=kDiskImage
-   ```
+### Image Harvester ne peut pas être supprimée
 
-### 2. Export to Staging
+L'image est utilisée par un volume (backing image). Solutions :
+1. Utiliser "Dissocier VM de l'image" (Menu 2 → Option 5)
+2. Ou supprimer manuellement : VM → Volume → Image
 
-Download the image to staging storage:
+### Vault "Connection timed out"
 
+Vérifier que `pass` est initialisé avec la bonne clé GPG :
 ```bash
-# Via curl (manual)
-curl -k -u admin "https://<prism_ip>:9440/api/nutanix/v3/images/<image_uuid>/file" \
-  -o /mnt/staging/<vm_name>-disk0.raw
+pass init "migration@ad.wysscenter.ch"
 ```
 
-Or use **Menu 3 → Option 4** in the tool.
+## Sécurité
 
-### 3. Convert to QCOW2
+- Les credentials Nutanix sont stockés en clair dans `config.yaml`
+- Les credentials Windows sont stockés chiffrés dans le vault `pass`
+- Les tickets Kerberos expirent après 10h (configurable)
+- Utilisez des comptes de service avec privilèges minimaux
 
-Use **Menu 3 → Option 5** to convert RAW to compressed QCOW2:
+## Licence
 
-- Typical compression: 70-90% size reduction
-- Windows VMs: ~70% reduction
-- Linux VMs: ~85-90% reduction
+MIT License - Wyss Center for Bio and Neuro Engineering
 
-### 4. Import to Harvester
+## Contributeurs
 
-Use **Menu 3 → Option 6**:
-
-1. Select QCOW2 file
-2. Choose target namespace
-3. Tool starts HTTP server
-4. Creates image in Harvester
-5. Wait for download to complete (monitor in Harvester UI)
-
-### 5. Create VM
-
-Use **Menu 3 → Option 7**:
-
-1. Select source VM in Nutanix (Menu 1 → Option 3) to auto-fill specs
-2. Choose imported image
-3. Select network (MAC address can be preserved)
-4. Configure disk bus:
-   - **SATA** (recommended for migration) - no drivers needed
-   - **virtio** - best performance, requires drivers
-5. Confirm and create
-
-### 6. Post-Migration
-
-1. **Boot VM** and verify functionality
-2. **Install virtio drivers** (Windows):
-   - Download: https://fedorapeople.org/groups/virt/virtio-win/
-   - Install `virtio-win-gt-x64.msi`
-3. **Change disk bus** to virtio (optional, for better performance)
-4. **Cleanup**:
-   - Delete Harvester source image
-   - Delete staging files
-   - Delete Nutanix export image
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  NUTANIX CLUSTER                                            │
-│  ┌──────────────┐         ┌──────────────┐                 │
-│  │ Source VMs   │ ──────▶ │ Disk Images  │                 │
-│  └──────────────┘  acli   └──────┬───────┘                 │
-└──────────────────────────────────│─────────────────────────┘
-                                   │ Prism API
-                                   ▼
-┌─────────────────────────────────────────────────────────────┐
-│  STAGING (Migration VM)                                     │
-│  ┌──────────────┐         ┌──────────────┐                 │
-│  │ RAW Image    │ ──────▶ │ QCOW2 Image  │                 │
-│  │ (40 GB)      │ qemu-img│ (10 GB)      │                 │
-│  └──────────────┘         └──────┬───────┘                 │
-└──────────────────────────────────│─────────────────────────┘
-                                   │ HTTP Server
-                                   ▼
-┌─────────────────────────────────────────────────────────────┐
-│  HARVESTER CLUSTER                                          │
-│  ┌──────────────┐         ┌──────────────┐                 │
-│  │ VM Image     │ ──────▶ │ Virtual      │                 │
-│  │ (imported)   │         │ Machine      │                 │
-│  └──────────────┘         └──────────────┘                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## Project Structure
-
-```
-hci-migration-tool/
-├── README.md           # This file
-├── config.yaml         # Configuration file
-├── migrate.py          # Main CLI interface
-└── lib/
-    ├── __init__.py     # Module exports
-    ├── utils.py        # Utilities (colors, formatting)
-    ├── nutanix.py      # Nutanix Prism API client
-    ├── harvester.py    # Harvester/KubeVirt API client
-    └── actions.py      # Migration operations
-```
-
-## Troubleshooting
-
-### VM boots to "No bootable device"
-- **Cause**: BIOS/UEFI mismatch
-- **Fix**: Set correct boot type (UEFI if source was UEFI)
-
-### Windows BSOD "INACCESSIBLE BOOT DEVICE"
-- **Cause**: Missing disk drivers
-- **Fix**: Change disk bus from `virtio` to `sata`
-
-### Network not working after migration
-- **Cause**: New MAC address = Windows sees new NIC
-- **Fix**: 
-  - Reconfigure IP on new adapter, OR
-  - Use MAC preservation option during VM creation
-
-### Image import stuck at 0%
-- **Cause**: HTTP server not accessible
-- **Fix**: Check firewall, ensure staging VM is reachable from Harvester
-
-### Slow transfer speeds
-- **Cause**: Network bottleneck between source and staging
-- **Tip**: Place staging VM in same network as source for faster export, only transfer compressed QCOW2 to target
-
-## Optimization Tips
-
-### Faster Migration
-
-Place a staging VM in the Nutanix datacenter:
-1. Export locally (10 Gbps internal)
-2. Convert RAW → QCOW2 locally
-3. Transfer only compressed QCOW2 to Harvester
-
-```
-Nutanix (10 Gbps) → Staging VM → QCOW2 (1 Gbps) → Harvester
-```
-
-### Multiple VMs
-
-Use the "Full migration" option (Menu 3 → Option 9) for batch operations (under development).
-
-## Known Limitations
-
-- Power on/off via API may not work on all Nutanix/Harvester versions
-- Multi-disk VMs require separate image creation for each disk
-- Guest customization (cloud-init) not yet implemented
-
-## License
-
-Internal use - Wyss Center for Bio and Neuroengineering
-
-## Contributing
-
-Contact: IT Infrastructure Team
+- Infrastructure Team @ Wyss Center
