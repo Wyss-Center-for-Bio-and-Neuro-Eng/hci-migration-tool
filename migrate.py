@@ -1321,36 +1321,124 @@ class MigrationTool:
         # Get available networks
         networks = self.harvester.list_all_networks()
         
-        print("\nAvailable networks:")
-        for i, net in enumerate(networks, 1):
-            name = net.get('metadata', {}).get('name', 'N/A')
-            ns = net.get('metadata', {}).get('namespace', 'N/A')
-            print(f"  {i}. {name} ({ns})")
-        
-        choice = self.input_prompt("Network number")
-        try:
-            idx = int(choice) - 1
-            selected_net = networks[idx]
-            network_name = f"{selected_net.get('metadata', {}).get('namespace')}/{selected_net.get('metadata', {}).get('name')}"
-        except:
-            print(colored("Invalid choice", Colors.RED))
+        if not networks:
+            print(colored("❌ No networks available in Harvester", Colors.RED))
             return
         
-        # MAC address option
-        use_source_mac = False
-        custom_mac = None
-        if source_mac:
-            print(f"\n   Source MAC: {colored(source_mac, Colors.YELLOW)}")
-            keep_mac = self.input_prompt("Keep source MAC address? (y/n) [y]")
-            if keep_mac.lower() != 'n':
-                use_source_mac = True
-                custom_mac = source_mac
-                print(colored(f"   ✅ Will use MAC: {source_mac}", Colors.GREEN))
+        # Build source NICs list from Nutanix VM info or vm-config.json
+        source_nics = []
         
-        if not use_source_mac:
-            manual_mac = self.input_prompt("Enter custom MAC (or Enter for auto)")
-            if manual_mac:
-                custom_mac = manual_mac
+        # First try vm-config.json (more detailed with static IPs)
+        if vm_info:
+            staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+            hostname = vm_info.get('hostname') or vm_name
+            config_path = os.path.join(staging_dir, 'migrations', hostname.lower(), 'vm-config.json')
+            
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path) as f:
+                        vm_config = json.load(f)
+                    for iface in vm_config.get('network', {}).get('interfaces', []):
+                        source_nics.append({
+                            'name': iface.get('name', 'Unknown'),
+                            'mac': iface.get('mac', ''),
+                            'ip': iface.get('ip', ''),
+                            'prefix': iface.get('prefix', ''),
+                            'gateway': iface.get('gateway', ''),
+                            'dhcp': iface.get('dhcp', True),
+                            'dns': iface.get('dns', [])
+                        })
+                    print(colored(f"   📋 Loaded network config from: {config_path}", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not load vm-config.json: {e}", Colors.YELLOW))
+        
+        # Fallback to Nutanix VM info
+        if not source_nics and vm_info and vm_info.get('nics'):
+            for nic in vm_info['nics']:
+                source_nics.append({
+                    'name': nic.get('subnet', 'Unknown'),
+                    'mac': nic.get('mac', ''),
+                    'ip': nic.get('ip', ''),
+                    'prefix': '',
+                    'gateway': '',
+                    'dhcp': True,
+                    'dns': []
+                })
+        
+        # Default to 1 NIC if no source info
+        if not source_nics:
+            num_nics = self.input_prompt("Number of network interfaces [1]")
+            num_nics = int(num_nics) if num_nics else 1
+            for i in range(num_nics):
+                source_nics.append({
+                    'name': f'NIC-{i}',
+                    'mac': '',
+                    'ip': '',
+                    'prefix': '',
+                    'gateway': '',
+                    'dhcp': True,
+                    'dns': []
+                })
+        
+        # Network mapping: for each source NIC, select target Harvester network
+        print(colored(f"\n🌐 Network Mapping ({len(source_nics)} NIC(s)):", Colors.BOLD))
+        print(colored("   Map each source NIC to a Harvester network", Colors.CYAN))
+        
+        nic_configs = []  # Will store {network_name, mac, source_info}
+        
+        for i, src_nic in enumerate(source_nics):
+            print(colored(f"\n   --- Source NIC {i}: {src_nic['name']} ---", Colors.BOLD))
+            if src_nic['mac']:
+                print(f"      MAC: {colored(src_nic['mac'], Colors.YELLOW)}")
+            if src_nic['ip']:
+                prefix = f"/{src_nic['prefix']}" if src_nic['prefix'] else ""
+                dhcp_status = "(DHCP)" if src_nic['dhcp'] else "(Static)"
+                print(f"      IP:  {colored(src_nic['ip'] + prefix, Colors.YELLOW)} {dhcp_status}")
+            if src_nic['gateway']:
+                print(f"      GW:  {src_nic['gateway']}")
+            if src_nic['dns']:
+                print(f"      DNS: {', '.join(src_nic['dns'])}")
+            
+            # List available Harvester networks
+            print(f"\n   Available Harvester networks:")
+            for j, net in enumerate(networks, 1):
+                name = net.get('metadata', {}).get('name', 'N/A')
+                ns = net.get('metadata', {}).get('namespace', 'N/A')
+                # Try to get VLAN ID from config
+                vlan_id = net.get('spec', {}).get('vlan', '')
+                vlan_str = f" (VLAN {vlan_id})" if vlan_id else ""
+                print(f"     {j}. {name} ({ns}){vlan_str}")
+            
+            choice = self.input_prompt(f"   Network for NIC {i}")
+            if not choice:
+                print(colored("   Cancelled", Colors.YELLOW))
+                return
+            try:
+                idx = int(choice) - 1
+                selected_net = networks[idx]
+                net_name = f"{selected_net.get('metadata', {}).get('namespace')}/{selected_net.get('metadata', {}).get('name')}"
+            except:
+                print(colored("   Invalid choice", Colors.RED))
+                return
+            
+            # MAC address option
+            use_mac = None
+            if src_nic['mac']:
+                keep_mac = self.input_prompt(f"   Keep MAC {src_nic['mac']}? (y/n) [y]")
+                if keep_mac.lower() != 'n':
+                    use_mac = src_nic['mac']
+                    print(colored(f"   ✅ Will use MAC: {use_mac}", Colors.GREEN))
+            
+            if not use_mac:
+                manual_mac = self.input_prompt("   Custom MAC (or Enter for auto)")
+                if manual_mac:
+                    use_mac = manual_mac
+            
+            nic_configs.append({
+                'network_name': net_name,
+                'mac': use_mac,
+                'source': src_nic
+            })
         
         # Get storage classes
         storage_classes = self.harvester.list_storage_classes()
@@ -1410,13 +1498,12 @@ class MigrationTool:
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
             print(f"      Disk {i}: {img['name']} ({img['namespace']}) - {size} GB")
         print(f"   Disk bus: {disk_bus}")
-        print(f"   Network: {network_name}")
-        if custom_mac:
-            print(f"   MAC: {custom_mac}")
-        else:
-            print(f"   MAC: auto-generated")
-        if source_ip:
-            print(f"   Source IP (for reference): {source_ip}")
+        print(f"   Network interfaces: {len(nic_configs)}")
+        for i, nic in enumerate(nic_configs):
+            mac_str = nic['mac'] if nic['mac'] else "auto"
+            src_ip = nic['source'].get('ip', '')
+            ip_str = f" (was: {src_ip})" if src_ip else ""
+            print(f"      NIC {i}: {nic['network_name']} - MAC: {mac_str}{ip_str}")
         print(f"   Storage: {storage_class}")
         print(f"   CPU: {cpu} cores")
         print(f"   RAM: {ram} GB")
@@ -1478,6 +1565,30 @@ class MigrationTool:
                 }
             })
         
+        # Build network interfaces and networks arrays
+        interfaces_spec = []
+        networks_spec = []
+        
+        for i, nic in enumerate(nic_configs):
+            nic_name = f"nic-{i}"
+            
+            # Interface spec
+            iface_spec = {
+                "name": nic_name,
+                "bridge": {}
+            }
+            if nic['mac']:
+                iface_spec["macAddress"] = nic['mac']
+            interfaces_spec.append(iface_spec)
+            
+            # Network spec
+            networks_spec.append({
+                "name": nic_name,
+                "multus": {
+                    "networkName": nic['network_name']
+                }
+            })
+        
         # Build manifest
         print("\n🚀 Creating VM...")
         try:
@@ -1511,25 +1622,13 @@ class MigrationTool:
                                 },
                                 "devices": {
                                     "disks": disks_spec,
-                                    "interfaces": [
-                                        {
-                                            "name": "nic-0",
-                                            "bridge": {}
-                                        }
-                                    ]
+                                    "interfaces": interfaces_spec
                                 },
                                 "machine": {
                                     "type": "q35"
                                 }
                             },
-                            "networks": [
-                                {
-                                    "name": "nic-0",
-                                    "multus": {
-                                        "networkName": network_name
-                                    }
-                                }
-                            ],
+                            "networks": networks_spec,
                             "volumes": volumes_spec
                         }
                     },
@@ -1550,10 +1649,6 @@ class MigrationTool:
                 manifest['spec']['template']['spec']['domain']['machine'] = {
                     "type": "q35"
                 }
-            
-            # Add custom MAC address if specified
-            if custom_mac:
-                manifest['spec']['template']['spec']['domain']['devices']['interfaces'][0]['macAddress'] = custom_mac
             
             result = self.harvester.create_vm(manifest)
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
@@ -1735,7 +1830,8 @@ class MigrationTool:
                 ("3", "View VM config"),
                 ("4", "Download virtio/qemu-ga tools"),
                 ("5", "Generate post-migration script"),
-                ("6", "Vault management"),
+                ("6", "Post-migration auto-configure"),
+                ("7", "Vault management"),
                 ("0", "Back")
             ])
             
@@ -1757,6 +1853,9 @@ class MigrationTool:
                 self.generate_postmig_script()
                 self.pause()
             elif choice == "6":
+                self.postmig_autoconfigure()
+                self.pause()
+            elif choice == "7":
                 self.menu_vault()
             elif choice == "0":
                 break
@@ -2276,6 +2375,241 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
             
         except (ValueError, IndexError):
             print(colored("Invalid choice", Colors.RED))
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def postmig_autoconfigure(self):
+        """Auto-configure Windows VM after migration using QEMU Guest Agent."""
+        print(colored("\n🔧 Post-Migration Auto-Configure", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        if not WINRM_AVAILABLE:
+            print(colored("❌ pywinrm not installed", Colors.RED))
+            return
+        
+        # List VMs in Harvester
+        vms = self.harvester.list_vms()
+        if not vms:
+            print(colored("❌ No VMs found in Harvester", Colors.RED))
+            return
+        
+        print("\nHarvester VMs:")
+        for i, vm in enumerate(vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            status = vm.get('status', {})
+            running = status.get('ready', False)
+            state = "🟢 Running" if running else "🔴 Stopped"
+            print(f"  {i}. {name} ({ns}) - {state}")
+        
+        choice = self.input_prompt("\nSelect VM number")
+        if not choice:
+            return
+        
+        try:
+            idx = int(choice) - 1
+            selected_vm = vms[idx]
+            vm_name = selected_vm.get('metadata', {}).get('name')
+            namespace = selected_vm.get('metadata', {}).get('namespace')
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        # Check if VM is running
+        vm_status = selected_vm.get('status', {})
+        if not vm_status.get('ready', False):
+            print(colored(f"\n⚠️  VM {vm_name} is not running", Colors.YELLOW))
+            start = self.input_prompt("Start it now? (y/n)")
+            if start.lower() == 'y':
+                print("   Starting VM...")
+                try:
+                    self.harvester.start_vm(namespace, vm_name)
+                    print(colored("   ✅ Start command sent. Waiting 30s for boot...", Colors.GREEN))
+                    import time
+                    time.sleep(30)
+                except Exception as e:
+                    print(colored(f"   ❌ Error: {e}", Colors.RED))
+                    return
+            else:
+                return
+        
+        # Get VM IP from Guest Agent
+        print(colored(f"\n🔍 Getting IP from QEMU Guest Agent...", Colors.CYAN))
+        
+        import time
+        max_attempts = 24  # 2 minutes max
+        vm_ip = None
+        
+        for attempt in range(max_attempts):
+            try:
+                vmi = self.harvester._request(
+                    "GET", 
+                    f"/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachineinstances/{vm_name}"
+                )
+                
+                interfaces = vmi.get('status', {}).get('interfaces', [])
+                for iface in interfaces:
+                    ip = iface.get('ipAddress')
+                    if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                        vm_ip = ip
+                        break
+                
+                if vm_ip:
+                    print(colored(f"\n   ✅ Found IP: {vm_ip}", Colors.GREEN))
+                    break
+                
+                if attempt % 4 == 0:
+                    print(f"   ... waiting for Guest Agent ({attempt * 5}s)")
+                time.sleep(5)
+                
+            except Exception as e:
+                if attempt % 4 == 0:
+                    print(f"   ... VM not ready ({attempt * 5}s)")
+                time.sleep(5)
+        
+        if not vm_ip:
+            print(colored("\n❌ Could not get IP from Guest Agent", Colors.RED))
+            manual_ip = self.input_prompt("   Enter IP manually (or Enter to cancel)")
+            if manual_ip:
+                vm_ip = manual_ip
+            else:
+                return
+        
+        # Load vm-config.json
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        config_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-config.json')
+        
+        if not os.path.exists(config_path):
+            migrations_dir = os.path.join(staging_dir, 'migrations')
+            if os.path.exists(migrations_dir):
+                configs = [d for d in os.listdir(migrations_dir) 
+                          if os.path.exists(os.path.join(migrations_dir, d, 'vm-config.json'))]
+                if configs:
+                    print(f"\n   Config not found for '{vm_name}'. Available:")
+                    for i, cfg in enumerate(configs, 1):
+                        print(f"     {i}. {cfg}")
+                    choice = self.input_prompt("   Select config number")
+                    try:
+                        idx = int(choice) - 1
+                        config_path = os.path.join(migrations_dir, configs[idx], 'vm-config.json')
+                    except:
+                        return
+        
+        if not os.path.exists(config_path):
+            print(colored(f"❌ Config not found. Run pre-migration check first.", Colors.RED))
+            return
+        
+        try:
+            with open(config_path) as f:
+                vm_config = json.load(f)
+            print(colored(f"   📋 Loaded: {config_path}", Colors.GREEN))
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+            return
+        
+        # Show config to apply
+        print(colored("\n📋 Network Configuration to Apply:", Colors.BOLD))
+        interfaces = vm_config.get('network', {}).get('interfaces', [])
+        static_interfaces = []
+        
+        for iface in interfaces:
+            dhcp = iface.get('dhcp', True)
+            name = iface.get('name', 'Unknown')
+            if not dhcp:
+                static_interfaces.append(iface)
+                print(f"   {name}: {iface.get('ip')}/{iface.get('prefix')}")
+                print(f"      Gateway: {iface.get('gateway')}")
+                print(f"      DNS: {', '.join(iface.get('dns', []))}")
+            else:
+                print(f"   {name}: DHCP (no change)")
+        
+        if not static_interfaces:
+            print(colored("\n✅ All interfaces use DHCP - no reconfiguration needed!", Colors.GREEN))
+            return
+        
+        confirm = self.input_prompt("\nApply configuration? (y/n)")
+        if confirm.lower() != 'y':
+            return
+        
+        # Connect via WinRM (NTLM)
+        print(colored(f"\n🔌 Connecting to {vm_ip}...", Colors.CYAN))
+        
+        try:
+            username, password = self.vault.get_credential("local-admin")
+            print(f"   Using: {username}")
+        except:
+            username = self.input_prompt("   Username [Administrator]") or "Administrator"
+            import getpass
+            password = getpass.getpass("   Password: ")
+        
+        try:
+            client = WinRMClient(
+                host=vm_ip,
+                username=username,
+                password=password,
+                transport="ntlm"
+            )
+            
+            if not client.test_connection():
+                print(colored("❌ WinRM connection failed", Colors.RED))
+                print(colored("   Tip: Ensure WinRM is enabled and firewall allows it", Colors.YELLOW))
+                return
+            
+            print(colored("   ✅ Connected!", Colors.GREEN))
+            
+            # Apply each static interface config
+            for iface in static_interfaces:
+                iface_name = iface.get('name', 'Ethernet')
+                ip = iface.get('ip')
+                prefix = iface.get('prefix', 24)
+                gateway = iface.get('gateway', '')
+                dns_list = iface.get('dns', [])
+                
+                print(colored(f"\n   🔧 Configuring {iface_name}...", Colors.CYAN))
+                
+                # PowerShell to set static IP
+                ps_script = f'''
+$ErrorActionPreference = "Stop"
+$ifName = "{iface_name}"
+$ip = "{ip}"
+$prefix = {prefix}
+$gateway = "{gateway}"
+$dns = @({','.join([f'"{d}"' for d in dns_list])})
+
+Write-Host "Configuring $ifName..."
+
+# Remove existing IP config
+Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+
+# Set new IP
+New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
+Write-Host "IP set: $ip/$prefix via $gateway"
+
+# Set DNS
+Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
+Write-Host "DNS set: $($dns -join ', ')"
+
+Write-Host "Configuration complete!"
+'''
+                stdout, stderr, rc = client.run_powershell(ps_script)
+                
+                if rc == 0:
+                    print(colored(f"   ✅ {iface_name} configured", Colors.GREEN))
+                    for line in stdout.strip().split('\n'):
+                        if line.strip():
+                            print(f"      {line}")
+                else:
+                    print(colored(f"   ❌ Failed (exit code: {rc})", Colors.RED))
+                    if stderr:
+                        print(f"      {stderr[:200]}")
+            
+            print(colored("\n✅ Post-migration configuration complete!", Colors.GREEN))
+            print(colored(f"   VM should now be reachable at its original IP(s)", Colors.CYAN))
+            
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
