@@ -1874,21 +1874,7 @@ class MigrationTool:
                 'source': src_nic
             })
         
-        # Get storage classes
-        storage_classes = self.harvester.list_storage_classes()
-        
-        print("\nAvailable storage classes:")
-        for i, sc in enumerate(storage_classes, 1):
-            name = sc.get('metadata', {}).get('name', 'N/A')
-            default = "(default)" if sc.get('metadata', {}).get('annotations', {}).get('storageclass.kubernetes.io/is-default-class') == 'true' else ""
-            print(f"  {i}. {name} {default}")
-        
-        choice = self.input_prompt("Storage class number [1]")
-        try:
-            idx = int(choice) - 1 if choice else 0
-            storage_class = storage_classes[idx].get('metadata', {}).get('name')
-        except:
-            storage_class = storage_classes[0].get('metadata', {}).get('name')
+        # Note: Storage class is determined automatically per image (longhorn-<image-name>)
         
         # CPU, RAM, Boot type
         default_cpu = vm_info['vcpu'] if vm_info else 2
@@ -1930,7 +1916,8 @@ class MigrationTool:
         print(f"   Namespace: {namespace}")
         print(f"   Disks: {num_disks}")
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
-            print(f"      Disk {i}: {img['name']} ({img['namespace']}) - {size} GB")
+            img_sc = f"longhorn-{img['name']}"
+            print(f"      Disk {i}: {img['name']} - {size} GB (storage: {img_sc})")
         print(f"   Disk bus: {disk_bus}")
         print(f"   Network interfaces: {len(nic_configs)}")
         for i, nic in enumerate(nic_configs):
@@ -1938,7 +1925,6 @@ class MigrationTool:
             src_ip = nic['source'].get('ip', '')
             ip_str = f" (was: {src_ip})" if src_ip else ""
             print(f"      NIC {i}: {nic['network_name']} - MAC: {mac_str}{ip_str}")
-        print(f"   Storage: {storage_class}")
         print(f"   CPU: {cpu} cores")
         print(f"   RAM: {ram} GB")
         print(f"   Boot: {boot}")
@@ -1975,6 +1961,10 @@ class MigrationTool:
                 }
             })
             
+            # For Harvester, when using an image, we must use the image's storageClass
+            # The storageClass is automatically created as "longhorn-<image-name>"
+            image_storage_class = f"longhorn-{img['name']}"
+            
             # DataVolumeTemplate with image reference
             data_volume_templates.append({
                 "metadata": {
@@ -1991,7 +1981,7 @@ class MigrationTool:
                                 "storage": f"{size}Gi"
                             }
                         },
-                        "storageClassName": storage_class
+                        "storageClassName": image_storage_class
                     },
                     "source": {
                         "blank": {}
@@ -2087,8 +2077,11 @@ class MigrationTool:
             result = self.harvester.create_vm(manifest)
             print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
             
-            # Auto-dissociate volumes from images
-            self._auto_dissociate_volumes(vm_name, namespace, data_volume_templates)
+            # Auto-dissociate disabled for now - can be done manually in Harvester UI
+            # The volumes will remain linked to images until manually dissociated
+            # self._auto_dissociate_volumes(vm_name, namespace, data_volume_templates)
+            print(colored("\n💡 TIP: After VM is running, you can dissociate volumes from images", Colors.CYAN))
+            print(colored("   via Harvester UI: Volumes → Select volume → Dissociate Image", Colors.CYAN))
             
             # Remind about Nutanix image cleanup
             print(colored("\n💡 Don't forget to delete the Nutanix export images (Menu Nutanix → Delete image)", Colors.YELLOW))
