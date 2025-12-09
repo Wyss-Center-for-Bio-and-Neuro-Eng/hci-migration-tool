@@ -3695,7 +3695,7 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
                     print(colored("\n   🔧 UPDATED DRIVERS & AGENTS STATUS", Colors.BOLD))
                     agents = new_config.agents
                     print(f"      VirtIO Network:  {'✅' if agents.virtio_net else '❌'}")
-                    print(f"      VirtIO Storage:  {'✅' if agents.virtio_scsi else '❌'}")
+                    print(f"      VirtIO Storage:  {'✅' if agents.virtio_storage else '❌'}")
                     print(f"      VirtIO Serial:   {'✅' if agents.virtio_serial else '❌'}")
                     print(f"      VirtIO Balloon:  {'✅' if agents.virtio_balloon else '⚪ (optional)'}")
                     print(f"      QEMU Guest Agent: {'✅' if agents.qemu_guest_agent else '❌'}")
