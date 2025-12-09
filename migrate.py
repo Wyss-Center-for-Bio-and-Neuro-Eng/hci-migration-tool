@@ -2098,6 +2098,15 @@ class MigrationTool:
                                     "interfaces": interfaces_spec,
                                     "inputs": [
                                         {"bus": "usb", "name": "tablet", "type": "tablet"}
+                                    ],
+                                    "channels": [
+                                        {
+                                            "name": "qemu-guest-agent",
+                                            "target": {
+                                                "type": "virtio",
+                                                "name": "org.qemu.guest_agent.0"
+                                            }
+                                        }
                                     ]
                                 },
                                 "features": {
@@ -3403,41 +3412,37 @@ Write-Host "SUCCESS"
         
         # Check what needs to be installed
         install_qemu_ga = not config.agents.qemu_guest_agent
-        install_virtio = not config.agents.virtio_fedora
+        install_virtio = not config.agents.virtio_fedora or not config.agents.virtio_serial
         
         # Verify tools exist
         qemu_ga_msi = os.path.join(tools_dir, 'qemu-ga-x86_64.msi')
-        virtio_msi = os.path.join(tools_dir, 'virtio-win-gt-x64.msi')
+        virtio_iso = os.path.join(tools_dir, 'virtio-win.iso')
         
         if install_qemu_ga and not os.path.exists(qemu_ga_msi):
             print(colored(f"   ❌ QEMU GA MSI not found: {qemu_ga_msi}", Colors.RED))
             print(colored("      Run 'Download virtio/qemu-ga tools' first", Colors.YELLOW))
             return
         
-        if install_virtio and not os.path.exists(virtio_msi):
-            print(colored(f"   ❌ VirtIO MSI not found: {virtio_msi}", Colors.RED))
+        if install_virtio and not os.path.exists(virtio_iso):
+            print(colored(f"   ❌ VirtIO ISO not found: {virtio_iso}", Colors.RED))
             print(colored("      Run 'Download virtio/qemu-ga tools' first", Colors.YELLOW))
             return
         
-        # Start HTTP server to serve MSI files
+        # Start HTTP server to serve files
         print(colored("\n   🚀 Starting HTTP server for file transfer...", Colors.CYAN))
         
         # Get local IP that the Windows server can reach
         import socket
         try:
-            # Get the IP by creating a connection to the target
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            # Resolve the target hostname
             try:
                 target_ip = socket.gethostbyname(host)
             except:
-                # If full FQDN fails, try short name
                 target_ip = socket.gethostbyname(host.split('.')[0])
             s.connect((target_ip, 5985))
             local_ip = s.getsockname()[0]
             s.close()
         except Exception as e:
-            # Fallback - ask user
             print(colored(f"   ⚠️  Could not auto-detect local IP: {e}", Colors.YELLOW))
             local_ip = self.input_prompt("   Enter this machine's IP (reachable from Windows)")
             if not local_ip:
@@ -3468,6 +3473,109 @@ Write-Host "SUCCESS"
         print(colored(f"   ✅ HTTP server running at {http_url}", Colors.GREEN))
         
         try:
+            # Install VirtIO drivers FIRST (before QEMU GA, as GA needs serial driver)
+            if install_virtio:
+                print(colored("\n   📦 Installing VirtIO drivers from ISO...", Colors.CYAN))
+                print(colored("      This includes: Network, Storage, Serial, Balloon, GPU", Colors.CYAN))
+                
+                ps_script = f'''
+$ErrorActionPreference = "Continue"
+$isoUrl = "{http_url}/virtio-win.iso"
+$isoPath = "$env:TEMP\\virtio-win.iso"
+
+# Download ISO
+Write-Host "Downloading VirtIO ISO (~500MB)... This may take a few minutes."
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest -Uri $isoUrl -OutFile $isoPath -UseBasicParsing
+Write-Host "Download complete."
+
+# Mount ISO
+Write-Host "Mounting ISO..."
+$mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
+$driveLetter = ($mountResult | Get-Volume).DriveLetter
+$driverPath = "${{driveLetter}}:"
+Write-Host "ISO mounted on $driverPath"
+
+# Detect Windows version for driver folder
+$osVersion = [System.Environment]::OSVersion.Version
+$winVersion = "2k22"
+if ($osVersion.Build -lt 9200) {{ $winVersion = "2k8R2" }}
+elseif ($osVersion.Build -lt 9600) {{ $winVersion = "2k12" }}
+elseif ($osVersion.Build -lt 14393) {{ $winVersion = "2k12R2" }}
+elseif ($osVersion.Build -lt 17763) {{ $winVersion = "2k16" }}
+elseif ($osVersion.Build -lt 20348) {{ $winVersion = "2k19" }}
+Write-Host "Windows version: $winVersion (Build $($osVersion.Build))"
+
+# Driver list - order matters (serial before QEMU GA can work)
+$drivers = @(
+    @{{Name="VirtIO Serial"; Path="vioserial\\$winVersion\\amd64"}},
+    @{{Name="VirtIO Balloon"; Path="Balloon\\$winVersion\\amd64"}},
+    @{{Name="VirtIO Network"; Path="NetKVM\\$winVersion\\amd64"}},
+    @{{Name="VirtIO SCSI"; Path="vioscsi\\$winVersion\\amd64"}},
+    @{{Name="VirtIO Block"; Path="viostor\\$winVersion\\amd64"}},
+    @{{Name="VirtIO RNG"; Path="viorng\\$winVersion\\amd64"}},
+    @{{Name="VirtIO GPU"; Path="viogpudo\\$winVersion\\amd64"}},
+    @{{Name="QEMU FWCfg"; Path="fwcfg\\$winVersion\\amd64"}},
+    @{{Name="QEMU PVPanic"; Path="pvpanic\\$winVersion\\amd64"}}
+)
+
+$installed = 0
+$failed = 0
+
+foreach ($driver in $drivers) {{
+    $fullPath = Join-Path $driverPath $driver.Path
+    if (Test-Path $fullPath) {{
+        Write-Host "Installing $($driver.Name)..."
+        $infFiles = Get-ChildItem -Path $fullPath -Filter "*.inf"
+        foreach ($inf in $infFiles) {{
+            $result = pnputil.exe /add-driver $inf.FullName /install 2>&1
+            if ($LASTEXITCODE -eq 0 -or $result -match "successfully") {{
+                Write-Host "  OK: $($inf.Name)"
+                $installed++
+            }} else {{
+                Write-Host "  Skip: $($inf.Name) (already installed or not needed)"
+            }}
+        }}
+    }} else {{
+        Write-Host "  Path not found: $($driver.Path) - trying w11 folder..."
+        # Try Windows 11/Server 2022 folder as fallback
+        $altPath = $driver.Path -replace "2k22", "w11"
+        $fullPath = Join-Path $driverPath $altPath
+        if (Test-Path $fullPath) {{
+            $infFiles = Get-ChildItem -Path $fullPath -Filter "*.inf"
+            foreach ($inf in $infFiles) {{
+                $result = pnputil.exe /add-driver $inf.FullName /install 2>&1
+                if ($LASTEXITCODE -eq 0) {{
+                    Write-Host "  OK: $($inf.Name)"
+                    $installed++
+                }}
+            }}
+        }}
+    }}
+}}
+
+# Unmount and cleanup
+Write-Host "Cleaning up..."
+Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
+
+Write-Host ""
+Write-Host "VirtIO drivers installation complete. $installed driver(s) installed."
+Write-Host "A reboot may be required for all drivers to be active."
+'''
+                stdout, stderr, rc = client.run_powershell(ps_script, timeout=600)  # 10 min timeout for download
+                if rc == 0:
+                    print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                    if stdout.strip():
+                        for line in stdout.strip().split('\n'):
+                            print(f"      {line}")
+                else:
+                    print(colored(f"   ⚠️  Some drivers may have failed (exit code: {rc})", Colors.YELLOW))
+                    if stdout.strip():
+                        for line in stdout.strip().split('\n'):
+                            print(f"      {line}")
+            
             # Install QEMU Guest Agent
             if install_qemu_ga:
                 print(colored("\n   📦 Installing QEMU Guest Agent...", Colors.CYAN))
@@ -3489,7 +3597,8 @@ if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
     Write-Host "QEMU Guest Agent installed successfully"
     # Start the service
     Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
-    Start-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue
+    # Set to auto-start
+    Set-Service -Name "QEMU-GA" -StartupType Automatic -ErrorAction SilentlyContinue
 }} else {{
     Write-Host "Installation failed with exit code: $($process.ExitCode)"
 }}
@@ -3508,42 +3617,13 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
                     if stderr.strip():
                         print(f"      {stderr.strip()}")
             
-            # Install VirtIO drivers
-            if install_virtio:
-                print(colored("\n   📦 Installing VirtIO drivers...", Colors.CYAN))
-                
-                ps_script = f'''
-$ErrorActionPreference = "Stop"
-$msiUrl = "{http_url}/virtio-win-gt-x64.msi"
-$msiPath = "$env:TEMP\\virtio-win-gt-x64.msi"
-
-# Download MSI
-Write-Host "Downloading VirtIO drivers..."
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
-
-# Install silently
-Write-Host "Installing VirtIO drivers..."
-$process = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru -NoNewWindow
-if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
-    Write-Host "VirtIO drivers installed successfully"
-}} else {{
-    Write-Host "Installation failed with exit code: $($process.ExitCode)"
-}}
-
-# Cleanup
-Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-'''
-                stdout, stderr, rc = client.run_powershell(ps_script)
-                if rc == 0:
-                    print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
-                    if stdout.strip():
-                        for line in stdout.strip().split('\n'):
-                            print(f"      {line}")
-                else:
-                    print(colored(f"   ❌ Installation failed (exit code: {rc})", Colors.RED))
-                    if stderr.strip():
-                        print(f"      {stderr.strip()}")
+            # Recommend reboot
+            print(colored("\n   ⚠️  A reboot is recommended to activate all drivers", Colors.YELLOW))
+            reboot = self.input_prompt("   Reboot now? (y/n)")
+            if reboot.lower() == 'y':
+                print("   Rebooting VM...")
+                client.run_powershell("Restart-Computer -Force")
+                print(colored("   ✅ Reboot initiated - wait 2-3 minutes then re-run pre-check", Colors.GREEN))
         
         finally:
             # Stop HTTP server
