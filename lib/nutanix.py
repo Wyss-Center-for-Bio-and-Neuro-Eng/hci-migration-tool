@@ -205,7 +205,7 @@ class NutanixClient:
         return False  # Timeout
 
     def download_image(self, image_uuid: str, dest_path: str, 
-                       progress_callback=None) -> bool:
+                       progress_callback=None, use_aria2=True) -> bool:
         """
         Download image to file.
         
@@ -213,12 +213,124 @@ class NutanixClient:
             image_uuid: UUID of the image
             dest_path: Destination file path
             progress_callback: Optional callback(downloaded, total) for progress
+            use_aria2: Use aria2c for faster multi-connection download
         
         Returns:
             True if successful
         """
         url = self.get_image_download_url(image_uuid)
         
+        # Try aria2c first (much faster with multi-connection)
+        if use_aria2:
+            try:
+                return self._download_with_aria2(url, dest_path, progress_callback)
+            except Exception as e:
+                print(f"      aria2c failed ({e}), falling back to Python...")
+        
+        # Fallback to Python requests
+        return self._download_with_requests(url, dest_path, progress_callback)
+    
+    def _download_with_aria2(self, url: str, dest_path: str, progress_callback=None) -> bool:
+        """Download using aria2c for maximum speed."""
+        import subprocess
+        import os
+        import time
+        import shutil
+        
+        # Check if aria2c is available
+        if not shutil.which('aria2c'):
+            raise Exception("aria2c not installed")
+        
+        dest_dir = os.path.dirname(dest_path)
+        dest_file = os.path.basename(dest_path)
+        
+        # Build aria2c command
+        # -x16: 16 connections per server
+        # -s16: split file into 16 parts
+        # -k1M: min split size 1MB
+        # --file-allocation=none: don't pre-allocate (faster start)
+        # --check-certificate=false: skip SSL verify
+        cmd = [
+            'aria2c',
+            '-x16', '-s16',
+            '-k1M',
+            '--file-allocation=none',
+            '--check-certificate=false',
+            '--http-user=' + self.auth[0],
+            '--http-passwd=' + self.auth[1],
+            '-d', dest_dir,
+            '-o', dest_file,
+            '--console-log-level=warn',
+            '--summary-interval=5',
+            url
+        ]
+        
+        print(f"      Using aria2c (16 parallel connections)...")
+        
+        # Run aria2c with real-time output
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        # Monitor progress
+        last_size = 0
+        start_time = time.time()
+        
+        for line in process.stdout:
+            line = line.strip()
+            # Parse aria2c progress output
+            if '[#' in line and '%' in line:
+                # Extract percentage and speed from aria2c output
+                # Format: [#abc 123MiB/456MiB(27%) CN:16 DL:45MiB]
+                try:
+                    if '(' in line and ')' in line:
+                        pct_str = line.split('(')[1].split(')')[0].replace('%', '')
+                        pct = float(pct_str)
+                        
+                        # Extract downloaded size
+                        size_part = line.split('[#')[1].split('(')[0]
+                        if '/' in size_part:
+                            dl_str = size_part.split('/')[0].strip()
+                            # Parse size (e.g., "123MiB", "1.2GiB")
+                            dl_gb = 0
+                            if 'GiB' in dl_str:
+                                dl_gb = float(dl_str.replace('GiB', ''))
+                            elif 'MiB' in dl_str:
+                                dl_gb = float(dl_str.replace('MiB', '')) / 1024
+                            
+                            # Extract speed
+                            speed = ""
+                            if 'DL:' in line:
+                                speed = line.split('DL:')[1].split(']')[0].split()[0]
+                            
+                            print(f"\r      Progress: {pct:.0f}% ({dl_gb:.1f} GB) - {speed}/s     ", end='', flush=True)
+                except:
+                    pass
+            elif 'Download complete' in line or 'download completed' in line.lower():
+                print(f"\n      Download complete!")
+        
+        process.wait()
+        
+        if process.returncode != 0:
+            raise Exception(f"aria2c exited with code {process.returncode}")
+        
+        # Verify file exists
+        if not os.path.exists(dest_path):
+            raise Exception(f"File not created: {dest_path}")
+        
+        elapsed = time.time() - start_time
+        size_gb = os.path.getsize(dest_path) / (1024**3)
+        speed = size_gb / elapsed * 1024 if elapsed > 0 else 0
+        print(f"      Average speed: {speed:.0f} MB/s ({size_gb:.1f} GB in {elapsed:.0f}s)")
+        
+        return True
+    
+    def _download_with_requests(self, url: str, dest_path: str, progress_callback=None) -> bool:
+        """Download using Python requests (fallback)."""
         response = requests.get(
             url,
             auth=self.auth,
