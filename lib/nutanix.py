@@ -381,7 +381,8 @@ class NutanixClient:
     
     def get_vm_vdisks_v2(self, vm_name: str) -> List[Dict]:
         """
-        Get VM vdisk info via API v2 (returns vmdisk_uuid for NFS access).
+        Get VM vdisk info via API v2 /vms/ with include_vm_disk_config=true.
+        Returns vmdisk_uuid which is the actual NFS filename.
         
         Args:
             vm_name: VM name
@@ -389,34 +390,53 @@ class NutanixClient:
         Returns:
             List of dicts with uuid, nfs_path, container, size
         """
-        # Use v2 API to get all virtual disks
-        url = f"https://{self.prism_ip}:9440/PrismGateway/services/rest/v2.0/virtual_disks/"
+        # Use v2 API /vms/ with disk config - this returns vmdisk_uuid correctly
+        url = f"https://{self.prism_ip}:9440/PrismGateway/services/rest/v2.0/vms/"
+        params = {'include_vm_disk_config': 'true'}
         
         response = requests.get(
             url,
             auth=self.auth,
+            params=params,
             verify=self.verify_ssl
         )
         response.raise_for_status()
         
-        all_disks = response.json().get('entities', [])
+        # Find the VM by name
+        target_vm = None
+        for vm in response.json().get('entities', []):
+            if vm.get('name') == vm_name:
+                target_vm = vm
+                break
         
-        # Filter by attached VM name
+        if not target_vm:
+            raise ValueError(f"VM '{vm_name}' not found")
+        
+        # Extract disk information
         vm_disks = []
-        for disk in all_disks:
-            if disk.get('attached_vmname') == vm_name:
-                nfs_path = disk.get('nutanix_nfsfile_path', '')
+        for disk_info in target_vm.get('vm_disk_info', []):
+            # Skip CDROMs and empty disks
+            if disk_info.get('is_cdrom', False) or disk_info.get('is_empty', False):
+                continue
+            
+            disk_addr = disk_info.get('disk_address', {})
+            vmdisk_uuid = disk_addr.get('vmdisk_uuid')
+            nfs_path = disk_addr.get('ndfs_filepath', '')
+            
+            if vmdisk_uuid and nfs_path:
                 # Extract container from path like "/container01/.acropolis/vmdisk/uuid"
-                parts = nfs_path.split('/')
-                container = parts[1] if len(parts) > 1 else ''
+                parts = nfs_path.strip('/').split('/')
+                container = parts[0] if parts else ''
                 
                 vm_disks.append({
-                    'uuid': disk.get('uuid'),  # This is the NFS filename
+                    'uuid': vmdisk_uuid,  # This is the NFS filename
                     'nfs_path': nfs_path,
                     'container': container,
-                    'size_bytes': disk.get('disk_capacity_in_bytes', 0),
-                    'device_uuid': disk.get('device_uuid'),
-                    'disk_address': disk.get('disk_address', '')
+                    'size_bytes': disk_info.get('size', 0),
+                    'device_uuid': disk_addr.get('device_uuid', ''),
+                    'disk_address': disk_addr.get('disk_label', ''),
+                    'device_bus': disk_addr.get('device_bus', ''),
+                    'device_index': disk_addr.get('device_index', 0),
                 })
         
         # Sort by disk_address (scsi.0, scsi.1, etc.)
