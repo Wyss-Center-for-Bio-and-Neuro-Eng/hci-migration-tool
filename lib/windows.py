@@ -179,7 +179,8 @@ class WinRMClient:
     """WinRM client for Windows remote management."""
     
     def __init__(self, host: str, username: str = None, password: str = None,
-                 transport: str = "kerberos", port: int = 5985, ssl: bool = False):
+                 transport: str = "kerberos", port: int = 5985, ssl: bool = False,
+                 operation_timeout: int = 300, read_timeout: int = 310):
         """
         Initialize WinRM client.
         
@@ -190,6 +191,8 @@ class WinRMClient:
             transport: "kerberos", "ntlm", or "basic"
             port: WinRM port (5985 HTTP, 5986 HTTPS)
             ssl: Use SSL/TLS
+            operation_timeout: WinRM operation timeout in seconds
+            read_timeout: HTTP read timeout in seconds
         """
         if not WINRM_AVAILABLE:
             raise ImportError("pywinrm not installed. Run: pip install pywinrm[kerberos]")
@@ -208,21 +211,27 @@ class WinRMClient:
                 endpoint,
                 auth=(username or '', password or ''),
                 transport='kerberos',
-                server_cert_validation='ignore'
+                server_cert_validation='ignore',
+                operation_timeout_sec=operation_timeout,
+                read_timeout_sec=read_timeout
             )
         elif transport == "ntlm":
             self.session = winrm.Session(
                 endpoint,
                 auth=(username, password),
                 transport='ntlm',
-                server_cert_validation='ignore'
+                server_cert_validation='ignore',
+                operation_timeout_sec=operation_timeout,
+                read_timeout_sec=read_timeout
             )
         else:  # basic
             self.session = winrm.Session(
                 endpoint,
                 auth=(username, password),
                 transport='basic',
-                server_cert_validation='ignore'
+                server_cert_validation='ignore',
+                operation_timeout_sec=operation_timeout,
+                read_timeout_sec=read_timeout
             )
     
     def run_powershell(self, script: str, timeout: int = 60) -> Tuple[str, str, int]:
