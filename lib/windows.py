@@ -42,12 +42,22 @@ class DiskInfo:
 
 @dataclass
 class AgentStatus:
-    """Guest agent status."""
+    """Guest agent and driver status for migration."""
+    # Nutanix-specific
     ngt_installed: bool = False
     ngt_version: Optional[str] = None
     virtio_nutanix: bool = False
+    # Fedora/Red Hat VirtIO drivers
     virtio_fedora: bool = False
+    virtio_net: bool = False
+    virtio_storage: bool = False
+    virtio_serial: bool = False
+    virtio_balloon: bool = False
+    vioserial_device_present: bool = False
+    # QEMU Guest Agent
     qemu_guest_agent: bool = False
+    qemu_guest_agent_running: bool = False
+    qemu_guest_agent_autostart: bool = False
 
 
 @dataclass
@@ -79,11 +89,14 @@ class VMConfig:
     rdp_enabled: bool
     migration_ready: bool
     missing_prerequisites: List[str]
+    warnings: List[str] = None
     listening_services: List[ListeningService] = None
     
     def __post_init__(self):
         if self.listening_services is None:
             self.listening_services = []
+        if self.warnings is None:
+            self.warnings = []
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -497,26 +510,72 @@ if ($ngt) {
 # Check Nutanix VirtIO drivers
 $virtioNutanix = (Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.Manufacturer -like "*Nutanix*" }).Count -gt 0
 
-# Check Fedora/Red Hat VirtIO drivers
-$virtioFedora = (Get-WmiObject Win32_PnPSignedDriver | Where-Object { 
+# Get all PnP signed drivers for VirtIO checks
+$allDrivers = Get-WmiObject Win32_PnPSignedDriver
+
+# Check Fedora/Red Hat VirtIO drivers (any)
+$virtioFedora = ($allDrivers | Where-Object { 
     $_.Manufacturer -like "*Red Hat*" -or $_.DeviceName -like "*VirtIO*" 
 }).Count -gt 0
 
-# Check QEMU Guest Agent
+# Check specific VirtIO drivers needed for Harvester/KubeVirt
+# VirtIO Network adapter
+$virtioNet = ($allDrivers | Where-Object { 
+    $_.DeviceName -like "*VirtIO*Net*" -or 
+    ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "Net")
+}).Count -gt 0
+
+# VirtIO SCSI/Block storage
+$virtioStorage = ($allDrivers | Where-Object { 
+    $_.DeviceName -like "*VirtIO*SCSI*" -or 
+    $_.DeviceName -like "*VirtIO*Stor*" -or
+    ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "SCSIAdapter")
+}).Count -gt 0
+
+# VirtIO Serial (required for QEMU Guest Agent communication)
+$virtioSerial = ($allDrivers | Where-Object { 
+    $_.DeviceName -like "*VirtIO*Serial*" -or
+    $_.DeviceName -like "*VirtIO Serial Driver*"
+}).Count -gt 0
+
+# VirtIO Balloon (memory management - optional but recommended)
+$virtioBalloon = ($allDrivers | Where-Object { 
+    $_.DeviceName -like "*VirtIO*Balloon*"
+}).Count -gt 0
+
+# Check QEMU Guest Agent service
 $qemuGA = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
 if (-not $qemuGA) {
     $qemuGA = Get-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue
 }
-if (-not $qemuGA) {
-    $qemuGA = Get-Service -Name "QEMU Guest Agent VSS Provider" -ErrorAction SilentlyContinue
+
+$qemuGAInstalled = $null -ne $qemuGA
+$qemuGARunning = $false
+$qemuGAAutoStart = $false
+
+if ($qemuGA) {
+    $qemuGARunning = $qemuGA.Status -eq 'Running'
+    $qemuGAAutoStart = $qemuGA.StartType -eq 'Automatic'
 }
+
+# Check if vioserial device exists (even without driver)
+$vioserialDevice = (Get-WmiObject Win32_PnPEntity | Where-Object { 
+    $_.Name -like "*VirtIO*Serial*" -or $_.DeviceID -like "*VEN_1AF4&DEV_1003*"
+}).Count -gt 0
 
 @{
     NGTInstalled = $null -ne $ngt
     NGTVersion = $ngtVersion
     VirtIONutanix = $virtioNutanix
     VirtIOFedora = $virtioFedora
-    QEMUGuestAgent = $null -ne $qemuGA
+    VirtIONet = $virtioNet
+    VirtIOStorage = $virtioStorage
+    VirtIOSerial = $virtioSerial
+    VirtioBalloon = $virtioBalloon
+    VioSerialDevicePresent = $vioserialDevice
+    QEMUGuestAgent = $qemuGAInstalled
+    QEMUGuestAgentRunning = $qemuGARunning
+    QEMUGuestAgentAutoStart = $qemuGAAutoStart
 } | ConvertTo-Json
 '''
 
@@ -638,7 +697,14 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
             ngt_version=agents.get('NGTVersion'),
             virtio_nutanix=agents.get('VirtIONutanix', False),
             virtio_fedora=agents.get('VirtIOFedora', False),
-            qemu_guest_agent=agents.get('QEMUGuestAgent', False)
+            virtio_net=agents.get('VirtIONet', False),
+            virtio_storage=agents.get('VirtIOStorage', False),
+            virtio_serial=agents.get('VirtIOSerial', False),
+            virtio_balloon=agents.get('VirtioBalloon', False),
+            vioserial_device_present=agents.get('VioSerialDevicePresent', False),
+            qemu_guest_agent=agents.get('QEMUGuestAgent', False),
+            qemu_guest_agent_running=agents.get('QEMUGuestAgentRunning', False),
+            qemu_guest_agent_autostart=agents.get('QEMUGuestAgentAutoStart', False)
         )
         
         # Build listening services list
@@ -653,12 +719,39 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
                 protocol=svc.get('Protocol', 'TCP')
             ))
         
-        # Determine missing prerequisites
+        # Determine missing prerequisites for Harvester/KubeVirt migration
         missing = []
-        if not agent_status.virtio_fedora:
-            missing.append("virtio_fedora")
+        warnings = []
+        
+        # Critical: Need VirtIO drivers (either Fedora/Red Hat or Nutanix)
+        if not agent_status.virtio_fedora and not agent_status.virtio_nutanix:
+            missing.append("virtio_drivers")
+        
+        # Critical: VirtIO Storage driver (required for disk access after migration)
+        if not agent_status.virtio_storage:
+            missing.append("virtio_storage")
+        
+        # Critical: VirtIO Network driver (required for network after migration)
+        if not agent_status.virtio_net:
+            missing.append("virtio_net")
+        
+        # Important: VirtIO Serial driver (required for Guest Agent ↔ KubeVirt communication)
+        if not agent_status.virtio_serial:
+            missing.append("virtio_serial")
+        
+        # Important: QEMU Guest Agent (required for IP detection in Harvester UI)
         if not agent_status.qemu_guest_agent:
             missing.append("qemu_guest_agent")
+        
+        # Warnings (not blocking but recommended)
+        if agent_status.qemu_guest_agent:
+            if not agent_status.qemu_guest_agent_running:
+                warnings.append("qemu_ga_not_running")
+            if not agent_status.qemu_guest_agent_autostart:
+                warnings.append("qemu_ga_not_autostart")
+        
+        if not agent_status.virtio_balloon:
+            warnings.append("virtio_balloon_missing")
         
         migration_ready = len(missing) == 0
         
@@ -678,6 +771,7 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
             rdp_enabled=services.get('RDPEnabled', False),
             migration_ready=migration_ready,
             missing_prerequisites=missing,
+            warnings=warnings,
             listening_services=listening_services
         )
 

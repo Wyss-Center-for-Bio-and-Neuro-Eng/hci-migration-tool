@@ -2174,83 +2174,54 @@ class MigrationTool:
             
             # Wait initial 20s for VM to start and VMI to be created
             print("   ⏳ Waiting for VM to start... (20s)")
-            time.sleep(20)
+            # Wait for VM to be Running, then ask for DHCP IP
+            # Note: QEMU Guest Agent may not report IP to KubeVirt on Windows VMs
+            print("   ⏳ Waiting for VM to start...")
+            time.sleep(15)
             
             vm_ip = None
-            max_wait = 60  # 1 minute (Windows VMs usually don't have Guest Agent)
+            max_wait = 60  # 1 minute to check if VM is Running
             start_time = time.time()
-            last_print = 0
             vmi_running = False
             
             while time.time() - start_time < max_wait:
-                elapsed = int(time.time() - start_time)
-                
                 try:
-                    # Try Harvester v1 API first (same as UI uses)
-                    url = f"{self.harvester.base_url}/v1/kubevirt.io.virtualmachineinstances/{namespace}/{vm_name}"
-                    response = requests.get(
-                        url,
-                        cert=self.harvester.cert,
-                        verify=self.harvester.verify if self.harvester.verify else False
-                    )
+                    # Check VMI status (silent to avoid error messages while waiting)
+                    vmi = self.harvester.get_vmi(vm_name, namespace, silent=True)
+                    vmi_phase = vmi.get('status', {}).get('phase', '')
                     
-                    if response.ok:
-                        vmi = response.json()
-                        vmi_phase = vmi.get('status', {}).get('phase', '')
+                    if vmi_phase == 'Running':
+                        vmi_running = True
+                        print("   ✅ VM instance is Running")
                         
-                        if vmi_phase == 'Running' and not vmi_running:
-                            vmi_running = True
-                            print("   ✅ VM instance is Running")
-                        
-                        # Debug: show raw interfaces data
+                        # Check if IP is available from Guest Agent
                         interfaces = vmi.get('status', {}).get('interfaces', [])
-                        if interfaces and not vmi_running:
-                            print(f"   🔍 Debug: Found {len(interfaces)} interface(s)")
-                        
                         for iface in interfaces:
                             ip = iface.get('ipAddress', '')
-                            # Also check ipAddresses array
-                            if not ip:
-                                ips = iface.get('ipAddresses', [])
-                                for addr in ips:
-                                    if addr and not addr.startswith('fe80:'):  # Skip IPv6 link-local
-                                        ip = addr
-                                        break
-                            
-                            # Remove CIDR suffix if present
                             if ip and '/' in ip:
                                 ip = ip.split('/')[0]
-                            
                             if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
                                 vm_ip = ip
-                                print(f"   🔍 Found IP: {vm_ip} (infoSource: {iface.get('infoSource', 'N/A')})")
+                                info_source = iface.get('infoSource', '')
+                                print(f"   ✅ Found IP via API: {vm_ip} (source: {info_source})")
                                 break
-                        
-                        if vm_ip:
-                            break
-                    else:
-                        # Debug: show why API failed
-                        if elapsed == 0:
-                            print(f"   🔍 API response: {response.status_code}")
+                        break
                         
                 except Exception as e:
-                    if elapsed == 0:
-                        print(f"   🔍 Debug exception: {e}")
-                
-                # Print progress every 15 seconds
-                if elapsed - last_print >= 15:
-                    if vmi_running:
-                        print(f"   ⏳ VM running, checking for IP... ({elapsed + 20}s)")
-                    else:
-                        print(f"   ⏳ Waiting for VM to start... ({elapsed + 20}s)")
-                    last_print = elapsed
+                    pass
                 
                 time.sleep(5)
             
+            if not vmi_running:
+                print(colored("   ❌ VM did not start within timeout", Colors.RED))
+                return
+            
             if not vm_ip:
-                print(colored("\n   ⚠️  Could not get IP from QEMU Guest Agent", Colors.YELLOW))
-                print(colored("      (Windows VMs typically don't have Guest Agent installed)", Colors.YELLOW))
-                print(colored("\n   💡 Look at Harvester UI - the DHCP IP should be visible there", Colors.CYAN))
+                # IP not available via API - common for Windows VMs
+                print(colored("\n   ℹ️  IP not available via QEMU Guest Agent", Colors.CYAN))
+                print(colored("      This is normal - the Guest Agent service may need to start", Colors.CYAN))
+                print(colored("\n   👉 Check Harvester UI for the VM's DHCP IP address", Colors.BOLD))
+                print(colored("      (It should be visible in the IP Address column)", Colors.CYAN))
                 manual_ip = self.input_prompt("\n   Enter the DHCP IP from Harvester UI")
                 if not manual_ip:
                     print(colored("\n💡 Complete migration later with Menu Windows → Post-migration auto-configure", Colors.YELLOW))
@@ -2287,20 +2258,56 @@ class MigrationTool:
                 print(f"         Gateway: {iface.get('gateway')}")
                 print(f"         DNS: {', '.join(iface.get('dns', []))}")
             
-            # Get credentials
+            # Get credentials - use same logic as pre-migration check
             if not WINRM_AVAILABLE:
                 print(colored("\n   ❌ pywinrm not installed - cannot configure network", Colors.RED))
                 print(colored("   Install with: pip install pywinrm --break-system-packages", Colors.YELLOW))
                 return
             
-            try:
-                username, password = self.vault.get_credential("local-admin")
-                print(f"\n   Using credential: {username}")
-            except:
-                print("\n   Credentials required for WinRM:")
-                username = self.input_prompt("   Username [Administrator]") or "Administrator"
-                import getpass
-                password = getpass.getpass("   Password: ")
+            # Check if using IP or FQDN - determines auth method
+            import re
+            is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', vm_ip))
+            
+            windows_config = self.config.get('windows', {})
+            use_kerberos = windows_config.get('use_kerberos', True)
+            domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
+            
+            username = None
+            password = None
+            transport = "ntlm"  # Default for IP addresses
+            connect_host = vm_ip
+            
+            if is_ip and use_kerberos:
+                # IP address but user prefers Kerberos
+                print(colored("\n   ⚠️  Using IP address, but Kerberos requires FQDN", Colors.YELLOW))
+                print(colored("   Options:", Colors.CYAN))
+                print(colored("     1. Use FQDN (if DNS already updated to new IP)", Colors.CYAN))
+                print(colored("     2. Use NTLM with username/password", Colors.CYAN))
+                
+                choice = self.input_prompt("\n   Use FQDN instead? (enter FQDN or press Enter for NTLM)")
+                if choice and not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', choice):
+                    connect_host = choice
+                    if '.' not in connect_host:
+                        connect_host = f"{connect_host}.{domain}"
+                    is_ip = False
+                    print(f"   → Will connect to: {connect_host}")
+            
+            if not is_ip and use_kerberos and get_kerberos_auth():
+                # FQDN with valid Kerberos ticket
+                print(colored("\n   Using Kerberos authentication", Colors.GREEN))
+                transport = "kerberos"
+            else:
+                # IP address or no Kerberos - use NTLM
+                print("\n   Using NTLM authentication")
+                transport = "ntlm"
+                try:
+                    username, password = self.vault.get_credential("local-admin")
+                    print(f"   Using credential from vault: {username}")
+                except:
+                    print("   No 'local-admin' credential in vault - enter manually:")
+                    username = self.input_prompt("   Username [Administrator]") or "Administrator"
+                    import getpass
+                    password = getpass.getpass("   Password: ")
             
             # Wait a bit more for WinRM to be ready
             print("\n   Waiting 15s for WinRM service to be ready...")
@@ -2309,10 +2316,10 @@ class MigrationTool:
             # Connect
             try:
                 client = WinRMClient(
-                    host=vm_ip,
+                    host=connect_host,
                     username=username,
                     password=password,
-                    transport="ntlm"
+                    transport=transport
                 )
                 
                 if not client.test_connection():
@@ -3212,12 +3219,27 @@ Write-Host "SUCCESS"
                         part_type = label if label else "System"
                         print(f"      [{part_type}] ({size} GB)")
             
-            print(colored("\n🔧 AGENTS STATUS", Colors.BOLD))
+            print(colored("\n🔧 DRIVERS & AGENTS STATUS", Colors.BOLD))
             agents = config.agents
+            
+            # Nutanix-specific
             print(f"   NGT Installed: {'✅' if agents.ngt_installed else '❌'} {agents.ngt_version or ''}")
             print(f"   VirtIO (Nutanix): {'✅' if agents.virtio_nutanix else '❌'}")
-            print(f"   VirtIO (Fedora): {'✅' if agents.virtio_fedora else '❌'}")
-            print(f"   QEMU Guest Agent: {'✅' if agents.qemu_guest_agent else '❌'}")
+            
+            # VirtIO Drivers (Fedora/Red Hat) - Critical for migration
+            print(colored("\n   VirtIO Drivers (Required for Harvester):", Colors.CYAN))
+            print(f"      Network (virtio-net):   {'✅' if agents.virtio_net else '❌ REQUIRED'}")
+            print(f"      Storage (virtio-scsi):  {'✅' if agents.virtio_storage else '❌ REQUIRED'}")
+            print(f"      Serial (virtio-serial): {'✅' if agents.virtio_serial else '❌ REQUIRED for Guest Agent'}")
+            print(f"      Balloon (optional):     {'✅' if agents.virtio_balloon else '⚪'}")
+            print(f"      Any VirtIO detected:    {'✅' if agents.virtio_fedora else '❌'}")
+            
+            # QEMU Guest Agent - Important for IP detection
+            print(colored("\n   QEMU Guest Agent (for IP detection in Harvester UI):", Colors.CYAN))
+            print(f"      Installed:   {'✅' if agents.qemu_guest_agent else '❌'}")
+            if agents.qemu_guest_agent:
+                print(f"      Running:     {'✅' if agents.qemu_guest_agent_running else '⚠️  NOT RUNNING'}")
+                print(f"      Auto-start:  {'✅' if agents.qemu_guest_agent_autostart else '⚠️  NOT AUTO'}")
             
             print(colored("\n⚙️  SERVICES", Colors.BOLD))
             print(f"   WinRM: {'✅' if config.winrm_enabled else '❌'}")
@@ -3275,30 +3297,70 @@ Write-Host "SUCCESS"
             
             # Migration readiness
             print(colored("\n📊 MIGRATION READINESS", Colors.BOLD))
+            
+            # Show warnings if any (not blocking but important)
+            if hasattr(config, 'warnings') and config.warnings:
+                print(colored("   ⚠️  Warnings:", Colors.YELLOW))
+                warning_messages = {
+                    'qemu_ga_not_running': "QEMU Guest Agent is installed but not running",
+                    'qemu_ga_not_autostart': "QEMU Guest Agent is not set to auto-start",
+                    'virtio_balloon_missing': "VirtIO Balloon driver not installed (optional)"
+                }
+                for warn in config.warnings:
+                    msg = warning_messages.get(warn, warn)
+                    print(f"      - {msg}")
+            
             if config.migration_ready:
                 print(colored("   ✅ VM is ready for migration!", Colors.GREEN))
             else:
-                print(colored("   ⚠️  Missing prerequisites:", Colors.YELLOW))
+                print(colored("   ❌ Missing prerequisites:", Colors.RED))
+                prereq_messages = {
+                    'virtio_drivers': "VirtIO drivers (network/storage)",
+                    'virtio_net': "VirtIO Network driver (required)",
+                    'virtio_storage': "VirtIO Storage driver (required)",
+                    'virtio_serial': "VirtIO Serial driver (required for Guest Agent)",
+                    'qemu_guest_agent': "QEMU Guest Agent (required for IP detection)"
+                }
                 for prereq in config.missing_prerequisites:
-                    print(f"      - {prereq}")
+                    msg = prereq_messages.get(prereq, prereq)
+                    print(f"      - {msg}")
                 
                 # Offer to install missing prerequisites
                 install = self.input_prompt("\n   Install missing prerequisites now? (y/n)")
                 if install.lower() == 'y':
                     self._install_windows_prerequisites(client, config, host)
                     
-                    # Re-check after installation
+                    # Re-check after installation - update ALL agent fields
                     print("\n   🔄 Re-checking agents...")
                     new_agents = checker.collect_agent_status()
                     config.agents.virtio_fedora = new_agents.get('VirtIOFedora', False)
+                    config.agents.virtio_net = new_agents.get('VirtIONet', False)
+                    config.agents.virtio_storage = new_agents.get('VirtIOStorage', False)
+                    config.agents.virtio_serial = new_agents.get('VirtIOSerial', False)
+                    config.agents.virtio_balloon = new_agents.get('VirtioBalloon', False)
                     config.agents.qemu_guest_agent = new_agents.get('QEMUGuestAgent', False)
+                    config.agents.qemu_guest_agent_running = new_agents.get('QEMUGuestAgentRunning', False)
+                    config.agents.qemu_guest_agent_autostart = new_agents.get('QEMUGuestAgentAutoStart', False)
                     
-                    # Update missing prerequisites
+                    # Recalculate missing prerequisites
                     config.missing_prerequisites = []
-                    if not config.agents.virtio_fedora:
-                        config.missing_prerequisites.append("virtio_fedora")
+                    if not (config.agents.virtio_fedora or config.agents.virtio_nutanix):
+                        config.missing_prerequisites.append("virtio_drivers")
+                    if not config.agents.virtio_storage:
+                        config.missing_prerequisites.append("virtio_storage")
+                    if not config.agents.virtio_net:
+                        config.missing_prerequisites.append("virtio_net")
+                    if not config.agents.virtio_serial:
+                        config.missing_prerequisites.append("virtio_serial")
                     if not config.agents.qemu_guest_agent:
                         config.missing_prerequisites.append("qemu_guest_agent")
+                    
+                    # Recalculate warnings
+                    config.warnings = []
+                    if config.agents.qemu_guest_agent and not config.agents.qemu_guest_agent_running:
+                        config.warnings.append("qemu_ga_not_running")
+                    if config.agents.qemu_guest_agent and not config.agents.qemu_guest_agent_autostart:
+                        config.warnings.append("qemu_ga_not_autostart")
                     
                     config.migration_ready = len(config.missing_prerequisites) == 0
                     
@@ -3307,7 +3369,8 @@ Write-Host "SUCCESS"
                     else:
                         print(colored("\n   ⚠️  Some prerequisites still missing (may need reboot):", Colors.YELLOW))
                         for prereq in config.missing_prerequisites:
-                            print(f"      - {prereq}")
+                            msg = prereq_messages.get(prereq, prereq)
+                            print(f"      - {msg}")
             
             # Save config
             staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
