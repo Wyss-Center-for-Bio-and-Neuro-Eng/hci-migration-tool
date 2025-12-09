@@ -533,10 +533,12 @@ $virtioGTInstalled = ($virtioPrograms | Where-Object { $_ -match "guest-tools|dr
 
 # Also check Red Hat folder (contains actual driver files)
 $redHatDir = Test-Path "$env:ProgramFiles\Red Hat"
+$virtioWinDrivers = Test-Path "$env:ProgramFiles\Virtio-Win\Vioscsi"
 "Red Hat folder: $redHatDir" | Out-File $logFile -Append
+"Virtio-Win drivers: $virtioWinDrivers" | Out-File $logFile -Append
 
-# VirtIO is installed if program in registry OR Red Hat folder exists
-$virtioInstalled = $virtioGTInstalled -or $redHatDir
+# VirtIO is installed if program in registry OR Red Hat folder OR Virtio-Win with drivers
+$virtioInstalled = $virtioGTInstalled -or $redHatDir -or $virtioWinDrivers
 
 # NGT
 $ngt = Get-Service -Name "Nutanix Guest Agent" -ErrorAction SilentlyContinue

@@ -3544,7 +3544,7 @@ if (Test-Path $exe) {
                             print(f"      Still installing... ({elapsed}s)")
                         
                         # Verify installation
-                        verify = 'if (Test-Path "$env:ProgramFiles\\Red Hat") { "SUCCESS" } else { "FAILED" }'
+                        verify = 'if ((Test-Path "$env:ProgramFiles\\Red Hat") -or (Test-Path "$env:ProgramFiles\\Virtio-Win\\Vioscsi")) { "SUCCESS" } else { "FAILED" }'
                         stdout3, _, _ = client.run_powershell(verify)
                         
                         if "SUCCESS" in stdout3:
