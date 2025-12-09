@@ -2172,27 +2172,30 @@ class MigrationTool:
             
             import time
             
-            # Wait initial 20s for VM to start and VMI to be created
-            print("   ⏳ Waiting for VM to start... (20s)")
-            # Wait for VM to be Running, then ask for DHCP IP
-            # Note: QEMU Guest Agent may not report IP to KubeVirt on Windows VMs
-            print("   ⏳ Waiting for VM to start...")
-            time.sleep(15)
+            # Wait initial time for VM to start and VMI to be created
+            print("   ⏳ Waiting for VM to initialize...")
+            time.sleep(20)
             
             vm_ip = None
-            max_wait = 60  # 1 minute to check if VM is Running
+            max_wait = 120  # 2 minutes to check if VM is Running
             start_time = time.time()
             vmi_running = False
+            last_status = ""
             
             while time.time() - start_time < max_wait:
+                elapsed = int(time.time() - start_time) + 20  # Add initial wait
                 try:
                     # Check VMI status (silent to avoid error messages while waiting)
                     vmi = self.harvester.get_vmi(vm_name, namespace, silent=True)
                     vmi_phase = vmi.get('status', {}).get('phase', '')
                     
+                    if vmi_phase != last_status:
+                        print(f"   ⏳ VM status: {vmi_phase} ({elapsed}s)")
+                        last_status = vmi_phase
+                    
                     if vmi_phase == 'Running':
                         vmi_running = True
-                        print("   ✅ VM instance is Running")
+                        print(colored("   ✅ VM instance is Running", Colors.GREEN))
                         
                         # Check if IP is available from Guest Agent
                         interfaces = vmi.get('status', {}).get('interfaces', [])
@@ -2200,21 +2203,29 @@ class MigrationTool:
                             ip = iface.get('ipAddress', '')
                             if ip and '/' in ip:
                                 ip = ip.split('/')[0]
-                            if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                            if ip and not ip.startswith('127.') and not ip.startswith('169.254.') and not ip.startswith('fe80:'):
                                 vm_ip = ip
                                 info_source = iface.get('infoSource', '')
                                 print(f"   ✅ Found IP via API: {vm_ip} (source: {info_source})")
                                 break
                         break
+                    elif vmi_phase == 'Succeeded':
+                        # VM completed (shutdown) - shouldn't happen with RerunOnFailure
+                        print(colored(f"   ⚠️  VM phase is 'Succeeded' - it may have shut down", Colors.YELLOW))
+                        break
                         
                 except Exception as e:
-                    pass
+                    # VMI not found yet - normal during startup
+                    if elapsed % 15 == 0:  # Print every 15s
+                        print(f"   ⏳ Waiting for VMI to be created... ({elapsed}s)")
                 
                 time.sleep(5)
             
+            # Even if we couldn't detect Running state via API, continue to ask for IP
+            # The VM might be running but API detection failed
             if not vmi_running:
-                print(colored("   ❌ VM did not start within timeout", Colors.RED))
-                return
+                print(colored("   ⚠️  Could not confirm VM status via API", Colors.YELLOW))
+                print(colored("   Check Harvester UI to verify VM is Running", Colors.CYAN))
             
             if not vm_ip:
                 # IP not available via API - common for Windows VMs
