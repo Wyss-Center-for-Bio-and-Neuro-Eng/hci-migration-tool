@@ -379,55 +379,50 @@ class NutanixClient:
     
     # === NFS Fast Transfer Methods ===
     
-    def get_vm_vdisks_ssh(self, vm_name: str) -> List[Dict]:
+    def get_vm_vdisks_v2(self, vm_name: str) -> List[Dict]:
         """
-        Get VM vdisk info via SSH/acli (returns actual vmdisk_uuid for NFS access).
+        Get VM vdisk info via API v2 (returns vmdisk_uuid for NFS access).
         
         Args:
             vm_name: VM name
             
         Returns:
-            List of dicts with vmdisk_uuid, vmdisk_nfs_path, vmdisk_size
+            List of dicts with uuid, nfs_path, container, size
         """
-        cmd = [
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
-            f'{self.cvm_user}@{self.cvm_ip}',
-            f'acli vm.get {vm_name} include_vmdisk_paths=1'
-        ]
+        # Use v2 API to get all virtual disks
+        url = f"https://{self.prism_ip}:9440/PrismGateway/services/rest/v2.0/virtual_disks/"
         
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                raise Exception(f"SSH command failed: {result.stderr}")
-            
-            # Parse output
-            disks = []
-            current_disk = {}
-            
-            for line in result.stdout.split('\n'):
-                line = line.strip()
-                if 'vmdisk_nfs_path:' in line:
-                    path = line.split(':', 1)[1].strip().strip('"')
-                    current_disk['nfs_path'] = path
-                    # Extract container name from path
-                    parts = path.split('/')
-                    if len(parts) >= 2:
-                        current_disk['container'] = parts[1]
-                elif 'vmdisk_uuid:' in line:
-                    current_disk['uuid'] = line.split(':', 1)[1].strip().strip('"')
-                elif 'vmdisk_size:' in line:
-                    current_disk['size_bytes'] = int(line.split(':', 1)[1].strip())
-                    # Complete disk entry
-                    if 'uuid' in current_disk and 'nfs_path' in current_disk:
-                        disks.append(current_disk.copy())
-                    current_disk = {}
-            
-            return disks
-            
-        except subprocess.TimeoutExpired:
-            raise Exception("SSH command timed out")
-        except Exception as e:
-            raise Exception(f"Failed to get vdisks via SSH: {e}")
+        response = requests.get(
+            url,
+            auth=self.auth,
+            verify=self.verify_ssl
+        )
+        response.raise_for_status()
+        
+        all_disks = response.json().get('entities', [])
+        
+        # Filter by attached VM name
+        vm_disks = []
+        for disk in all_disks:
+            if disk.get('attached_vmname') == vm_name:
+                nfs_path = disk.get('nutanix_nfsfile_path', '')
+                # Extract container from path like "/container01/.acropolis/vmdisk/uuid"
+                parts = nfs_path.split('/')
+                container = parts[1] if len(parts) > 1 else ''
+                
+                vm_disks.append({
+                    'uuid': disk.get('uuid'),  # This is the NFS filename
+                    'nfs_path': nfs_path,
+                    'container': container,
+                    'size_bytes': disk.get('disk_capacity_in_bytes', 0),
+                    'device_uuid': disk.get('device_uuid'),
+                    'disk_address': disk.get('disk_address', '')
+                })
+        
+        # Sort by disk_address (scsi.0, scsi.1, etc.)
+        vm_disks.sort(key=lambda x: x.get('disk_address', ''))
+        
+        return vm_disks
     
     def mount_nfs_container(self, container_name: str, mount_path: str = None) -> str:
         """

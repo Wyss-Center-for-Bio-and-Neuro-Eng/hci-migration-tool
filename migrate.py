@@ -1106,15 +1106,12 @@ class MigrationTool:
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         vm_name_clean = self._selected_vm.lower().replace(' ', '-').replace('/', '-')
         
-        # Get vdisks via SSH
-        print(colored("\n📡 Getting vdisk info via SSH...", Colors.CYAN))
+        # Get vdisks via API v2
+        print(colored("\n📡 Getting vdisk info via API v2...", Colors.CYAN))
         try:
-            vdisks = self.nutanix.get_vm_vdisks_ssh(self._selected_vm)
+            vdisks = self.nutanix.get_vm_vdisks_v2(self._selected_vm)
         except Exception as e:
-            print(colored(f"❌ Failed to get vdisks via SSH: {e}", Colors.RED))
-            print(colored("   Make sure SSH key is configured for CVM access", Colors.YELLOW))
-            print(colored("   Falling back to API method...", Colors.YELLOW))
-            self._export_vm_api()
+            print(colored(f"❌ Failed to get vdisks: {e}", Colors.RED))
             return
         
         if not vdisks:
@@ -1124,9 +1121,9 @@ class MigrationTool:
         print(colored(f"\n💾 Found {len(vdisks)} disk(s):", Colors.BOLD))
         for i, vdisk in enumerate(vdisks):
             size_gb = vdisk['size_bytes'] // (1024**3)
-            print(f"   Disk {i}: {size_gb} GB")
+            print(f"   Disk {i} ({vdisk.get('disk_address', 'N/A')}): {size_gb} GB")
             print(f"      UUID: {vdisk['uuid']}")
-            print(f"      Path: {vdisk['nfs_path']}")
+            print(f"      Container: {vdisk['container']}")
         
         # Mount NFS
         container = vdisks[0].get('container', 'container01')
