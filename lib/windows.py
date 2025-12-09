@@ -180,7 +180,7 @@ class WinRMClient:
     
     def __init__(self, host: str, username: str = None, password: str = None,
                  transport: str = "kerberos", port: int = 5985, ssl: bool = False,
-                 operation_timeout: int = 300, read_timeout: int = 310):
+                 operation_timeout: int = 60, read_timeout: int = 70):
         """
         Initialize WinRM client.
         

@@ -3492,7 +3492,7 @@ Write-Host "OK"
                 else:
                     print(colored("      ✅ Downloaded", Colors.GREEN))
                     
-                    # Step 2: Mount and install
+                    # Step 2: Mount and start installer in background
                     print(colored("      Mounting and installing...", Colors.CYAN))
                     ps_install = '''
 $iso = "$env:TEMP\\virtio-win.iso"
@@ -3501,56 +3501,76 @@ Start-Sleep 2
 $d = ($m | Get-Volume).DriveLetter + ":"
 Write-Host "Mounted on $d"
 
-# Try different installer names
+# Try different installer names - start WITHOUT -Wait
 $installers = @(
     "$d\\virtio-win-gt-x64.exe",
-    "$d\\virtio-win-guest-tools.exe", 
-    "$d\\guest-agent\\qemu-ga-x86_64.msi"
+    "$d\\virtio-win-guest-tools.exe"
 )
 
 $found = $false
 foreach ($exe in $installers) {
     if (Test-Path $exe) {
         Write-Host "Found: $exe"
-        if ($exe -match "\\.msi$") {
-            Start-Process msiexec.exe -ArgumentList "/i `"$exe`" /qn /norestart" -Wait -NoNewWindow
-        } else {
-            Start-Process $exe -ArgumentList "/S" -Wait -NoNewWindow
-        }
-        Write-Host "Installed"
+        Write-Host "Starting installer..."
+        Start-Process $exe -ArgumentList "/S"
         $found = $true
         break
     }
 }
 
 if (-not $found) {
-    Write-Host "No installer found. ISO contents:"
+    Write-Host "NOTFOUND"
     Get-ChildItem $d -Name | ForEach-Object { Write-Host "  $_" }
 }
-
-Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
-Remove-Item $iso -Force -ErrorAction SilentlyContinue
-
-if (Test-Path "$env:ProgramFiles\\Virtio-Win") { 
-    Write-Host "SUCCESS"
-} else {
-    Write-Host "NOTFOUND"
-}
 '''
-                    stdout, stderr, rc = client.run_powershell(ps_install, timeout=300)
+                    stdout, stderr, rc = client.run_powershell(ps_install)
                     if stdout:
                         for line in stdout.strip().split('\n'):
                             print(f"      {line}")
-                    if "SUCCESS" in stdout:
-                        print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
-                    elif "Installed" in stdout:
-                        print(colored("   ✅ Installation completed (verify after reboot)", Colors.GREEN))
-                    elif "NOTFOUND" in stdout:
-                        print(colored("   ⚠️  Drivers may not be fully installed", Colors.YELLOW))
+                    
+                    if "NOTFOUND" in stdout:
+                        print(colored("   ❌ VirtIO installer not found in ISO", Colors.RED))
                     else:
-                        print(colored(f"   ⚠️  Check installation manually", Colors.YELLOW))
-                        if stderr:
-                            print(f"      Error: {stderr.strip()}")
+                        # Poll for installation completion (check Red Hat folder)
+                        print(colored("      Waiting for installation...", Colors.CYAN))
+                        max_wait = 120  # 2 minutes max
+                        check_interval = 5
+                        elapsed = 0
+                        installed = False
+                        
+                        while elapsed < max_wait:
+                            time.sleep(check_interval)
+                            elapsed += check_interval
+                            
+                            # Check if Red Hat folder exists (VirtIO drivers installed there)
+                            check_script = 'if (Test-Path "$env:ProgramFiles\\Red Hat") { "INSTALLED" } else { "WAITING" }'
+                            stdout2, _, _ = client.run_powershell(check_script)
+                            
+                            if "INSTALLED" in stdout2:
+                                installed = True
+                                print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                                break
+                            else:
+                                print(f"      Still installing... ({elapsed}s)")
+                        
+                        if not installed:
+                            # Final check
+                            check_script = 'if (Test-Path "$env:ProgramFiles\\Red Hat") { "INSTALLED" } elseif (Test-Path "$env:ProgramFiles\\Virtio-Win") { "PARTIAL" } else { "NOTFOUND" }'
+                            stdout2, _, _ = client.run_powershell(check_script)
+                            if "INSTALLED" in stdout2:
+                                print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                            elif "PARTIAL" in stdout2:
+                                print(colored("   ⚠️  VirtIO partially installed (verify after reboot)", Colors.YELLOW))
+                            else:
+                                print(colored("   ⚠️  Check installation manually", Colors.YELLOW))
+                        
+                        # Cleanup ISO
+                        cleanup_script = '''
+$iso = "$env:TEMP\\virtio-win.iso"
+Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+Remove-Item $iso -Force -ErrorAction SilentlyContinue
+'''
+                        client.run_powershell(cleanup_script)
             
             # Install QEMU Guest Agent
             if install_qemu_ga:
