@@ -505,49 +505,45 @@ New-Item -ItemType Directory -Path "C:\temp" -Force -ErrorAction SilentlyContinu
 
 "=== VirtIO Detection Debug ===" | Out-File $logFile
 "Date: $(Get-Date)" | Out-File $logFile -Append
-"" | Out-File $logFile -Append
 
-# Check all possible VirtIO locations
-$virtioWin = Test-Path "$env:ProgramFiles\Virtio-Win"
-$redHat = Test-Path "$env:ProgramFiles\Red Hat"
-$qemuGaDir = Test-Path "$env:ProgramFiles\Qemu-ga"
+# Fast method: check registry for installed programs
+$uninstallPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+$installed = Get-ItemProperty $uninstallPaths -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayName -ErrorAction SilentlyContinue
 
-"Virtio-Win folder: $virtioWin" | Out-File $logFile -Append
-"Red Hat folder: $redHat" | Out-File $logFile -Append
-"Qemu-ga folder: $qemuGaDir" | Out-File $logFile -Append
+$virtioPrograms = $installed | Where-Object { $_ -match "virtio" }
+$qemuPrograms = $installed | Where-Object { $_ -match "qemu" }
 
-# List Program Files contents
-"" | Out-File $logFile -Append
-"Program Files contents:" | Out-File $logFile -Append
-Get-ChildItem "$env:ProgramFiles" -Directory | Select-Object -ExpandProperty Name | Out-File $logFile -Append
+"VirtIO programs: $($virtioPrograms -join ', ')" | Out-File $logFile -Append
+"QEMU programs: $($qemuPrograms -join ', ')" | Out-File $logFile -Append
 
-# VirtIO is installed if ANY of these exist
-$virtioInstalled = $virtioWin -or $redHat
+# VirtIO is installed if virtio-win-guest-tools or virtio-win-driver is in registry
+$virtioGTInstalled = ($virtioPrograms | Where-Object { $_ -match "guest-tools|driver" }).Count -gt 0
+
+# Also check Red Hat folder (contains actual driver files)
+$redHatDir = Test-Path "$env:ProgramFiles\Red Hat"
+"Red Hat folder: $redHatDir" | Out-File $logFile -Append
+
+# VirtIO is installed if program in registry OR Red Hat folder exists
+$virtioInstalled = $virtioGTInstalled -or $redHatDir
 
 # NGT
 $ngt = Get-Service -Name "Nutanix Guest Agent" -ErrorAction SilentlyContinue
 
-# QEMU GA - check service
+# QEMU GA - service check (most reliable)
 $qemuGA = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
 if (-not $qemuGA) { $qemuGA = Get-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue }
 
-"" | Out-File $logFile -Append
-"QEMU-GA service found: $($null -ne $qemuGA)" | Out-File $logFile -Append
-if ($qemuGA) {
-    "QEMU-GA status: $($qemuGA.Status)" | Out-File $logFile -Append
-}
-
-# Also check if qemu-ga.exe exists
-$qemuGaExe = Test-Path "$env:ProgramFiles\Qemu-ga\qemu-ga.exe"
-"Qemu-ga.exe exists: $qemuGaExe" | Out-File $logFile -Append
-
-# Final detection: QEMU GA is installed if service exists OR folder exists
-$qemuGaInstalled = ($null -ne $qemuGA) -or $qemuGaDir
+$qemuGaInstalled = $null -ne $qemuGA
 
 "" | Out-File $logFile -Append
 "=== Final Results ===" | Out-File $logFile -Append
+"VirtIO in registry: $virtioGTInstalled" | Out-File $logFile -Append
+"Red Hat folder: $redHatDir" | Out-File $logFile -Append  
 "VirtIO installed: $virtioInstalled" | Out-File $logFile -Append
-"QEMU GA installed: $qemuGaInstalled" | Out-File $logFile -Append
+"QEMU GA service: $qemuGaInstalled" | Out-File $logFile -Append
 
 @{
     NGTInstalled = $null -ne $ngt
