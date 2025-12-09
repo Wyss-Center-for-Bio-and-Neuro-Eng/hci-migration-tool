@@ -2068,12 +2068,14 @@ class MigrationTool:
                     },
                     "annotations": {
                         "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
+                        # RerunOnFailure = VM starts automatically and restarts on failure
+                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
                         "harvesterhci.io/vmRunStrategy": "Halted",
                         "network.harvesterhci.io/ips": "[]"
                     }
                 },
                 "spec": {
-                    "runStrategy": "Halted",
+                    "runStrategy": "RerunOnFailure",
                     "template": {
                         "metadata": {
                             "labels": {
@@ -2151,43 +2153,44 @@ class MigrationTool:
             print(colored("\n" + "="*50, Colors.BLUE))
             print(colored("🚀 COMPLETE MIGRATION WORKFLOW", Colors.BOLD))
             print(colored("="*50, Colors.BLUE))
-            print("\nNext steps:")
-            print("  1. Start VM")
-            print("  2. Wait for DHCP IP (via QEMU Guest Agent)")
-            print("  3. Connect via WinRM")
-            print("  4. Reconfigure static network")
+            print("\nThe VM will start automatically. Next steps:")
+            print("  1. Wait for VM boot and DHCP IP (via QEMU Guest Agent)")
+            print("  2. Connect via WinRM")
+            print("  3. Reconfigure static network")
             
             continue_migration = self.input_prompt("\nContinue with full migration? (y/n) [y]")
             if continue_migration.lower() == 'n':
                 print(colored("\n💡 To complete migration later:", Colors.YELLOW))
-                print("   1. Start VM manually in Harvester UI")
-                print("   2. Use Menu Windows → Post-migration auto-configure")
+                print("   Use Menu Windows → Post-migration auto-configure")
                 return
             
-            # Step 1: Start VM
-            print(colored("\n▶️  Step 1: Starting VM...", Colors.BOLD))
-            try:
-                self.harvester.start_vm(vm_name, namespace)
-                print(colored("   ✅ Start command sent", Colors.GREEN))
-            except Exception as e:
-                print(colored(f"   ❌ Error starting VM: {e}", Colors.RED))
-                return
-            
-            # Step 2: Wait for IP from QEMU Guest Agent
-            print(colored("\n▶️  Step 2: Waiting for VM to boot and get IP...", Colors.BOLD))
-            print("   (This may take 1-3 minutes)")
+            # Step 1: Wait for IP from QEMU Guest Agent
+            # VM starts automatically with runStrategy: RerunOnFailure
+            print(colored("\n▶️  Step 1: Waiting for VM to boot and get IP...", Colors.BOLD))
+            print("   (VM is starting automatically, this may take 1-3 minutes)")
             
             import time
+            
+            # Wait initial 20s for VM to start and VMI to be created
+            print("   ⏳ Waiting for VM to start... (20s)")
+            time.sleep(20)
+            
             vm_ip = None
-            max_wait = 180  # 3 minutes
+            max_wait = 180  # 3 minutes total
             start_time = time.time()
             last_print = 0
+            vmi_found = False
             
             while time.time() - start_time < max_wait:
                 elapsed = int(time.time() - start_time)
                 
                 try:
                     interfaces = self.harvester.get_vm_ip(vm_name, namespace)
+                    
+                    if interfaces and not vmi_found:
+                        vmi_found = True
+                        print("   ✅ VM instance running, waiting for QEMU Guest Agent...")
+                    
                     for iface in interfaces:
                         ip = iface.get('ip', '')
                         if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
@@ -2199,9 +2202,10 @@ class MigrationTool:
                 except:
                     pass
                 
-                # Print progress every 10 seconds
-                if elapsed - last_print >= 10:
-                    print(f"   ⏳ Waiting... ({elapsed}s)")
+                # Print progress every 15 seconds
+                if elapsed - last_print >= 15:
+                    status = "waiting for Guest Agent..." if vmi_found else "waiting for VM to start..."
+                    print(f"   ⏳ {status} ({elapsed + 15}s)")
                     last_print = elapsed
                 
                 time.sleep(5)
@@ -2216,8 +2220,8 @@ class MigrationTool:
             
             print(colored(f"\n   ✅ VM IP (DHCP): {vm_ip}", Colors.GREEN))
             
-            # Step 3: Load network config and connect via WinRM
-            print(colored("\n▶️  Step 3: Connecting via WinRM...", Colors.BOLD))
+            # Step 2: Load network config and connect via WinRM
+            print(colored("\n▶️  Step 2: Connecting via WinRM...", Colors.BOLD))
             
             # Load vm-config.json for network settings
             config_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-config.json')
@@ -2283,8 +2287,8 @@ class MigrationTool:
                 print(colored(f"   ❌ Connection error: {e}", Colors.RED))
                 return
             
-            # Step 4: Apply network configuration
-            print(colored("\n▶️  Step 4: Applying network configuration...", Colors.BOLD))
+            # Step 3: Apply network configuration
+            print(colored("\n▶️  Step 3: Applying network configuration...", Colors.BOLD))
             
             for iface in static_interfaces:
                 iface_name = iface.get('name', 'Ethernet')

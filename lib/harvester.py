@@ -152,10 +152,28 @@ class HarvesterClient:
             patch
         )
     
-    def get_vmi(self, name: str, namespace: str = None) -> dict:
+    def get_vmi(self, name: str, namespace: str = None, silent: bool = False) -> dict:
         """Get VirtualMachineInstance (running VM) by name."""
         ns = namespace or self.namespace
-        return self._request("GET", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}")
+        url = f"{self.base_url}/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachineinstances/{name}"
+        
+        response = requests.get(
+            url,
+            cert=self.cert,
+            verify=self.verify if self.verify else False
+        )
+        
+        if not response.ok:
+            if not silent:
+                try:
+                    error_detail = response.json()
+                    error_msg = error_detail.get('message', response.text)
+                    print(f"API Error: {error_msg}")
+                except:
+                    print(f"API Error: {response.text}")
+            response.raise_for_status()
+        
+        return response.json() if response.text else {}
     
     def get_vm_ip(self, name: str, namespace: str = None) -> List[dict]:
         """
@@ -164,7 +182,7 @@ class HarvesterClient:
         """
         ns = namespace or self.namespace
         try:
-            vmi = self.get_vmi(name, ns)
+            vmi = self.get_vmi(name, ns, silent=True)
             interfaces = vmi.get('status', {}).get('interfaces', [])
             
             result = []
