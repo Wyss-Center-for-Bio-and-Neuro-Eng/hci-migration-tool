@@ -2,42 +2,75 @@
 """
 Test VMI API to debug IP retrieval
 """
-import requests
 import yaml
 import json
 import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+# Add lib to path
+sys.path.insert(0, '.')
+from lib.harvester import HarvesterClient
+
 # Load config
 with open('config.yaml') as f:
     config = yaml.safe_load(f)
 
-harvester = config.get('harvester', {})
-base_url = harvester.get('api_url', 'https://10.16.16.130')
-cert_file = harvester.get('cert_file')
-key_file = harvester.get('key_file')
-namespace = harvester.get('default_namespace', 'harvester-public')
+harvester_config = config.get('harvester', {})
+namespace = harvester_config.get('default_namespace', 'harvester-public')
 
 # VM to test
 vm_name = sys.argv[1] if len(sys.argv) > 1 else 'wlchgvaopefs1'
 
 print(f"Testing VMI API for: {vm_name} in {namespace}")
-print(f"Base URL: {base_url}")
+print(f"Base URL: {harvester_config.get('api_url')}")
 print()
 
-# Setup cert
-cert = (cert_file, key_file) if cert_file and key_file else None
+# Create client (handles auth correctly)
+client = HarvesterClient(harvester_config)
 
-# Test 1: Harvester v1 API (what UI uses)
+# Test 1: Get VMI via get_vmi method
 print("=" * 60)
-print("Test 1: Harvester v1 API")
+print("Test 1: get_vmi() method")
 print("=" * 60)
-url1 = f"{base_url}/v1/kubevirt.io.virtualmachineinstances/{namespace}/{vm_name}"
-print(f"URL: {url1}")
-
 try:
-    r = requests.get(url1, cert=cert, verify=False)
+    vmi = client.get_vmi(vm_name, namespace, silent=False)
+    print(f"Phase: {vmi.get('status', {}).get('phase', 'N/A')}")
+    interfaces = vmi.get('status', {}).get('interfaces', [])
+    print(f"Interfaces: {len(interfaces)}")
+    for i, iface in enumerate(interfaces):
+        print(f"  Interface {i}:")
+        print(f"    name: {iface.get('name', 'N/A')}")
+        print(f"    mac: {iface.get('mac', 'N/A')}")
+        print(f"    ipAddress: {iface.get('ipAddress', 'N/A')}")
+        print(f"    ipAddresses: {iface.get('ipAddresses', [])}")
+        print(f"    infoSource: {iface.get('infoSource', 'N/A')}")
+except Exception as e:
+    print(f"Exception: {e}")
+
+print()
+
+# Test 2: Get VM IP via get_vm_ip method
+print("=" * 60)
+print("Test 2: get_vm_ip() method")
+print("=" * 60)
+try:
+    ips = client.get_vm_ip(vm_name, namespace)
+    print(f"Result: {json.dumps(ips, indent=2)}")
+except Exception as e:
+    print(f"Exception: {e}")
+
+print()
+
+# Test 3: Raw API call to Harvester v1 endpoint
+print("=" * 60)
+print("Test 3: Raw Harvester v1 API")
+print("=" * 60)
+import requests
+url = f"{client.base_url}/v1/kubevirt.io.virtualmachineinstances/{namespace}/{vm_name}"
+print(f"URL: {url}")
+try:
+    r = requests.get(url, cert=client.cert, verify=client.verify if client.verify else False)
     print(f"Status: {r.status_code}")
     if r.ok:
         data = r.json()
@@ -46,11 +79,8 @@ try:
         print(f"Interfaces: {len(interfaces)}")
         for i, iface in enumerate(interfaces):
             print(f"  Interface {i}:")
-            print(f"    name: {iface.get('name', 'N/A')}")
-            print(f"    mac: {iface.get('mac', 'N/A')}")
-            print(f"    ipAddress: {iface.get('ipAddress', 'N/A')}")
-            print(f"    ipAddresses: {iface.get('ipAddresses', [])}")
-            print(f"    infoSource: {iface.get('infoSource', 'N/A')}")
+            for key in ['name', 'mac', 'ipAddress', 'ipAddresses', 'infoSource']:
+                print(f"    {key}: {iface.get(key, 'N/A')}")
     else:
         print(f"Error: {r.text[:500]}")
 except Exception as e:
@@ -58,55 +88,15 @@ except Exception as e:
 
 print()
 
-# Test 2: KubeVirt API
+# Test 4: Check VM annotations
 print("=" * 60)
-print("Test 2: KubeVirt API")
+print("Test 4: VM annotations")
 print("=" * 60)
-url2 = f"{base_url}/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachineinstances/{vm_name}"
-print(f"URL: {url2}")
-
 try:
-    r = requests.get(url2, cert=cert, verify=False)
-    print(f"Status: {r.status_code}")
-    if r.ok:
-        data = r.json()
-        print(f"Phase: {data.get('status', {}).get('phase', 'N/A')}")
-        interfaces = data.get('status', {}).get('interfaces', [])
-        print(f"Interfaces: {len(interfaces)}")
-        for i, iface in enumerate(interfaces):
-            print(f"  Interface {i}:")
-            print(f"    name: {iface.get('name', 'N/A')}")
-            print(f"    mac: {iface.get('mac', 'N/A')}")
-            print(f"    ipAddress: {iface.get('ipAddress', 'N/A')}")
-            print(f"    ipAddresses: {iface.get('ipAddresses', [])}")
-            print(f"    infoSource: {iface.get('infoSource', 'N/A')}")
-    else:
-        print(f"Error: {r.text[:500]}")
-except Exception as e:
-    print(f"Exception: {e}")
-
-print()
-
-# Test 3: Check VM annotations
-print("=" * 60)
-print("Test 3: VM network.harvesterhci.io/ips annotation")
-print("=" * 60)
-url3 = f"{base_url}/v1/kubevirt.io.virtualmachines/{namespace}/{vm_name}"
-print(f"URL: {url3}")
-
-try:
-    r = requests.get(url3, cert=cert, verify=False)
-    print(f"Status: {r.status_code}")
-    if r.ok:
-        data = r.json()
-        annotations = data.get('metadata', {}).get('annotations', {})
-        ips_annotation = annotations.get('network.harvesterhci.io/ips', '[]')
-        print(f"network.harvesterhci.io/ips: {ips_annotation}")
-        
-        # Check status
-        status = data.get('status', {})
-        print(f"printableStatus: {status.get('printableStatus', 'N/A')}")
-    else:
-        print(f"Error: {r.text[:500]}")
+    vm = client.get_vm(vm_name, namespace)
+    annotations = vm.get('metadata', {}).get('annotations', {})
+    ips_annotation = annotations.get('network.harvesterhci.io/ips', '[]')
+    print(f"network.harvesterhci.io/ips: {ips_annotation}")
+    print(f"printableStatus: {vm.get('status', {}).get('printableStatus', 'N/A')}")
 except Exception as e:
     print(f"Exception: {e}")
