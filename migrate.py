@@ -3499,41 +3499,58 @@ $iso = "$env:TEMP\\virtio-win.iso"
 $m = Mount-DiskImage -ImagePath $iso -PassThru
 Start-Sleep 2
 $d = ($m | Get-Volume).DriveLetter + ":"
-$exe = "$d\\virtio-win-gt-x64.exe"
-if (Test-Path $exe) {
-    Start-Process $exe -ArgumentList "/S" -Wait -NoNewWindow
-    Write-Host "Installed with exe"
-} else {
-    $msi = "$d\\virtio-win-gt-x64.msi"
-    if (Test-Path $msi) {
-        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -NoNewWindow
-        Write-Host "Installed with msi"
-    } else {
-        Write-Host "No installer found"
+Write-Host "Mounted on $d"
+
+# Try different installer names
+$installers = @(
+    "$d\\virtio-win-gt-x64.exe",
+    "$d\\virtio-win-guest-tools.exe", 
+    "$d\\guest-agent\\qemu-ga-x86_64.msi"
+)
+
+$found = $false
+foreach ($exe in $installers) {
+    if (Test-Path $exe) {
+        Write-Host "Found: $exe"
+        if ($exe -match "\\.msi$") {
+            Start-Process msiexec.exe -ArgumentList "/i `"$exe`" /qn /norestart" -Wait -NoNewWindow
+        } else {
+            Start-Process $exe -ArgumentList "/S" -Wait -NoNewWindow
+        }
+        Write-Host "Installed"
+        $found = $true
+        break
     }
 }
+
+if (-not $found) {
+    Write-Host "No installer found. ISO contents:"
+    Get-ChildItem $d -Name | ForEach-Object { Write-Host "  $_" }
+}
+
 Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
 Remove-Item $iso -Force -ErrorAction SilentlyContinue
-if (Test-Path "$env:ProgramFiles\\Virtio-Win") { Write-Host "SUCCESS" }
+
+if (Test-Path "$env:ProgramFiles\\Virtio-Win") { 
+    Write-Host "SUCCESS"
+} else {
+    Write-Host "NOTFOUND"
+}
 '''
                     stdout, stderr, rc = client.run_powershell(ps_install, timeout=300)
                     if stdout:
-                        print(f"      {stdout.strip()}")
-                    if "SUCCESS" in stdout or "Installed" in stdout:
+                        for line in stdout.strip().split('\n'):
+                            print(f"      {line}")
+                    if "SUCCESS" in stdout:
                         print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                    elif "Installed" in stdout:
+                        print(colored("   ✅ Installation completed (verify after reboot)", Colors.GREEN))
+                    elif "NOTFOUND" in stdout:
+                        print(colored("   ⚠️  Drivers may not be fully installed", Colors.YELLOW))
                     else:
                         print(colored(f"   ⚠️  Check installation manually", Colors.YELLOW))
-                stdout, stderr, rc = client.run_powershell(ps_script, timeout=600)  # 10 min timeout for download
-                if rc == 0:
-                    print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
-                    if stdout.strip():
-                        for line in stdout.strip().split('\n'):
-                            print(f"      {line}")
-                else:
-                    print(colored(f"   ⚠️  Some drivers may have failed (exit code: {rc})", Colors.YELLOW))
-                    if stdout.strip():
-                        for line in stdout.strip().split('\n'):
-                            print(f"      {line}")
+                        if stderr:
+                            print(f"      Error: {stderr.strip()}")
             
             # Install QEMU Guest Agent
             if install_qemu_ga:
