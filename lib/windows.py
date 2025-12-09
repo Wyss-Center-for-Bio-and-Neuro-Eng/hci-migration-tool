@@ -766,6 +766,13 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
 class WindowsPostConfig:
     """Post-migration configuration for Windows VMs."""
     
+    # TODO: Implement uninstall_nutanix_tools() method
+    # Should uninstall after successful migration to Harvester:
+    # - Nutanix Guest Tools (msiexec /x or wmic product uninstall)
+    # - Nutanix VirtIO
+    # - Nutanix VM Mobility
+    # Command example: wmic product where "name like 'Nutanix%'" call uninstall /nointeractive
+    
     PS_SET_STATIC_IP = '''
 param(
     [string]$InterfaceName,

@@ -3742,6 +3742,13 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
     
     def generate_postmig_script(self):
         """Generate post-migration PowerShell script."""
+        # TODO: Implement Nutanix tools uninstallation after migration to Harvester
+        # Tools to uninstall:
+        # - Nutanix Guest Tools
+        # - Nutanix VirtIO
+        # - Nutanix VM Mobility
+        # Note: Only uninstall AFTER VM is successfully running on Harvester with Fedora VirtIO drivers
+        
         print(colored("\n📜 Generate Post-Migration Script", Colors.BOLD))
         
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
