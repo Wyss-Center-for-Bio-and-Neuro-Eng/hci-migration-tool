@@ -499,57 +499,65 @@ $results | ConvertTo-Json -Depth 3
 '''
 
     PS_AGENT_STATUS = r'''
-# Simple detection script with debug
-$virtioDir = "$env:ProgramFiles\Virtio-Win"
-$virtioGT = Test-Path $virtioDir
+# Debug logging
+$logFile = "C:\temp\virtio-debug.log"
+New-Item -ItemType Directory -Path "C:\temp" -Force -ErrorAction SilentlyContinue | Out-Null
 
-# Debug: list virtio directory if exists
-$virtioContents = @()
-if ($virtioGT) {
-    $virtioContents = (Get-ChildItem $virtioDir -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-}
+"=== VirtIO Detection Debug ===" | Out-File $logFile
+"Date: $(Get-Date)" | Out-File $logFile -Append
+"" | Out-File $logFile -Append
+
+# Check all possible VirtIO locations
+$virtioWin = Test-Path "$env:ProgramFiles\Virtio-Win"
+$redHat = Test-Path "$env:ProgramFiles\Red Hat"
+$qemuGaDir = Test-Path "$env:ProgramFiles\Qemu-ga"
+
+"Virtio-Win folder: $virtioWin" | Out-File $logFile -Append
+"Red Hat folder: $redHat" | Out-File $logFile -Append
+"Qemu-ga folder: $qemuGaDir" | Out-File $logFile -Append
+
+# List Program Files contents
+"" | Out-File $logFile -Append
+"Program Files contents:" | Out-File $logFile -Append
+Get-ChildItem "$env:ProgramFiles" -Directory | Select-Object -ExpandProperty Name | Out-File $logFile -Append
+
+# VirtIO is installed if ANY of these exist
+$virtioInstalled = $virtioWin -or $redHat
 
 # NGT
 $ngt = Get-Service -Name "Nutanix Guest Agent" -ErrorAction SilentlyContinue
 
-# QEMU GA  
+# QEMU GA - check service
 $qemuGA = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
 if (-not $qemuGA) { $qemuGA = Get-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue }
 
-# VirtIO detection
-$virtioNet = $false
-$virtioStorage = $false  
-$virtioSerial = $false
-$virtioBalloon = $false
-
-if ($virtioGT) {
-    # Check various possible folder structures
-    $virtioNet = (Test-Path "$virtioDir\NetKVM") -or (Test-Path "$virtioDir\Drivers\NetKVM") -or ($virtioContents -contains "NetKVM")
-    $virtioStorage = (Test-Path "$virtioDir\vioscsi") -or (Test-Path "$virtioDir\viostor") -or (Test-Path "$virtioDir\Drivers\vioscsi") -or ($virtioContents -match "viostor|vioscsi")
-    $virtioSerial = (Test-Path "$virtioDir\vioserial") -or (Test-Path "$virtioDir\Drivers\vioserial") -or ($virtioContents -contains "vioserial")
-    $virtioBalloon = (Test-Path "$virtioDir\Balloon") -or (Test-Path "$virtioDir\Drivers\Balloon") -or ($virtioContents -contains "Balloon")
-    
-    # If still false but GT is installed, assume drivers are there
-    if (-not ($virtioNet -or $virtioStorage -or $virtioSerial)) {
-        $virtioNet = $true
-        $virtioStorage = $true
-        $virtioSerial = $true
-        $virtioBalloon = $true
-    }
+"" | Out-File $logFile -Append
+"QEMU-GA service found: $($null -ne $qemuGA)" | Out-File $logFile -Append
+if ($qemuGA) {
+    "QEMU-GA status: $($qemuGA.Status)" | Out-File $logFile -Append
 }
+
+# Also check if qemu-ga.exe exists
+$qemuGaExe = Test-Path "$env:ProgramFiles\Qemu-ga\qemu-ga.exe"
+"Qemu-ga.exe exists: $qemuGaExe" | Out-File $logFile -Append
+
+# Final detection: QEMU GA is installed if service exists OR folder exists
+$qemuGaInstalled = ($null -ne $qemuGA) -or $qemuGaDir
+
+"" | Out-File $logFile -Append
+"=== Final Results ===" | Out-File $logFile -Append
+"VirtIO installed: $virtioInstalled" | Out-File $logFile -Append
+"QEMU GA installed: $qemuGaInstalled" | Out-File $logFile -Append
 
 @{
     NGTInstalled = $null -ne $ngt
     VirtIONutanix = $false
-    VirtIOFedora = $virtioGT
-    VirtIONet = $virtioNet
-    VirtIOStorage = $virtioStorage
-    VirtIOSerial = $virtioSerial
-    VirtioBalloon = $virtioBalloon
-    VirtIODir = $virtioDir
-    VirtIODirExists = $virtioGT
-    VirtIOContents = ($virtioContents -join ",")
-    QEMUGuestAgent = $null -ne $qemuGA
+    VirtIOFedora = $virtioInstalled
+    VirtIONet = $virtioInstalled
+    VirtIOStorage = $virtioInstalled
+    VirtIOSerial = $virtioInstalled
+    VirtioBalloon = $virtioInstalled
+    QEMUGuestAgent = $qemuGaInstalled
     QEMUGuestAgentRunning = ($qemuGA -and $qemuGA.Status -eq 'Running')
     QEMUGuestAgentAutoStart = ($qemuGA -and $qemuGA.StartType -eq 'Automatic')
 } | ConvertTo-Json
@@ -610,20 +618,9 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
         stdout, stderr, rc = self.client.run_powershell(self.PS_AGENT_STATUS)
         if rc == 0 and stdout.strip():
             try:
-                data = json.loads(stdout)
-                # Debug: show VirtIO detection info if available
-                if data.get('VirtIODirExists'):
-                    contents = data.get('VirtIOContents', '')
-                    if contents:
-                        print(f"      [Debug] VirtIO dir contents: {contents}")
-                return data
-            except json.JSONDecodeError as e:
-                print(f"      [Debug] JSON parse error: {e}")
-                print(f"      [Debug] Raw output: {stdout[:200]}")
+                return json.loads(stdout)
+            except json.JSONDecodeError:
                 return {}
-        else:
-            if stderr:
-                print(f"      [Debug] Agent check error: {stderr[:100]}")
         return {}
     
     def collect_service_status(self) -> Dict[str, Any]:
