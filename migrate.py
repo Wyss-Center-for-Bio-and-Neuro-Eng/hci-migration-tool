@@ -2176,47 +2176,59 @@ class MigrationTool:
             time.sleep(20)
             
             vm_ip = None
-            max_wait = 180  # 3 minutes total
+            max_wait = 60  # 1 minute (Windows VMs usually don't have Guest Agent)
             start_time = time.time()
             last_print = 0
-            vmi_found = False
+            vmi_running = False
             
             while time.time() - start_time < max_wait:
                 elapsed = int(time.time() - start_time)
                 
                 try:
-                    interfaces = self.harvester.get_vm_ip(vm_name, namespace)
+                    # Check VMI status and interfaces
+                    vmi = self.harvester.get_vmi(vm_name, namespace, silent=True)
+                    vmi_phase = vmi.get('status', {}).get('phase', '')
                     
-                    if interfaces and not vmi_found:
-                        vmi_found = True
-                        print("   ✅ VM instance running, waiting for QEMU Guest Agent...")
+                    if vmi_phase == 'Running' and not vmi_running:
+                        vmi_running = True
+                        print("   ✅ VM instance is Running")
                     
+                    # Try to get IP from interfaces
+                    interfaces = vmi.get('status', {}).get('interfaces', [])
                     for iface in interfaces:
-                        ip = iface.get('ip', '')
+                        ip = iface.get('ipAddress', '')
+                        # Remove CIDR suffix if present (e.g., 10.16.16.132/23)
+                        if ip and '/' in ip:
+                            ip = ip.split('/')[0]
                         if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
                             vm_ip = ip
                             break
                     
                     if vm_ip:
                         break
-                except:
+                        
+                except Exception as e:
                     pass
                 
                 # Print progress every 15 seconds
                 if elapsed - last_print >= 15:
-                    status = "waiting for Guest Agent..." if vmi_found else "waiting for VM to start..."
-                    print(f"   ⏳ {status} ({elapsed + 15}s)")
+                    if vmi_running:
+                        print(f"   ⏳ VM running, checking for IP... ({elapsed + 20}s)")
+                    else:
+                        print(f"   ⏳ Waiting for VM to start... ({elapsed + 20}s)")
                     last_print = elapsed
                 
                 time.sleep(5)
             
             if not vm_ip:
-                print(colored("\n   ❌ Could not get IP from QEMU Guest Agent", Colors.RED))
-                manual_ip = self.input_prompt("   Enter IP manually (or Enter to skip)")
+                print(colored("\n   ⚠️  Could not get IP from QEMU Guest Agent", Colors.YELLOW))
+                print(colored("      (Windows VMs typically don't have Guest Agent installed)", Colors.YELLOW))
+                print(colored("\n   💡 Look at Harvester UI - the DHCP IP should be visible there", Colors.CYAN))
+                manual_ip = self.input_prompt("\n   Enter the DHCP IP from Harvester UI")
                 if not manual_ip:
                     print(colored("\n💡 Complete migration later with Menu Windows → Post-migration auto-configure", Colors.YELLOW))
                     return
-                vm_ip = manual_ip
+                vm_ip = manual_ip.strip()
             
             print(colored(f"\n   ✅ VM IP (DHCP): {vm_ip}", Colors.GREEN))
             

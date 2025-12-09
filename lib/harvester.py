@@ -177,21 +177,56 @@ class HarvesterClient:
     
     def get_vm_ip(self, name: str, namespace: str = None) -> List[dict]:
         """
-        Get VM IP addresses from QEMU guest agent via VMI status.
+        Get VM IP addresses from VMI status.
+        Tries multiple sources: Harvester v1 API and KubeVirt API.
         Returns list of interfaces with IP info.
         """
         ns = namespace or self.namespace
+        result = []
+        
+        # Try Harvester v1 API first (used by UI)
+        try:
+            url = f"{self.base_url}/v1/kubevirt.io.virtualmachineinstances/{ns}/{name}"
+            response = requests.get(
+                url,
+                cert=self.cert,
+                verify=self.verify if self.verify else False
+            )
+            if response.ok:
+                vmi = response.json()
+                interfaces = vmi.get('status', {}).get('interfaces', [])
+                for iface in interfaces:
+                    ip = iface.get('ipAddress', '')
+                    # Clean up IP if it has CIDR notation
+                    if '/' in ip:
+                        ip = ip.split('/')[0]
+                    result.append({
+                        'name': iface.get('name', ''),
+                        'mac': iface.get('mac', ''),
+                        'ip': ip,
+                        'ips': iface.get('ipAddresses', []),
+                        'infoSource': iface.get('infoSource', '')
+                    })
+                if result:
+                    return result
+        except:
+            pass
+        
+        # Fallback to KubeVirt API
         try:
             vmi = self.get_vmi(name, ns, silent=True)
             interfaces = vmi.get('status', {}).get('interfaces', [])
             
-            result = []
             for iface in interfaces:
+                ip = iface.get('ipAddress', '')
+                if '/' in ip:
+                    ip = ip.split('/')[0]
                 result.append({
                     'name': iface.get('name', ''),
                     'mac': iface.get('mac', ''),
-                    'ip': iface.get('ipAddress', ''),
-                    'ips': iface.get('ipAddresses', [])
+                    'ip': ip,
+                    'ips': iface.get('ipAddresses', []),
+                    'infoSource': iface.get('infoSource', '')
                 })
             return result
         except Exception as e:
