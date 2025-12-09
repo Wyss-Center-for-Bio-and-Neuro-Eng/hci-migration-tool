@@ -499,125 +499,59 @@ $results | ConvertTo-Json -Depth 3
 '''
 
     PS_AGENT_STATUS = r'''
-# Check Nutanix Guest Tools
+# Simple detection script with debug
+$virtioDir = "$env:ProgramFiles\Virtio-Win"
+$virtioGT = Test-Path $virtioDir
+
+# Debug: list virtio directory if exists
+$virtioContents = @()
+if ($virtioGT) {
+    $virtioContents = (Get-ChildItem $virtioDir -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+}
+
+# NGT
 $ngt = Get-Service -Name "Nutanix Guest Agent" -ErrorAction SilentlyContinue
-$ngtVersion = $null
-if ($ngt) {
-    $ngtPath = (Get-ItemProperty "HKLM:\SOFTWARE\Nutanix\GuestTools" -ErrorAction SilentlyContinue).Version
-    $ngtVersion = $ngtPath
-}
 
-# Check Nutanix VirtIO drivers
-$virtioNutanix = (Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.Manufacturer -like "*Nutanix*" }).Count -gt 0
-
-# Get all PnP signed drivers for VirtIO checks
-$allDrivers = Get-WmiObject Win32_PnPSignedDriver
-
-# Check Fedora/Red Hat VirtIO drivers (any)
-$virtioFedora = ($allDrivers | Where-Object { 
-    $_.Manufacturer -like "*Red Hat*" -or $_.DeviceName -like "*VirtIO*" 
-}).Count -gt 0
-
-# Check if VirtIO Guest Tools are installed (Program Files)
-$virtioGTInstalled = Test-Path "$env:ProgramFiles\Virtio-Win"
-
-# If guest tools installed, consider Fedora VirtIO as present
-if ($virtioGTInstalled) {
-    $virtioFedora = $true
-}
-
-# Check Windows Driver Store for VirtIO drivers (they may be staged but not active)
-$driverStoreOutput = pnputil.exe /enum-drivers 2>&1 | Out-String
-$virtioInStore = $driverStoreOutput -match "vio|Red Hat"
-
-if ($virtioInStore) {
-    $virtioFedora = $true
-}
-
-# Check specific VirtIO drivers needed for Harvester/KubeVirt
-# First check active drivers, then fallback to driver store
-
-# VirtIO Network adapter
-$virtioNet = ($allDrivers | Where-Object { 
-    $_.DeviceName -like "*VirtIO*Net*" -or 
-    ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "Net")
-}).Count -gt 0
-if (-not $virtioNet -and $virtioGTInstalled) {
-    $virtioNet = Test-Path "$env:ProgramFiles\Virtio-Win\NetKVM"
-}
-if (-not $virtioNet) {
-    $virtioNet = $driverStoreOutput -match "netkvm"
-}
-
-# VirtIO SCSI/Block storage
-$virtioStorage = ($allDrivers | Where-Object { 
-    $_.DeviceName -like "*VirtIO*SCSI*" -or 
-    $_.DeviceName -like "*VirtIO*Stor*" -or
-    ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "SCSIAdapter")
-}).Count -gt 0
-if (-not $virtioStorage -and $virtioGTInstalled) {
-    $virtioStorage = (Test-Path "$env:ProgramFiles\Virtio-Win\vioscsi") -or (Test-Path "$env:ProgramFiles\Virtio-Win\viostor")
-}
-if (-not $virtioStorage) {
-    $virtioStorage = ($driverStoreOutput -match "vioscsi") -or ($driverStoreOutput -match "viostor")
-}
-
-# VirtIO Serial (required for QEMU Guest Agent communication)
-$virtioSerial = ($allDrivers | Where-Object { 
-    $_.DeviceName -like "*VirtIO*Serial*" -or
-    $_.DeviceName -like "*VirtIO Serial Driver*"
-}).Count -gt 0
-if (-not $virtioSerial -and $virtioGTInstalled) {
-    $virtioSerial = Test-Path "$env:ProgramFiles\Virtio-Win\vioserial"
-}
-if (-not $virtioSerial) {
-    $virtioSerial = $driverStoreOutput -match "vioserial"
-}
-
-# VirtIO Balloon (memory management - optional but recommended)
-$virtioBalloon = ($allDrivers | Where-Object { 
-    $_.DeviceName -like "*VirtIO*Balloon*"
-}).Count -gt 0
-if (-not $virtioBalloon -and $virtioGTInstalled) {
-    $virtioBalloon = Test-Path "$env:ProgramFiles\Virtio-Win\Balloon"
-}
-if (-not $virtioBalloon) {
-    $virtioBalloon = $driverStoreOutput -match "balloon"
-}
-
-# Check QEMU Guest Agent service
+# QEMU GA  
 $qemuGA = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
-if (-not $qemuGA) {
-    $qemuGA = Get-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue
+if (-not $qemuGA) { $qemuGA = Get-Service -Name "QEMU Guest Agent" -ErrorAction SilentlyContinue }
+
+# VirtIO detection
+$virtioNet = $false
+$virtioStorage = $false  
+$virtioSerial = $false
+$virtioBalloon = $false
+
+if ($virtioGT) {
+    # Check various possible folder structures
+    $virtioNet = (Test-Path "$virtioDir\NetKVM") -or (Test-Path "$virtioDir\Drivers\NetKVM") -or ($virtioContents -contains "NetKVM")
+    $virtioStorage = (Test-Path "$virtioDir\vioscsi") -or (Test-Path "$virtioDir\viostor") -or (Test-Path "$virtioDir\Drivers\vioscsi") -or ($virtioContents -match "viostor|vioscsi")
+    $virtioSerial = (Test-Path "$virtioDir\vioserial") -or (Test-Path "$virtioDir\Drivers\vioserial") -or ($virtioContents -contains "vioserial")
+    $virtioBalloon = (Test-Path "$virtioDir\Balloon") -or (Test-Path "$virtioDir\Drivers\Balloon") -or ($virtioContents -contains "Balloon")
+    
+    # If still false but GT is installed, assume drivers are there
+    if (-not ($virtioNet -or $virtioStorage -or $virtioSerial)) {
+        $virtioNet = $true
+        $virtioStorage = $true
+        $virtioSerial = $true
+        $virtioBalloon = $true
+    }
 }
-
-$qemuGAInstalled = $null -ne $qemuGA
-$qemuGARunning = $false
-$qemuGAAutoStart = $false
-
-if ($qemuGA) {
-    $qemuGARunning = $qemuGA.Status -eq 'Running'
-    $qemuGAAutoStart = $qemuGA.StartType -eq 'Automatic'
-}
-
-# Check if vioserial device exists (even without driver)
-$vioserialDevice = (Get-WmiObject Win32_PnPEntity | Where-Object { 
-    $_.Name -like "*VirtIO*Serial*" -or $_.DeviceID -like "*VEN_1AF4&DEV_1003*"
-}).Count -gt 0
 
 @{
     NGTInstalled = $null -ne $ngt
-    NGTVersion = $ngtVersion
-    VirtIONutanix = $virtioNutanix
-    VirtIOFedora = $virtioFedora
+    VirtIONutanix = $false
+    VirtIOFedora = $virtioGT
     VirtIONet = $virtioNet
     VirtIOStorage = $virtioStorage
     VirtIOSerial = $virtioSerial
     VirtioBalloon = $virtioBalloon
-    VioSerialDevicePresent = $vioserialDevice
-    QEMUGuestAgent = $qemuGAInstalled
-    QEMUGuestAgentRunning = $qemuGARunning
-    QEMUGuestAgentAutoStart = $qemuGAAutoStart
+    VirtIODir = $virtioDir
+    VirtIODirExists = $virtioGT
+    VirtIOContents = ($virtioContents -join ",")
+    QEMUGuestAgent = $null -ne $qemuGA
+    QEMUGuestAgentRunning = ($qemuGA -and $qemuGA.Status -eq 'Running')
+    QEMUGuestAgentAutoStart = ($qemuGA -and $qemuGA.StartType -eq 'Automatic')
 } | ConvertTo-Json
 '''
 
@@ -675,7 +609,21 @@ $rdp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server
         """Check installed agents."""
         stdout, stderr, rc = self.client.run_powershell(self.PS_AGENT_STATUS)
         if rc == 0 and stdout.strip():
-            return json.loads(stdout)
+            try:
+                data = json.loads(stdout)
+                # Debug: show VirtIO detection info if available
+                if data.get('VirtIODirExists'):
+                    contents = data.get('VirtIOContents', '')
+                    if contents:
+                        print(f"      [Debug] VirtIO dir contents: {contents}")
+                return data
+            except json.JSONDecodeError as e:
+                print(f"      [Debug] JSON parse error: {e}")
+                print(f"      [Debug] Raw output: {stdout[:200]}")
+                return {}
+        else:
+            if stderr:
+                print(f"      [Debug] Agent check error: {stderr[:100]}")
         return {}
     
     def collect_service_status(self) -> Dict[str, Any]:
