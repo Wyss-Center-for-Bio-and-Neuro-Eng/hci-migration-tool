@@ -1,86 +1,85 @@
 #!/usr/bin/env python3
 """
-Test VMI API to debug IP retrieval
+Test VMI API to debug IP retrieval - Uses raw API calls
 """
 import yaml
 import json
 import sys
+import requests
+import base64
+import tempfile
+import os
 import warnings
 warnings.filterwarnings('ignore')
-
-# Add lib to path
-sys.path.insert(0, '.')
-from lib.harvester import HarvesterClient
 
 # Load config
 with open('config.yaml') as f:
     config = yaml.safe_load(f)
 
 harvester_config = config.get('harvester', {})
+base_url = harvester_config.get('api_url')
 namespace = harvester_config.get('default_namespace', 'harvester-public')
 
 # VM to test
 vm_name = sys.argv[1] if len(sys.argv) > 1 else 'wlchgvaopefs1'
 
 print(f"Testing VMI API for: {vm_name} in {namespace}")
-print(f"Base URL: {harvester_config.get('api_url')}")
+print(f"Base URL: {base_url}")
 print()
 
-# Create client (handles auth correctly)
-client = HarvesterClient(harvester_config)
+# Setup certificates from base64 data
+cert_data = harvester_config.get('client_certificate_data')
+key_data = harvester_config.get('client_key_data')
+ca_data = harvester_config.get('certificate_authority_data')
 
-# Test 1: Get VMI via get_vmi method
-print("=" * 60)
-print("Test 1: get_vmi() method")
-print("=" * 60)
-try:
-    vmi = client.get_vmi(vm_name, namespace, silent=False)
-    print(f"Phase: {vmi.get('status', {}).get('phase', 'N/A')}")
-    interfaces = vmi.get('status', {}).get('interfaces', [])
-    print(f"Interfaces: {len(interfaces)}")
-    for i, iface in enumerate(interfaces):
-        print(f"  Interface {i}:")
-        print(f"    name: {iface.get('name', 'N/A')}")
-        print(f"    mac: {iface.get('mac', 'N/A')}")
-        print(f"    ipAddress: {iface.get('ipAddress', 'N/A')}")
-        print(f"    ipAddresses: {iface.get('ipAddresses', [])}")
-        print(f"    infoSource: {iface.get('infoSource', 'N/A')}")
-except Exception as e:
-    print(f"Exception: {e}")
+cert = None
+verify = False
 
-print()
+if cert_data and key_data:
+    cert_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+    cert_file.write(base64.b64decode(cert_data))
+    cert_file.close()
+    
+    key_file = tempfile.NamedTemporaryFile(delete=False, suffix='.key')
+    key_file.write(base64.b64decode(key_data))
+    key_file.close()
+    
+    cert = (cert_file.name, key_file.name)
+    print(f"✅ Using client certificate")
 
-# Test 2: Get VM IP via get_vm_ip method
-print("=" * 60)
-print("Test 2: get_vm_ip() method")
-print("=" * 60)
-try:
-    ips = client.get_vm_ip(vm_name, namespace)
-    print(f"Result: {json.dumps(ips, indent=2)}")
-except Exception as e:
-    print(f"Exception: {e}")
+if ca_data:
+    ca_file = tempfile.NamedTemporaryFile(delete=False, suffix='.crt')
+    ca_file.write(base64.b64decode(ca_data))
+    ca_file.close()
+    verify = ca_file.name
+    print(f"✅ Using CA certificate")
 
 print()
 
-# Test 3: Raw API call to Harvester v1 endpoint
+# Test 1: KubeVirt API - Get VMI
 print("=" * 60)
-print("Test 3: Raw Harvester v1 API")
+print("Test 1: KubeVirt API - /apis/kubevirt.io/v1/")
 print("=" * 60)
-import requests
-url = f"{client.base_url}/v1/kubevirt.io.virtualmachineinstances/{namespace}/{vm_name}"
+url = f"{base_url}/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachineinstances/{vm_name}"
 print(f"URL: {url}")
+
 try:
-    r = requests.get(url, cert=client.cert, verify=client.verify if client.verify else False)
+    r = requests.get(url, cert=cert, verify=verify if verify else False)
     print(f"Status: {r.status_code}")
     if r.ok:
         data = r.json()
         print(f"Phase: {data.get('status', {}).get('phase', 'N/A')}")
+        
+        # Show raw interfaces
         interfaces = data.get('status', {}).get('interfaces', [])
-        print(f"Interfaces: {len(interfaces)}")
-        for i, iface in enumerate(interfaces):
-            print(f"  Interface {i}:")
-            for key in ['name', 'mac', 'ipAddress', 'ipAddresses', 'infoSource']:
-                print(f"    {key}: {iface.get(key, 'N/A')}")
+        print(f"Interfaces count: {len(interfaces)}")
+        
+        if interfaces:
+            print("\nRaw interfaces data:")
+            print(json.dumps(interfaces, indent=2))
+        else:
+            print("\n⚠️  No interfaces in status!")
+            print("\nFull status keys:", list(data.get('status', {}).keys()))
     else:
         print(f"Error: {r.text[:500]}")
 except Exception as e:
@@ -88,15 +87,62 @@ except Exception as e:
 
 print()
 
-# Test 4: Check VM annotations
+# Test 2: Get VM (not VMI) to check annotations
 print("=" * 60)
-print("Test 4: VM annotations")
+print("Test 2: VM annotations - /apis/kubevirt.io/v1/virtualmachines")
 print("=" * 60)
+url = f"{base_url}/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}"
+print(f"URL: {url}")
+
 try:
-    vm = client.get_vm(vm_name, namespace)
-    annotations = vm.get('metadata', {}).get('annotations', {})
-    ips_annotation = annotations.get('network.harvesterhci.io/ips', '[]')
-    print(f"network.harvesterhci.io/ips: {ips_annotation}")
-    print(f"printableStatus: {vm.get('status', {}).get('printableStatus', 'N/A')}")
+    r = requests.get(url, cert=cert, verify=verify if verify else False)
+    print(f"Status: {r.status_code}")
+    if r.ok:
+        data = r.json()
+        annotations = data.get('metadata', {}).get('annotations', {})
+        
+        # Show relevant annotations
+        print("\nRelevant annotations:")
+        for key in ['network.harvesterhci.io/ips', 'harvesterhci.io/mac-address']:
+            print(f"  {key}: {annotations.get(key, 'N/A')}")
+        
+        print(f"\nStatus.printableStatus: {data.get('status', {}).get('printableStatus', 'N/A')}")
+        print(f"Status.ready: {data.get('status', {}).get('ready', 'N/A')}")
+    else:
+        print(f"Error: {r.text[:500]}")
 except Exception as e:
     print(f"Exception: {e}")
+
+print()
+
+# Test 3: List all VMIs to see if ours exists
+print("=" * 60)
+print("Test 3: List all VMIs in namespace")
+print("=" * 60)
+url = f"{base_url}/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachineinstances"
+print(f"URL: {url}")
+
+try:
+    r = requests.get(url, cert=cert, verify=verify if verify else False)
+    print(f"Status: {r.status_code}")
+    if r.ok:
+        data = r.json()
+        items = data.get('items', [])
+        print(f"Found {len(items)} VMI(s):")
+        for item in items:
+            name = item.get('metadata', {}).get('name', 'N/A')
+            phase = item.get('status', {}).get('phase', 'N/A')
+            interfaces = item.get('status', {}).get('interfaces', [])
+            ips = [iface.get('ipAddress', '') for iface in interfaces if iface.get('ipAddress')]
+            print(f"  - {name}: {phase}, IPs: {ips}")
+    else:
+        print(f"Error: {r.text[:500]}")
+except Exception as e:
+    print(f"Exception: {e}")
+
+# Cleanup temp files
+if cert:
+    os.unlink(cert[0])
+    os.unlink(cert[1])
+if verify and verify != False:
+    os.unlink(verify)
