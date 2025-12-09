@@ -3621,9 +3621,71 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
             print(colored("\n   ⚠️  A reboot is recommended to activate all drivers", Colors.YELLOW))
             reboot = self.input_prompt("   Reboot now? (y/n)")
             if reboot.lower() == 'y':
-                print("   Rebooting VM...")
+                print("   🔄 Rebooting VM...")
                 client.run_powershell("Restart-Computer -Force")
-                print(colored("   ✅ Reboot initiated - wait 2-3 minutes then re-run pre-check", Colors.GREEN))
+                
+                # Wait for VM to come back
+                print(colored("\n   ⏳ Waiting for VM to restart...", Colors.CYAN))
+                time.sleep(10)  # Initial wait for shutdown
+                
+                max_attempts = 12  # 12 * 30s = 6 minutes max
+                reconnected = False
+                
+                for attempt in range(1, max_attempts + 1):
+                    print(f"   🔍 Checking connection... (attempt {attempt}/{max_attempts})")
+                    try:
+                        new_client = WinRMClient(
+                            host=host,
+                            username=username,
+                            password=password,
+                            transport=transport
+                        )
+                        if new_client.test_connection():
+                            print(colored("   ✅ VM is back online!", Colors.GREEN))
+                            client = new_client
+                            reconnected = True
+                            break
+                    except:
+                        pass
+                    
+                    if attempt < max_attempts:
+                        print(f"      Waiting 30 seconds...")
+                        time.sleep(30)
+                
+                if reconnected:
+                    # Re-run verification
+                    print(colored("\n   📋 Re-checking prerequisites after reboot...", Colors.CYAN))
+                    time.sleep(5)  # Short delay for services to stabilize
+                    
+                    checker = WindowsPreCheck(client)
+                    new_config = checker.run_full_check()
+                    
+                    # Show updated status
+                    print(colored("\n   🔧 UPDATED DRIVERS & AGENTS STATUS", Colors.BOLD))
+                    agents = new_config.agents
+                    print(f"      VirtIO Network:  {'✅' if agents.virtio_net else '❌'}")
+                    print(f"      VirtIO Storage:  {'✅' if agents.virtio_scsi else '❌'}")
+                    print(f"      VirtIO Serial:   {'✅' if agents.virtio_serial else '❌'}")
+                    print(f"      VirtIO Balloon:  {'✅' if agents.virtio_balloon else '⚪ (optional)'}")
+                    print(f"      QEMU Guest Agent: {'✅' if agents.qemu_guest_agent else '❌'}")
+                    
+                    if new_config.migration_ready:
+                        print(colored("\n   🎉 VM is now READY for migration!", Colors.GREEN))
+                    else:
+                        print(colored("\n   ⚠️  Still missing prerequisites:", Colors.YELLOW))
+                        for prereq in new_config.missing_prerequisites:
+                            print(f"      - {prereq}")
+                    
+                    # Update saved config
+                    staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+                    vm_dir = os.path.join(staging_dir, 'migrations', new_config.hostname.lower())
+                    os.makedirs(vm_dir, exist_ok=True)
+                    config_path = os.path.join(vm_dir, 'vm-config.json')
+                    new_config.save(config_path)
+                    print(colored(f"\n   💾 Configuration updated: {config_path}", Colors.GREEN))
+                else:
+                    print(colored("   ❌ Could not reconnect to VM after reboot", Colors.RED))
+                    print(colored("      Re-run pre-migration check manually", Colors.YELLOW))
         
         finally:
             # Stop HTTP server
