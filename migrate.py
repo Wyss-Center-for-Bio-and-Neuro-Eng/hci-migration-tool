@@ -3488,15 +3488,25 @@ $isoPath = "$env:TEMP\\virtio-win.iso"
 Write-Host "Downloading VirtIO ISO (~500MB)... This may take a few minutes."
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest -Uri $isoUrl -OutFile $isoPath -UseBasicParsing
-Write-Host "Download complete."
+try {{
+    Invoke-WebRequest -Uri $isoUrl -OutFile $isoPath -UseBasicParsing
+    Write-Host "Download complete."
+}} catch {{
+    Write-Host "ERROR: Failed to download ISO: $_"
+    exit 1
+}}
 
 # Mount ISO
 Write-Host "Mounting ISO..."
-$mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
-$driveLetter = ($mountResult | Get-Volume).DriveLetter
-$driverPath = "${{driveLetter}}:"
-Write-Host "ISO mounted on $driverPath"
+try {{
+    $mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
+    $driveLetter = ($mountResult | Get-Volume).DriveLetter
+    $driverPath = "${{driveLetter}}:"
+    Write-Host "ISO mounted on $driverPath"
+}} catch {{
+    Write-Host "ERROR: Failed to mount ISO: $_"
+    exit 1
+}}
 
 # Detect Windows version for driver folder
 $osVersion = [System.Environment]::OSVersion.Version
@@ -3507,6 +3517,23 @@ elseif ($osVersion.Build -lt 14393) {{ $winVersion = "2k12R2" }}
 elseif ($osVersion.Build -lt 17763) {{ $winVersion = "2k16" }}
 elseif ($osVersion.Build -lt 20348) {{ $winVersion = "2k19" }}
 Write-Host "Windows version: $winVersion (Build $($osVersion.Build))"
+
+# Check what folders actually exist in the ISO
+Write-Host "Checking available driver folders..."
+$testPaths = @("2k22", "w11", "2k19", "2k16")
+$availableVersion = $null
+foreach ($ver in $testPaths) {{
+    $testPath = Join-Path $driverPath "vioserial\\$ver\\amd64"
+    if (Test-Path $testPath) {{
+        Write-Host "  Found drivers for: $ver"
+        if (-not $availableVersion) {{ $availableVersion = $ver }}
+    }}
+}}
+
+if ($availableVersion -and $availableVersion -ne $winVersion) {{
+    Write-Host "Using $availableVersion drivers (closest match)"
+    $winVersion = $availableVersion
+}}
 
 # Driver list - order matters (serial before QEMU GA can work)
 $drivers = @(
@@ -3522,7 +3549,8 @@ $drivers = @(
 )
 
 $installed = 0
-$failed = 0
+$skipped = 0
+$notfound = 0
 
 foreach ($driver in $drivers) {{
     $fullPath = Join-Path $driverPath $driver.Path
@@ -3531,28 +3559,18 @@ foreach ($driver in $drivers) {{
         $infFiles = Get-ChildItem -Path $fullPath -Filter "*.inf"
         foreach ($inf in $infFiles) {{
             $result = pnputil.exe /add-driver $inf.FullName /install 2>&1
-            if ($LASTEXITCODE -eq 0 -or $result -match "successfully") {{
+            $resultStr = $result | Out-String
+            if ($resultStr -match "added" -or $resultStr -match "staged" -or $resultStr -match "successfully" -or $LASTEXITCODE -eq 0) {{
                 Write-Host "  OK: $($inf.Name)"
                 $installed++
             }} else {{
-                Write-Host "  Skip: $($inf.Name) (already installed or not needed)"
+                Write-Host "  Skip: $($inf.Name) - $($resultStr.Trim().Substring(0, [Math]::Min(50, $resultStr.Trim().Length)))"
+                $skipped++
             }}
         }}
     }} else {{
-        Write-Host "  Path not found: $($driver.Path) - trying w11 folder..."
-        # Try Windows 11/Server 2022 folder as fallback
-        $altPath = $driver.Path -replace "2k22", "w11"
-        $fullPath = Join-Path $driverPath $altPath
-        if (Test-Path $fullPath) {{
-            $infFiles = Get-ChildItem -Path $fullPath -Filter "*.inf"
-            foreach ($inf in $infFiles) {{
-                $result = pnputil.exe /add-driver $inf.FullName /install 2>&1
-                if ($LASTEXITCODE -eq 0) {{
-                    Write-Host "  OK: $($inf.Name)"
-                    $installed++
-                }}
-            }}
-        }}
+        Write-Host "  Path not found: $($driver.Path)"
+        $notfound++
     }}
 }}
 
@@ -3562,8 +3580,18 @@ Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
 Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
 
 Write-Host ""
-Write-Host "VirtIO drivers installation complete. $installed driver(s) installed."
-Write-Host "A reboot may be required for all drivers to be active."
+Write-Host "=========================================="
+Write-Host "VirtIO drivers: $installed installed, $skipped skipped, $notfound not found"
+Write-Host "=========================================="
+
+# Exit with 0 if at least some drivers were installed
+if ($installed -gt 0) {{
+    Write-Host "SUCCESS: Drivers added to Windows driver store"
+    exit 0
+}} else {{
+    Write-Host "WARNING: No drivers were installed"
+    exit 1
+}}
 '''
                 stdout, stderr, rc = client.run_powershell(ps_script, timeout=600)  # 10 min timeout for download
                 if rc == 0:
@@ -3646,8 +3674,10 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
                             client = new_client
                             reconnected = True
                             break
-                    except:
-                        pass
+                        else:
+                            print(f"      WinRM not ready yet...")
+                    except Exception as e:
+                        print(f"      Connection error: {str(e)[:50]}...")
                     
                     if attempt < max_attempts:
                         print(f"      Waiting 30 seconds...")
