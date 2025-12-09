@@ -3349,7 +3349,7 @@ Write-Host "SUCCESS"
                 # Offer to install missing prerequisites
                 install = self.input_prompt("\n   Install missing prerequisites now? (y/n)")
                 if install.lower() == 'y':
-                    self._install_windows_prerequisites(client, config, host)
+                    self._install_windows_prerequisites(client, config, host, username, password, transport)
                     
                     # Re-check after installation - update ALL agent fields
                     print("\n   🔄 Re-checking agents...")
@@ -3404,7 +3404,7 @@ Write-Host "SUCCESS"
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
-    def _install_windows_prerequisites(self, client, config, host):
+    def _install_windows_prerequisites(self, client, config, host, username, password, transport):
         """Install missing prerequisites on Windows VM via WinRM."""
         self.init_actions()
         
