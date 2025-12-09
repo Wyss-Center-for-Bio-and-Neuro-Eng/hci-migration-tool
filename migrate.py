@@ -10,6 +10,7 @@ import sys
 import yaml
 import argparse
 import json
+import requests
 from datetime import datetime
 
 # Add lib to path
@@ -2185,30 +2186,56 @@ class MigrationTool:
                 elapsed = int(time.time() - start_time)
                 
                 try:
-                    # Check VMI status and interfaces
-                    vmi = self.harvester.get_vmi(vm_name, namespace, silent=True)
-                    vmi_phase = vmi.get('status', {}).get('phase', '')
+                    # Try Harvester v1 API first (same as UI uses)
+                    url = f"{self.harvester.base_url}/v1/kubevirt.io.virtualmachineinstances/{namespace}/{vm_name}"
+                    response = requests.get(
+                        url,
+                        cert=self.harvester.cert,
+                        verify=self.harvester.verify if self.harvester.verify else False
+                    )
                     
-                    if vmi_phase == 'Running' and not vmi_running:
-                        vmi_running = True
-                        print("   ✅ VM instance is Running")
-                    
-                    # Try to get IP from interfaces
-                    interfaces = vmi.get('status', {}).get('interfaces', [])
-                    for iface in interfaces:
-                        ip = iface.get('ipAddress', '')
-                        # Remove CIDR suffix if present (e.g., 10.16.16.132/23)
-                        if ip and '/' in ip:
-                            ip = ip.split('/')[0]
-                        if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
-                            vm_ip = ip
+                    if response.ok:
+                        vmi = response.json()
+                        vmi_phase = vmi.get('status', {}).get('phase', '')
+                        
+                        if vmi_phase == 'Running' and not vmi_running:
+                            vmi_running = True
+                            print("   ✅ VM instance is Running")
+                        
+                        # Debug: show raw interfaces data
+                        interfaces = vmi.get('status', {}).get('interfaces', [])
+                        if interfaces and not vmi_running:
+                            print(f"   🔍 Debug: Found {len(interfaces)} interface(s)")
+                        
+                        for iface in interfaces:
+                            ip = iface.get('ipAddress', '')
+                            # Also check ipAddresses array
+                            if not ip:
+                                ips = iface.get('ipAddresses', [])
+                                for addr in ips:
+                                    if addr and not addr.startswith('fe80:'):  # Skip IPv6 link-local
+                                        ip = addr
+                                        break
+                            
+                            # Remove CIDR suffix if present
+                            if ip and '/' in ip:
+                                ip = ip.split('/')[0]
+                            
+                            if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                                vm_ip = ip
+                                print(f"   🔍 Found IP: {vm_ip} (infoSource: {iface.get('infoSource', 'N/A')})")
+                                break
+                        
+                        if vm_ip:
                             break
-                    
-                    if vm_ip:
-                        break
+                    else:
+                        # Debug: show why API failed
+                        if elapsed == 0:
+                            print(f"   🔍 API response: {response.status_code}")
                         
                 except Exception as e:
-                    pass
+                    if elapsed == 0:
+                        print(f"   🔍 Debug exception: {e}")
                 
                 # Print progress every 15 seconds
                 if elapsed - last_print >= 15:
