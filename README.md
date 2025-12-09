@@ -5,7 +5,8 @@ VM migration tool from Nutanix AHV to Harvester HCI.
 ## Features
 
 - **Windows Pre-Check**: Collect VM config, install VirtIO drivers & QEMU Guest Agent
-- **Fast Export**: aria2c multi-connection download (5-10x faster)
+- **Fast NFS Export**: Direct NFS copy from Nutanix storage (420-500 MB/s) - **5x faster than API**
+- **Fallback API Export**: aria2c multi-connection download when NFS unavailable
 - **Conversion**: RAW → QCOW2 with compression
 - **Import**: Upload to Harvester (HTTP or virtctl)
 - **VM Creation**: Automatic configuration from Nutanix specs with multi-NIC mapping
@@ -25,7 +26,8 @@ sudo apt install -y \
     pass gnupg2 \
     krb5-user libkrb5-dev \
     realmd sssd sssd-tools adcli \
-    aria2
+    aria2 \
+    nfs-common  # For NFS fast export
 
 # Python packages
 pip install pyyaml requests pywinrm[kerberos] --break-system-packages
@@ -37,10 +39,23 @@ pip install pyyaml requests pywinrm[kerberos] --break-system-packages
 |------|---------|---------|
 | `python3` | Script runtime | `apt install python3` |
 | `qemu-img` | RAW → QCOW2 conversion | `apt install qemu-utils` |
-| `aria2c` | Fast multi-connection download (16 streams) | `apt install aria2` |
+| `nfs-common` | NFS mount for fast export | `apt install nfs-common` |
+| `aria2c` | Fallback multi-connection download | `apt install aria2` |
 | `pass` | Secure credential vault | `apt install pass gnupg2` |
 | `kinit` | Kerberos authentication | `apt install krb5-user` |
 | `virtctl` | (Optional) Direct upload to Harvester | Manual install |
+
+### NFS Whitelist Configuration (Nutanix)
+
+For fast NFS export, the migration server IP must be whitelisted on Nutanix containers:
+
+1. **Prism Element** → Storage → Table view
+2. Select container (e.g., `container01`)
+3. **Update** → Filesystem Whitelist
+4. Add migration server IP: `10.16.22.x`
+5. Save
+
+This enables direct NFS mount: `mount -t nfs <CVM_IP>:/<container> /mnt/nutanix`
 
 ### Active Directory Domain Join (for Kerberos)
 
@@ -109,6 +124,8 @@ nutanix:
   prism_ip: "10.16.22.46"
   username: "admin"
   password: "your_password"
+  cvm_ip: "10.16.22.46"      # CVM IP for NFS mount (usually same as prism_ip)
+  nfs_mount_path: "/mnt/nutanix"  # Local mount point for NFS
 
 harvester:
   api_url: "https://10.16.16.130:6443"
@@ -169,8 +186,12 @@ python3 migrate.py
 |------|------|--------|-------------|
 | 2.1 | Nutanix (1) | 3 | **Select VM** |
 | 2.2 | Nutanix (1) | 5 | **Power OFF** the VM |
-| 2.3 | Migration (3) | 4 | **Export VM** → Creates Nutanix image, downloads via aria2c |
+| 2.3 | Migration (3) | 4 | **Export VM** → Choose NFS (fast) or API (fallback) |
 | 2.4 | Migration (3) | 5 | **Convert RAW → QCOW2** (auto-proposed after export) |
+
+**Export Options:**
+- **NFS Direct (recommended)**: 420-530 MB/s - requires container whitelist
+- **API Download**: ~100 MB/s - no special config needed
 
 **Result:** QCOW2 file(s) in `/mnt/data/<vm>-disk0.qcow2`
 
@@ -257,7 +278,7 @@ python3 migrate.py
 | 1 | Check staging |
 | 2 | List staging disks |
 | 3 | Disk image details |
-| 4 | **Export VM** (Nutanix → Staging via aria2c) |
+| 4 | **Export VM** (NFS fast copy or API fallback) |
 | 5 | Convert RAW → QCOW2 |
 | 6 | **Import image to Harvester** (HTTP or Upload) |
 | 7 | Create VM in Harvester |
@@ -280,15 +301,26 @@ python3 migrate.py
 
 ---
 
-## Download Speed Comparison
+## Export Speed Comparison
 
-| Method | Speed | Notes |
-|--------|-------|-------|
-| Python requests | ~100 MB/s | Single connection |
-| **aria2c (default)** | ~500 MB/s | 16 parallel connections |
-| NFS direct | ~800 MB/s | Not working (firewall issues) |
+| Method | Speed | Time for 1 TB | Notes |
+|--------|-------|---------------|-------|
+| **NFS Direct (default)** | **420-530 MB/s** | **~33 min** | Requires whitelist config |
+| aria2c (fallback) | ~100 MB/s | ~2h45 | 16 parallel connections |
+| Python requests | ~100 MB/s | ~2h45 | Single connection |
 
-The tool automatically uses aria2c if available, with fallback to Python.
+The tool automatically:
+1. Tries **NFS direct copy** first (fastest)
+2. Falls back to **API download** if NFS unavailable
+
+### NFS vs API Performance
+
+```
+NFS Direct:  ████████████████████████████████████ 500 MB/s
+API (aria2): ████████                              100 MB/s
+```
+
+**5x faster with NFS!** A 1 TB disk exports in ~33 minutes instead of ~3 hours.
 
 ---
 
@@ -340,18 +372,24 @@ After:  VM → Volume Clone (independent)
 ## Staging Directory Structure
 
 ```
-/mnt/data/
-├── tools/                          # VirtIO/QEMU tools
+/mnt/nutanix/                           # NFS mount (Nutanix containers)
+├── container01/
+│   └── .acropolis/vmdisk/              # Raw VM disks
+└── Nutanix_nxf_ctr/
+    └── .acropolis/vmdisk/
+
+/mnt/data/                              # Local staging
+├── tools/                              # VirtIO/QEMU tools
 │   ├── virtio-win.iso
 │   └── qemu-ga-x86_64.msi
 │
-├── migrations/                     # Per-VM configs
+├── migrations/                         # Per-VM configs
 │   └── <hostname>/
-│       ├── vm-config.json          # Collected config
-│       └── reconfig-network.ps1    # Post-migration script
+│       ├── vm-config.json              # Collected config
+│       └── reconfig-network.ps1        # Post-migration script
 │
-├── <vm>-disk0.raw                  # Exported disks (temporary)
-└── <vm>-disk0.qcow2                # Converted disks (for import)
+├── <vm>-disk0.raw                      # Exported disks (temporary)
+└── <vm>-disk0.qcow2                    # Converted disks (for import)
 ```
 
 ---
@@ -393,6 +431,22 @@ After:  VM → Volume Clone (independent)
 ---
 
 ## Troubleshooting
+
+### NFS Mount Fails
+
+```bash
+# Check if NFS is accessible
+showmount -e 10.16.22.46
+
+# If "access denied", add IP to whitelist:
+# Prism Element → Storage → Container → Update → Filesystem Whitelist
+```
+
+### NFS Export Slow or Fails
+
+- Ensure migration server is on same subnet as CVM (avoid firewall routing)
+- Check network: `iperf3` between migration server and CVM
+- Verify container whitelist includes correct IP
 
 ### aria2c "authentication required"
 
@@ -444,6 +498,28 @@ Image is used by a volume (backing image). Solutions:
 
 ---
 
+## Technical Notes
+
+### Nutanix API for NFS Export
+
+The tool uses Nutanix API v2 `/vms/?include_vm_disk_config=true` to retrieve:
+- `vmdisk_uuid`: Actual filename on NFS storage
+- `ndfs_filepath`: Full NFS path (e.g., `/container01/.acropolis/vmdisk/<uuid>`)
+
+**Important**: API v3 returns `device_uuid` which is different from the NFS filename. Only API v2 with `include_vm_disk_config=true` returns the correct `vmdisk_uuid`.
+
+### vDisk Storage Layout
+
+```
+/mnt/nutanix/                          # NFS mount point
+└── <container>/
+    └── .acropolis/
+        └── vmdisk/
+            └── <vmdisk_uuid>          # Raw disk file
+```
+
+---
+
 ## Security Notes
 
 - Nutanix credentials are stored in plaintext in `config.yaml`
@@ -461,6 +537,7 @@ Image is used by a volume (backing image). Solutions:
 - [ ] Linux VM support
 - [ ] Parallel disk export for multi-disk VMs
 - [ ] Progress dashboard / web UI
+- [x] ~~NFS direct export~~ ✅ Implemented (420-530 MB/s)
 
 ---
 
