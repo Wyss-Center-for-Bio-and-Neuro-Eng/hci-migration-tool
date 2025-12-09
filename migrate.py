@@ -7,6 +7,7 @@ Interactive menu to migrate VMs from Nutanix to Harvester
 
 import os
 import sys
+import time
 import yaml
 import argparse
 import json
