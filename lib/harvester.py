@@ -130,35 +130,27 @@ class HarvesterClient:
         ns = namespace or self.namespace
         return self._request("DELETE", f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}")
     
-    def start_vm(self, name: str, namespace: str = None) -> dict:
-        """Start VM using KubeVirt subresources API."""
-        ns = namespace or self.namespace
-        # Use subresources.kubevirt.io API for start/stop/restart
-        url = f"{self.base_url}/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start"
-        
-        response = requests.put(
-            url,
-            json={},  # Empty body for start
-            cert=self.cert,
-            verify=self.verify if self.verify else False
-        )
-        response.raise_for_status()
-        return response.json() if response.text else {}
-    
     def stop_vm(self, name: str, namespace: str = None) -> dict:
-        """Stop VM using KubeVirt subresources API."""
+        """Stop VM by setting runStrategy to Halted."""
         ns = namespace or self.namespace
-        # Use subresources.kubevirt.io API for start/stop/restart
-        url = f"{self.base_url}/apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop"
-        
-        response = requests.put(
-            url,
-            json={},  # Empty body for stop
-            cert=self.cert,
-            verify=self.verify if self.verify else False
+        # Patch runStrategy to Halted
+        patch = {"spec": {"runStrategy": "Halted"}}
+        return self._request(
+            "PATCH", 
+            f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}",
+            patch
         )
-        response.raise_for_status()
-        return response.json() if response.text else {}
+    
+    def start_vm(self, name: str, namespace: str = None) -> dict:
+        """Start VM by setting runStrategy to RerunOnFailure."""
+        ns = namespace or self.namespace
+        # Patch runStrategy to RerunOnFailure (this starts the VM)
+        patch = {"spec": {"runStrategy": "RerunOnFailure"}}
+        return self._request(
+            "PATCH", 
+            f"/apis/kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}",
+            patch
+        )
     
     def get_vmi(self, name: str, namespace: str = None) -> dict:
         """Get VirtualMachineInstance (running VM) by name."""
