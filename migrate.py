@@ -3477,139 +3477,52 @@ Write-Host "SUCCESS"
             # Install VirtIO drivers FIRST (before QEMU GA, as GA needs serial driver)
             if install_virtio:
                 print(colored("\n   📦 Installing VirtIO drivers...", Colors.CYAN))
-                print(colored("      Using virtio-win-gt-x64 installer (adds drivers to Windows store)", Colors.CYAN))
                 
-                # Use the official VirtIO Guest Tools installer - MUCH simpler and reliable
-                ps_script = f'''
-$ErrorActionPreference = "Continue"
-$isoUrl = "{http_url}/virtio-win.iso"
-$isoPath = "$env:TEMP\\virtio-win.iso"
-
-Write-Host "=== VirtIO Drivers Installation ==="
-Write-Host ""
-
-# Step 1: Download ISO
-Write-Host "[1/4] Downloading VirtIO ISO (~500MB)..."
+                # Step 1: Download ISO
+                print(colored("      Downloading ISO...", Colors.CYAN))
+                ps_download = f'''
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ProgressPreference = 'SilentlyContinue'
-try {{
-    Invoke-WebRequest -Uri $isoUrl -OutFile $isoPath -UseBasicParsing
-    Write-Host "      Download complete: $((Get-Item $isoPath).Length / 1MB) MB"
-}} catch {{
-    Write-Host "ERROR: Download failed - $_"
-    exit 1
-}}
-
-# Step 2: Mount ISO
-Write-Host "[2/4] Mounting ISO..."
-try {{
-    $mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru
-    Start-Sleep -Seconds 2
-    $driveLetter = ($mountResult | Get-Volume).DriveLetter
-    if (-not $driveLetter) {{
-        Write-Host "ERROR: Could not get drive letter"
-        exit 1
-    }}
-    $driverPath = "${{driveLetter}}:\\"
-    Write-Host "      Mounted on drive $driveLetter"
-}} catch {{
-    Write-Host "ERROR: Mount failed - $_"
-    exit 1
-}}
-
-# Step 3: Find and run the installer
-Write-Host "[3/4] Installing VirtIO Guest Tools..."
-$installerPaths = @(
-    "$driverPath\\virtio-win-gt-x64.exe",
-    "$driverPath\\virtio-win-guest-tools.exe",
-    "$driverPath\\virtio-win-gt-x64.msi"
-)
-
-$installerFound = $false
-foreach ($installer in $installerPaths) {{
-    if (Test-Path $installer) {{
-        Write-Host "      Found installer: $installer"
-        $installerFound = $true
-        
-        if ($installer -match "\\.msi$") {{
-            # MSI installer
-            Write-Host "      Running MSI installer (silent)..."
-            $process = Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /qn /norestart" -Wait -PassThru -NoNewWindow
-        }} else {{
-            # EXE installer
-            Write-Host "      Running EXE installer (silent)..."
-            $process = Start-Process $installer -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-        }}
-        
-        if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
-            Write-Host "      Installation successful (exit code: $($process.ExitCode))"
-        }} else {{
-            Write-Host "      Installation returned exit code: $($process.ExitCode)"
-        }}
-        break
-    }}
-}}
-
-if (-not $installerFound) {{
-    Write-Host "WARNING: No installer found, listing ISO contents:"
-    Get-ChildItem $driverPath | ForEach-Object {{ Write-Host "      $_" }}
-    
-    # Fallback: try to add drivers to store with pnputil
-    Write-Host ""
-    Write-Host "      Attempting fallback with pnputil..."
-    $infFiles = Get-ChildItem -Path $driverPath -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue | 
-                Where-Object {{ $_.FullName -match "amd64" }}
-    
-    $added = 0
-    foreach ($inf in $infFiles | Select-Object -First 20) {{
-        $result = pnputil.exe /add-driver $inf.FullName /install 2>&1 | Out-String
-        if ($result -match "added|staged|successfully") {{
-            Write-Host "      Added: $($inf.Name)"
-            $added++
-        }}
-    }}
-    Write-Host "      Fallback: $added drivers added to store"
-}}
-
-# Step 4: Cleanup
-Write-Host "[4/4] Cleaning up..."
-Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
-Remove-Item $isoPath -Force -ErrorAction SilentlyContinue
-
-# Verify installation
-Write-Host ""
-Write-Host "=== Verification ==="
-$virtioDir = "$env:ProgramFiles\\Virtio-Win"
-if (Test-Path $virtioDir) {{
-    Write-Host "SUCCESS: VirtIO drivers installed at $virtioDir"
-    Get-ChildItem $virtioDir -Directory | ForEach-Object {{ Write-Host "      - $($_.Name)" }}
-    exit 0
-}} else {{
-    # Check driver store
-    $storeDrivers = pnputil.exe /enum-drivers | Select-String -Pattern "vio|virtio" -AllMatches
-    if ($storeDrivers) {{
-        Write-Host "SUCCESS: VirtIO drivers found in Windows driver store"
-        exit 0
-    }} else {{
-        Write-Host "WARNING: Could not verify installation"
-        Write-Host "         Drivers may still work after reboot on Harvester"
-        exit 0
-    }}
-}}
+Invoke-WebRequest -Uri "{http_url}/virtio-win.iso" -OutFile "$env:TEMP\\virtio-win.iso" -UseBasicParsing
+Write-Host "OK"
 '''
-                stdout, stderr, rc = client.run_powershell(ps_script, timeout=900)  # 15 min timeout
-                
-                # Always show output for debugging
-                if stdout.strip():
-                    for line in stdout.strip().split('\n'):
-                        print(f"      {line}")
-                
-                if rc == 0:
-                    print(colored("   ✅ VirtIO drivers installation complete", Colors.GREEN))
+                stdout, stderr, rc = client.run_powershell(ps_download, timeout=600)
+                if rc != 0:
+                    print(colored(f"   ❌ Download failed: {stderr}", Colors.RED))
                 else:
-                    print(colored(f"   ⚠️  Installation finished with warnings (exit code: {rc})", Colors.YELLOW))
-                    if stderr.strip():
-                        print(f"      {stderr.strip()}")
+                    print(colored("      ✅ Downloaded", Colors.GREEN))
+                    
+                    # Step 2: Mount and install
+                    print(colored("      Mounting and installing...", Colors.CYAN))
+                    ps_install = '''
+$iso = "$env:TEMP\\virtio-win.iso"
+$m = Mount-DiskImage -ImagePath $iso -PassThru
+Start-Sleep 2
+$d = ($m | Get-Volume).DriveLetter + ":"
+$exe = "$d\\virtio-win-gt-x64.exe"
+if (Test-Path $exe) {
+    Start-Process $exe -ArgumentList "/S" -Wait -NoNewWindow
+    Write-Host "Installed with exe"
+} else {
+    $msi = "$d\\virtio-win-gt-x64.msi"
+    if (Test-Path $msi) {
+        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -NoNewWindow
+        Write-Host "Installed with msi"
+    } else {
+        Write-Host "No installer found"
+    }
+}
+Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+Remove-Item $iso -Force -ErrorAction SilentlyContinue
+if (Test-Path "$env:ProgramFiles\\Virtio-Win") { Write-Host "SUCCESS" }
+'''
+                    stdout, stderr, rc = client.run_powershell(ps_install, timeout=300)
+                    if stdout:
+                        print(f"      {stdout.strip()}")
+                    if "SUCCESS" in stdout or "Installed" in stdout:
+                        print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
+                    else:
+                        print(colored(f"   ⚠️  Check installation manually", Colors.YELLOW))
                 stdout, stderr, rc = client.run_powershell(ps_script, timeout=600)  # 10 min timeout for download
                 if rc == 0:
                     print(colored("   ✅ VirtIO drivers installed", Colors.GREEN))
