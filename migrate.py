@@ -1074,6 +1074,143 @@ class MigrationTool:
         print(colored(f"\n📤 Export VM: {self._selected_vm}", Colors.BOLD))
         print(colored("-" * 50, Colors.BLUE))
         
+        # Ask for transfer method
+        print(colored("\nTransfer method:", Colors.BOLD))
+        print("  1. NFS direct (FAST ~1000+ MB/s) - requires NFS whitelist")
+        print("  2. API download (slower ~100 MB/s) - always works")
+        method = self.input_prompt("Choice [1]")
+        
+        if method == "2":
+            self._export_vm_api()
+        else:
+            self._export_vm_nfs()
+    
+    def _export_vm_nfs(self):
+        """Export VM disks via NFS (fast method)."""
+        print(colored(f"\n🚀 NFS Export: {self._selected_vm}", Colors.BOLD))
+        
+        # Get VM details for power state check
+        vm = self.nutanix.get_vm_by_name(self._selected_vm)
+        if not vm:
+            print(colored(f"❌ VM not found: {self._selected_vm}", Colors.RED))
+            return
+        
+        # Check power state
+        power_state = vm.get('status', {}).get('resources', {}).get('power_state', 'UNKNOWN')
+        if power_state != 'OFF':
+            print(colored(f"⚠️  VM is {power_state}. It's recommended to power off before export.", Colors.YELLOW))
+            proceed = self.input_prompt("Continue anyway? (y/n)")
+            if proceed.lower() != 'y':
+                return
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        vm_name_clean = self._selected_vm.lower().replace(' ', '-').replace('/', '-')
+        
+        # Get vdisks via SSH
+        print(colored("\n📡 Getting vdisk info via SSH...", Colors.CYAN))
+        try:
+            vdisks = self.nutanix.get_vm_vdisks_ssh(self._selected_vm)
+        except Exception as e:
+            print(colored(f"❌ Failed to get vdisks via SSH: {e}", Colors.RED))
+            print(colored("   Make sure SSH key is configured for CVM access", Colors.YELLOW))
+            print(colored("   Falling back to API method...", Colors.YELLOW))
+            self._export_vm_api()
+            return
+        
+        if not vdisks:
+            print(colored("❌ No vdisks found", Colors.RED))
+            return
+        
+        print(colored(f"\n💾 Found {len(vdisks)} disk(s):", Colors.BOLD))
+        for i, vdisk in enumerate(vdisks):
+            size_gb = vdisk['size_bytes'] // (1024**3)
+            print(f"   Disk {i}: {size_gb} GB")
+            print(f"      UUID: {vdisk['uuid']}")
+            print(f"      Path: {vdisk['nfs_path']}")
+        
+        # Mount NFS
+        container = vdisks[0].get('container', 'container01')
+        print(colored(f"\n📁 Mounting NFS container: {container}", Colors.CYAN))
+        try:
+            mount_path = self.nutanix.mount_nfs_container(container)
+            print(colored(f"   ✅ Mounted at {mount_path}", Colors.GREEN))
+        except Exception as e:
+            print(colored(f"❌ Failed to mount NFS: {e}", Colors.RED))
+            print(colored("   Make sure the server IP is in the container's filesystem whitelist", Colors.YELLOW))
+            return
+        
+        # Copy disks
+        print(colored(f"\n🚀 Starting NFS copy to {staging_dir}", Colors.CYAN))
+        print(colored("   This should be MUCH faster than API download!\n", Colors.CYAN))
+        
+        downloaded_files = []
+        
+        for i, vdisk in enumerate(vdisks):
+            dest_file = os.path.join(staging_dir, f"{vm_name_clean}-disk{i}.raw")
+            size_gb = vdisk['size_bytes'] // (1024**3)
+            
+            print(colored(f"   📀 Disk {i} ({size_gb} GB):", Colors.BOLD))
+            
+            if os.path.exists(dest_file):
+                existing_size = os.path.getsize(dest_file)
+                if existing_size == vdisk['size_bytes']:
+                    print(f"      File exists with correct size")
+                    skip = self.input_prompt("      Skip? (y/n) [y]")
+                    if skip.lower() != 'n':
+                        downloaded_files.append(dest_file)
+                        continue
+                else:
+                    overwrite = self.input_prompt(f"      File exists ({existing_size // (1024**3)} GB). Overwrite? (y/n)")
+                    if overwrite.lower() != 'y':
+                        downloaded_files.append(dest_file)
+                        continue
+            
+            start_time = time.time()
+            last_print = start_time
+            
+            def copy_progress(copied, total, speed):
+                nonlocal last_print
+                now = time.time()
+                if now - last_print >= 2.0:  # Update every 2 seconds
+                    pct = (copied / total * 100) if total > 0 else 0
+                    copied_gb = copied / (1024**3)
+                    total_gb = total / (1024**3)
+                    print(f"\r      Progress: {pct:.1f}% ({copied_gb:.1f}/{total_gb:.1f} GB) - {speed:.0f} MB/s   ", end='', flush=True)
+                    last_print = now
+            
+            try:
+                self.nutanix.copy_vdisk_nfs(
+                    vdisk['uuid'],
+                    container,
+                    dest_file,
+                    progress_callback=copy_progress
+                )
+                elapsed = time.time() - start_time
+                avg_speed = (vdisk['size_bytes'] / elapsed) / (1024**2)
+                print(f"\n      ✅ Done in {elapsed:.0f}s (avg {avg_speed:.0f} MB/s)")
+                downloaded_files.append(dest_file)
+            except Exception as e:
+                print(f"\n      ❌ Failed: {e}")
+        
+        # Summary
+        print(colored(f"\n✅ Export complete!", Colors.GREEN))
+        print(f"   Files in staging: {len(downloaded_files)}")
+        for f in downloaded_files:
+            size = os.path.getsize(f) if os.path.exists(f) else 0
+            print(f"      {f} ({size // (1024**3)} GB)")
+        
+        # Offer to convert to QCOW2
+        if downloaded_files:
+            convert = self.input_prompt("\nConvert to QCOW2 now? (y/n) [y]")
+            if convert.lower() != 'n':
+                for raw_file in downloaded_files:
+                    self._convert_single_file(raw_file)
+    
+    def _export_vm_api(self):
+        """Export VM disks via API (original method)."""
+        print(colored(f"\n📤 API Export: {self._selected_vm}", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
         # Get VM details
         vm = self.nutanix.get_vm_by_name(self._selected_vm)
         if not vm:

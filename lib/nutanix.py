@@ -2,6 +2,10 @@
 Nutanix Prism API Client
 """
 
+import os
+import subprocess
+import shutil
+import time
 import requests
 import urllib3
 from typing import Optional, List, Dict, Any
@@ -18,11 +22,17 @@ class NutanixClient:
         
         Args:
             config: Dictionary with prism_ip, username, password, verify_ssl
+            Optional: cvm_ip, cvm_user, nfs_mount_path
         """
         self.base_url = f"https://{config['prism_ip']}:9440/api/nutanix/v3"
         self.auth = (config['username'], config['password'])
         self.verify_ssl = config.get('verify_ssl', False)
         self.prism_ip = config['prism_ip']
+        
+        # NFS/SSH config for fast transfer
+        self.cvm_ip = config.get('cvm_ip', config['prism_ip'])  # Default to prism_ip
+        self.cvm_user = config.get('cvm_user', 'nutanix')
+        self.nfs_mount_path = config.get('nfs_mount_path', '/mnt/nutanix')
     
     def _request(self, method: str, endpoint: str, data: dict = None) -> dict:
         """Execute API request."""
@@ -366,3 +376,198 @@ class NutanixClient:
             'disks': disk_list,
             'nics': nic_list,
         }
+    
+    # === NFS Fast Transfer Methods ===
+    
+    def get_vm_vdisks_ssh(self, vm_name: str) -> List[Dict]:
+        """
+        Get VM vdisk info via SSH/acli (returns actual vmdisk_uuid for NFS access).
+        
+        Args:
+            vm_name: VM name
+            
+        Returns:
+            List of dicts with vmdisk_uuid, vmdisk_nfs_path, vmdisk_size
+        """
+        cmd = [
+            'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes',
+            f'{self.cvm_user}@{self.cvm_ip}',
+            f'acli vm.get {vm_name} include_vmdisk_paths=1'
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                raise Exception(f"SSH command failed: {result.stderr}")
+            
+            # Parse output
+            disks = []
+            current_disk = {}
+            
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if 'vmdisk_nfs_path:' in line:
+                    path = line.split(':', 1)[1].strip().strip('"')
+                    current_disk['nfs_path'] = path
+                    # Extract container name from path
+                    parts = path.split('/')
+                    if len(parts) >= 2:
+                        current_disk['container'] = parts[1]
+                elif 'vmdisk_uuid:' in line:
+                    current_disk['uuid'] = line.split(':', 1)[1].strip().strip('"')
+                elif 'vmdisk_size:' in line:
+                    current_disk['size_bytes'] = int(line.split(':', 1)[1].strip())
+                    # Complete disk entry
+                    if 'uuid' in current_disk and 'nfs_path' in current_disk:
+                        disks.append(current_disk.copy())
+                    current_disk = {}
+            
+            return disks
+            
+        except subprocess.TimeoutExpired:
+            raise Exception("SSH command timed out")
+        except Exception as e:
+            raise Exception(f"Failed to get vdisks via SSH: {e}")
+    
+    def mount_nfs_container(self, container_name: str, mount_path: str = None) -> str:
+        """
+        Mount Nutanix container via NFS.
+        
+        Args:
+            container_name: Name of the container (e.g., 'container01')
+            mount_path: Optional mount point (default: self.nfs_mount_path)
+            
+        Returns:
+            Mount path
+        """
+        mount_path = mount_path or self.nfs_mount_path
+        
+        # Check if already mounted
+        if os.path.ismount(mount_path):
+            # Verify it's the right container
+            test_path = os.path.join(mount_path, '.acropolis', 'vmdisk')
+            if os.path.exists(test_path):
+                return mount_path
+            # Wrong mount, unmount first
+            subprocess.run(['umount', mount_path], capture_output=True)
+        
+        # Create mount point
+        os.makedirs(mount_path, exist_ok=True)
+        
+        # Mount NFS
+        nfs_source = f"{self.prism_ip}:/{container_name}"
+        cmd = ['mount', '-t', 'nfs', nfs_source, mount_path]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Failed to mount NFS: {result.stderr}")
+        
+        return mount_path
+    
+    def unmount_nfs(self, mount_path: str = None):
+        """Unmount NFS container."""
+        mount_path = mount_path or self.nfs_mount_path
+        if os.path.ismount(mount_path):
+            subprocess.run(['umount', mount_path], capture_output=True)
+    
+    def copy_vdisk_nfs(self, vmdisk_uuid: str, container_name: str, 
+                       dest_path: str, progress_callback=None) -> bool:
+        """
+        Copy vdisk via NFS (much faster than API).
+        
+        Args:
+            vmdisk_uuid: The vmdisk UUID (from acli, not API)
+            container_name: Container name
+            dest_path: Destination file path
+            progress_callback: Optional callback(copied_bytes, total_bytes, speed_mbps)
+            
+        Returns:
+            True if successful
+        """
+        # Ensure NFS is mounted
+        mount_path = self.mount_nfs_container(container_name)
+        
+        # Source path
+        src_path = os.path.join(mount_path, '.acropolis', 'vmdisk', vmdisk_uuid)
+        
+        if not os.path.exists(src_path):
+            raise Exception(f"vdisk not found: {src_path}")
+        
+        total_size = os.path.getsize(src_path)
+        
+        # Copy with progress
+        start_time = time.time()
+        copied = 0
+        chunk_size = 64 * 1024 * 1024  # 64MB chunks for speed
+        last_update = start_time
+        last_copied = 0
+        
+        with open(src_path, 'rb') as src, open(dest_path, 'wb') as dst:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                
+                # Progress update every second
+                now = time.time()
+                if progress_callback and (now - last_update) >= 1.0:
+                    speed = (copied - last_copied) / (now - last_update) / (1024 * 1024)
+                    progress_callback(copied, total_size, speed)
+                    last_update = now
+                    last_copied = copied
+        
+        # Final progress
+        elapsed = time.time() - start_time
+        if progress_callback and elapsed > 0:
+            avg_speed = copied / elapsed / (1024 * 1024)
+            progress_callback(copied, total_size, avg_speed)
+        
+        return True
+    
+    def export_vm_disks_nfs(self, vm_name: str, dest_dir: str, 
+                            progress_callback=None) -> List[Dict]:
+        """
+        Export all VM disks via NFS (fast method).
+        
+        Args:
+            vm_name: VM name
+            dest_dir: Destination directory
+            progress_callback: Optional callback(disk_index, filename, copied, total, speed)
+            
+        Returns:
+            List of exported disk info
+        """
+        # Get vdisks via SSH
+        vdisks = self.get_vm_vdisks_ssh(vm_name)
+        
+        if not vdisks:
+            raise Exception(f"No vdisks found for VM {vm_name}")
+        
+        exported = []
+        
+        for idx, vdisk in enumerate(vdisks):
+            filename = f"{vm_name}-disk{idx}.raw"
+            dest_path = os.path.join(dest_dir, filename)
+            
+            def disk_progress(copied, total, speed):
+                if progress_callback:
+                    progress_callback(idx, filename, copied, total, speed)
+            
+            self.copy_vdisk_nfs(
+                vdisk['uuid'],
+                vdisk['container'],
+                dest_path,
+                progress_callback=disk_progress
+            )
+            
+            exported.append({
+                'index': idx,
+                'filename': filename,
+                'path': dest_path,
+                'size_bytes': vdisk['size_bytes'],
+                'vmdisk_uuid': vdisk['uuid']
+            })
+        
+        return exported

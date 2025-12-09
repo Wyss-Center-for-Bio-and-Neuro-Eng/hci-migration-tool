@@ -5,6 +5,12 @@ nutanix:
   prism_ip: "10.16.22.46"
   username: "admin"
   password: "your_password_here"
+  # NFS fast transfer settings (optional)
+  # CVM IP for SSH access (defaults to prism_ip)
+  cvm_ip: "10.16.22.46"
+  cvm_user: "nutanix"
+  # NFS mount point for direct vdisk access
+  nfs_mount_path: "/mnt/nutanix"
 
 harvester:
   api_url: "https://10.16.16.130:6443"
