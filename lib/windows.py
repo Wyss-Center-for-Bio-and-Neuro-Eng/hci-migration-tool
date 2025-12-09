@@ -518,12 +518,36 @@ $virtioFedora = ($allDrivers | Where-Object {
     $_.Manufacturer -like "*Red Hat*" -or $_.DeviceName -like "*VirtIO*" 
 }).Count -gt 0
 
+# Check if VirtIO Guest Tools are installed (Program Files)
+$virtioGTInstalled = Test-Path "$env:ProgramFiles\Virtio-Win"
+
+# If guest tools installed, consider Fedora VirtIO as present
+if ($virtioGTInstalled) {
+    $virtioFedora = $true
+}
+
+# Check Windows Driver Store for VirtIO drivers (they may be staged but not active)
+$driverStoreOutput = pnputil.exe /enum-drivers 2>&1 | Out-String
+$virtioInStore = $driverStoreOutput -match "vio|Red Hat"
+
+if ($virtioInStore) {
+    $virtioFedora = $true
+}
+
 # Check specific VirtIO drivers needed for Harvester/KubeVirt
+# First check active drivers, then fallback to driver store
+
 # VirtIO Network adapter
 $virtioNet = ($allDrivers | Where-Object { 
     $_.DeviceName -like "*VirtIO*Net*" -or 
     ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "Net")
 }).Count -gt 0
+if (-not $virtioNet -and $virtioGTInstalled) {
+    $virtioNet = Test-Path "$env:ProgramFiles\Virtio-Win\NetKVM"
+}
+if (-not $virtioNet) {
+    $virtioNet = $driverStoreOutput -match "netkvm"
+}
 
 # VirtIO SCSI/Block storage
 $virtioStorage = ($allDrivers | Where-Object { 
@@ -531,17 +555,35 @@ $virtioStorage = ($allDrivers | Where-Object {
     $_.DeviceName -like "*VirtIO*Stor*" -or
     ($_.Manufacturer -like "*Red Hat*" -and $_.DeviceClass -eq "SCSIAdapter")
 }).Count -gt 0
+if (-not $virtioStorage -and $virtioGTInstalled) {
+    $virtioStorage = (Test-Path "$env:ProgramFiles\Virtio-Win\vioscsi") -or (Test-Path "$env:ProgramFiles\Virtio-Win\viostor")
+}
+if (-not $virtioStorage) {
+    $virtioStorage = ($driverStoreOutput -match "vioscsi") -or ($driverStoreOutput -match "viostor")
+}
 
 # VirtIO Serial (required for QEMU Guest Agent communication)
 $virtioSerial = ($allDrivers | Where-Object { 
     $_.DeviceName -like "*VirtIO*Serial*" -or
     $_.DeviceName -like "*VirtIO Serial Driver*"
 }).Count -gt 0
+if (-not $virtioSerial -and $virtioGTInstalled) {
+    $virtioSerial = Test-Path "$env:ProgramFiles\Virtio-Win\vioserial"
+}
+if (-not $virtioSerial) {
+    $virtioSerial = $driverStoreOutput -match "vioserial"
+}
 
 # VirtIO Balloon (memory management - optional but recommended)
 $virtioBalloon = ($allDrivers | Where-Object { 
     $_.DeviceName -like "*VirtIO*Balloon*"
 }).Count -gt 0
+if (-not $virtioBalloon -and $virtioGTInstalled) {
+    $virtioBalloon = Test-Path "$env:ProgramFiles\Virtio-Win\Balloon"
+}
+if (-not $virtioBalloon) {
+    $virtioBalloon = $driverStoreOutput -match "balloon"
+}
 
 # Check QEMU Guest Agent service
 $qemuGA = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
