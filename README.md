@@ -4,31 +4,43 @@ VM migration tool from Nutanix AHV to Harvester HCI.
 
 ## Features
 
-- **Export**: Extract VM disks from Nutanix (via acli)
+- **Windows Pre-Check**: Collect VM config, install VirtIO drivers & QEMU Guest Agent
+- **Fast Export**: aria2c multi-connection download (5-10x faster)
 - **Conversion**: RAW → QCOW2 with compression
 - **Import**: Upload to Harvester (HTTP or virtctl)
 - **VM Creation**: Automatic configuration from Nutanix specs with multi-NIC mapping
 - **Dissociation**: Clone volumes to remove image dependency
-- **Windows Tools**: Pre-check, network config collection, auto post-migration
+- **Post-Migration**: Auto-reconfigure network, start services
 - **Vault**: Secure credential storage with `pass` + GPG
 
 ## Prerequisites
 
-### System (Debian/Ubuntu)
+### System Packages (Debian/Ubuntu)
 
 ```bash
-# System packages
 sudo apt install -y \
     python3 python3-pip \
     qemu-utils \
     sshpass \
     pass gnupg2 \
     krb5-user libkrb5-dev \
-    realmd sssd sssd-tools adcli
+    realmd sssd sssd-tools adcli \
+    aria2
 
 # Python packages
 pip install pyyaml requests pywinrm[kerberos] --break-system-packages
 ```
+
+### Required Tools Summary
+
+| Tool | Purpose | Install |
+|------|---------|---------|
+| `python3` | Script runtime | `apt install python3` |
+| `qemu-img` | RAW → QCOW2 conversion | `apt install qemu-utils` |
+| `aria2c` | Fast multi-connection download (16 streams) | `apt install aria2` |
+| `pass` | Secure credential vault | `apt install pass gnupg2` |
+| `kinit` | Kerberos authentication | `apt install krb5-user` |
+| `virtctl` | (Optional) Direct upload to Harvester | Manual install |
 
 ### Active Directory Domain Join (for Kerberos)
 
@@ -58,8 +70,9 @@ EOF
 # Initialize pass
 pass init "migration@yourdomain.com"
 
-# Add Windows credentials (for workgroup machines)
-pass insert migration/windows/local-admin
+# Add Windows credentials (multiline format)
+pass insert -m migration/windows/local-admin
+# Enter password, then on new line: username: svc_run_script@ad.wysscenter.ch
 ```
 
 ### Kerberos Authentication
@@ -105,6 +118,7 @@ harvester:
 
 transfer:
   staging_mount: "/mnt/data"
+  http_server_ip: "10.16.16.167"  # Your Debian IP for Harvester imports
   convert_to_qcow2: true
   compress: true
 
@@ -132,13 +146,72 @@ kubectl -n cattle-system get secret \
 python3 migrate.py
 ```
 
+---
+
+# Migration Workflow
+
+## Complete Windows VM Migration
+
+### PHASE 1 - PREPARATION (Source VM on Nutanix)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 1.1 | Windows (4) | 2 | **Pre-migration check** → Connect via WinRM, collect config |
+| 1.2 | Windows (4) | 2 | **Install prerequisites** → VirtIO drivers + QEMU Guest Agent |
+| 1.3 | Windows (4) | 2 | **Reboot** → Activate drivers, verify installation |
+| 1.4 | Windows (4) | 5 | **Stop services** → Stop application services (optional) |
+
+**Result:** VM config saved to `/mnt/data/migrations/<hostname>/vm-config.json`
+
+### PHASE 2 - EXPORT (Nutanix → Staging)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 2.1 | Nutanix (1) | 3 | **Select VM** |
+| 2.2 | Nutanix (1) | 5 | **Power OFF** the VM |
+| 2.3 | Migration (3) | 4 | **Export VM** → Creates Nutanix image, downloads via aria2c |
+| 2.4 | Migration (3) | 5 | **Convert RAW → QCOW2** (auto-proposed after export) |
+
+**Result:** QCOW2 file(s) in `/mnt/data/<vm>-disk0.qcow2`
+
+### PHASE 3 - IMPORT (Staging → Harvester)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 3.1 | Migration (3) | 6 | **Import image** → Upload QCOW2 to Harvester |
+| 3.2 | Migration (3) | 7 | **Create VM** → Uses saved config (CPU, RAM, disks, network) |
+
+**Result:** VM created in Harvester (powered off)
+
+### PHASE 4 - POST-MIGRATION (Target VM on Harvester)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 4.1 | Harvester (2) | 2 | **Start VM** on Harvester |
+| 4.2 | Windows (4) | 8 | **Auto-configure network** → Apply static IP from saved config |
+| 4.3 | Windows (4) | 6 | **Start services** → Restart application services |
+| 4.4 | - | - | **Uninstall Nutanix tools** (TODO - manual for now) |
+
+**Result:** VM running on Harvester with original IP address!
+
+### PHASE 5 - CLEANUP (Optional)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 5.1 | Harvester (2) | 5 | **Dissociate from image** → Clone volume to remove dependency |
+| 5.2 | Harvester (2) | 7 | **Delete Harvester image** |
+| 5.3 | Nutanix (1) | 7 | **Delete Nutanix export image** |
+| 5.4 | Migration (3) | 8 | **Delete staging files** (RAW/QCOW2) |
+
+---
+
+## Detailed Menus
+
 ### Main Menu
 
 ```
 ╔══════════════════════════════════════════════════════════════╗
 ║              NUTANIX → HARVESTER MIGRATION TOOL              ║
-╠══════════════════════════════════════════════════════════════╣
-║                         MAIN MENU                            ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  1. Nutanix                                                  ║
 ║  2. Harvester                                                ║
@@ -148,51 +221,6 @@ python3 migrate.py
 ║  q. Quit                                                     ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
-
-## Migration Workflow
-
-### Standard Migration
-
-1. **Select source VM** (Menu 1 → Option 3)
-2. **Power off source VM** (Menu 1 → Option 5)
-3. **Create Nutanix image** (via Prism or acli)
-4. **Export disk** (Menu 3 → Option 4)
-5. **Convert RAW → QCOW2** (Menu 3 → Option 5)
-6. **Import to Harvester** (Menu 3 → Option 6)
-7. **Create VM** (Menu 3 → Option 7)
-8. **Start and test** (Menu 2 → Option 2)
-9. **Dissociate from image** (Menu 2 → Option 5) - Optional
-10. **Cleanup**: Delete images and staging files
-
-### Windows Migration (with network reconfiguration)
-
-#### Pre-migration
-
-1. **Download tools** (Menu 4 → Option 4)
-   - virtio-win.iso
-   - virtio-win-gt-x64.msi
-   - qemu-ga-x86_64.msi
-
-2. **Run pre-migration check** (Menu 4 → Option 2)
-   - Connects via WinRM + Kerberos
-   - Collects: IP, DNS, Gateway, Hostname, Agents
-   - Auto-installs QEMU Guest Agent if missing
-   - Saves to `/mnt/data/migrations/<hostname>/vm-config.json`
-
-3. **Verify readiness** (Menu 4 → Option 3)
-   - Displays JSON configuration
-   - Shows missing prerequisites
-
-#### Post-migration
-
-1. **Start migrated VM** on Harvester (Menu 2 → Option 2)
-2. **Auto-configure network** (Menu 4 → Option 6)
-   - Gets temporary DHCP IP via QEMU Guest Agent
-   - Connects via WinRM (NTLM)
-   - Applies static IP configuration from vm-config.json
-3. VM is now reachable at its original IP!
-
-## Detailed Menus
 
 ### Nutanix Menu (1)
 
@@ -229,24 +257,40 @@ python3 migrate.py
 | 1 | Check staging |
 | 2 | List staging disks |
 | 3 | Disk image details |
-| 4 | Export VM (Nutanix → Staging) |
+| 4 | **Export VM** (Nutanix → Staging via aria2c) |
 | 5 | Convert RAW → QCOW2 |
 | 6 | **Import image to Harvester** (HTTP or Upload) |
 | 7 | Create VM in Harvester |
 | 8 | Delete staging file |
-| 9 | Full migration |
+| 9 | Full migration (TODO) |
 
 ### Windows Tools Menu (4)
 
 | Option | Description |
 |--------|-------------|
 | 1 | Check WinRM/Prerequisites |
-| 2 | Pre-migration check (collect config + install agents) |
+| 2 | **Pre-migration check** (collect config + install VirtIO/QEMU-GA) |
 | 3 | View VM config |
 | 4 | Download virtio/qemu-ga tools |
-| 5 | Generate post-migration script |
-| 6 | **Post-migration auto-configure** |
-| 7 | Vault management |
+| 5 | **Stop services** (pre-migration) |
+| 6 | **Start services** (post-migration) |
+| 7 | Generate post-migration script |
+| 8 | **Post-migration auto-configure** |
+| 9 | Vault management |
+
+---
+
+## Download Speed Comparison
+
+| Method | Speed | Notes |
+|--------|-------|-------|
+| Python requests | ~100 MB/s | Single connection |
+| **aria2c (default)** | ~500 MB/s | 16 parallel connections |
+| NFS direct | ~800 MB/s | Not working (firewall issues) |
+
+The tool automatically uses aria2c if available, with fallback to Python.
+
+---
 
 ## Multi-NIC Support
 
@@ -269,6 +313,8 @@ When creating a VM with multiple network interfaces, the tool maps each source N
    Keep MAC 50:6B:8D:D7:26:A6? (y/n) [y] > y
 ```
 
+---
+
 ## Image Dissociation
 
 ### Problem
@@ -289,13 +335,14 @@ Before: VM → Volume → Backing Image (linked)
 After:  VM → Volume Clone (independent)
 ```
 
+---
+
 ## Staging Directory Structure
 
 ```
 /mnt/data/
-├── tools/                          # Tools to deploy
+├── tools/                          # VirtIO/QEMU tools
 │   ├── virtio-win.iso
-│   ├── virtio-win-gt-x64.msi
 │   └── qemu-ga-x86_64.msi
 │
 ├── migrations/                     # Per-VM configs
@@ -303,9 +350,11 @@ After:  VM → Volume Clone (independent)
 │       ├── vm-config.json          # Collected config
 │       └── reconfig-network.ps1    # Post-migration script
 │
-├── <vm>-disk0.raw                  # Exported disks
-└── <vm>-disk0.qcow2                # Converted disks
+├── <vm>-disk0.raw                  # Exported disks (temporary)
+└── <vm>-disk0.qcow2                # Converted disks (for import)
 ```
+
+---
 
 ## vm-config.json Format
 
@@ -313,14 +362,11 @@ After:  VM → Volume Clone (independent)
 {
   "collected_at": "2025-12-08T10:30:00Z",
   "source_platform": "nutanix",
-  "system": {
-    "hostname": "SRV-APP01",
-    "os_name": "Microsoft Windows Server 2022 Standard",
-    "os_version": "10.0.20348",
-    "architecture": "64-bit",
-    "domain": "AD.YOURDOMAIN.COM",
-    "domain_joined": true
-  },
+  "hostname": "SRV-APP01",
+  "os_name": "Microsoft Windows Server 2022 Standard",
+  "cpu_cores": 4,
+  "memory_mb": 8192,
+  "boot_type": "UEFI",
   "network": {
     "interfaces": [
       {
@@ -344,7 +390,18 @@ After:  VM → Volume Clone (independent)
 }
 ```
 
+---
+
 ## Troubleshooting
+
+### aria2c "authentication required"
+
+The tool passes credentials automatically. If it fails, check:
+```bash
+# Test manually
+aria2c --http-user=admin --http-passwd=PASSWORD \
+  "https://10.16.22.46:9440/api/nutanix/v3/images/UUID/file"
+```
 
 ### WinRM "Access Denied" Error
 
@@ -366,19 +423,12 @@ Windows hostname (FQDN) > 10.16.16.113
 Windows hostname (FQDN) > servername.ad.yourdomain.com
 ```
 
-### "422 Unprocessable Entity" on Harvester
+### VirtIO drivers not detected
 
-Start/stop operations use KubeVirt subresources API:
+Check the debug log on Windows:
 ```
-PUT /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/start
-PUT /apis/subresources.kubevirt.io/v1/namespaces/{ns}/virtualmachines/{name}/stop
+C:\temp\virtio-debug.log
 ```
-
-### Harvester Image Cannot Be Deleted
-
-Image is used by a volume (backing image). Solutions:
-1. Use "Dissociate VM from image" (Menu 2 → Option 5)
-2. Or delete manually: VM → Volume → Image
 
 ### QEMU Guest Agent Not Reporting IP
 
@@ -386,12 +436,13 @@ Image is used by a volume (backing image). Solutions:
 - Check VM has network connectivity (DHCP)
 - Wait 1-2 minutes after boot
 
-### Vault Errors
+### Harvester Image Cannot Be Deleted
 
-Verify `pass` is initialized with correct GPG key:
-```bash
-pass init "migration@yourdomain.com"
-```
+Image is used by a volume (backing image). Solutions:
+1. Use "Dissociate VM from image" (Menu 2 → Option 5)
+2. Or delete manually: VM → Volume → Image
+
+---
 
 ## Security Notes
 
@@ -401,6 +452,18 @@ pass init "migration@yourdomain.com"
 - Use service accounts with minimal privileges
 - The migration server should have restricted access
 
+---
+
+## TODO / Future Improvements
+
+- [ ] Uninstall Nutanix tools post-migration (automated)
+- [ ] Full migration option (single command)
+- [ ] Linux VM support
+- [ ] Parallel disk export for multi-disk VMs
+- [ ] Progress dashboard / web UI
+
+---
+
 ## License
 
 MIT License - Wyss Center for Bio and Neuro Engineering
@@ -408,49 +471,3 @@ MIT License - Wyss Center for Bio and Neuro Engineering
 ## Contributors
 
 - Infrastructure Team @ Wyss Center
-
-## Known Issues & Future Improvements
-
-### NFS Direct Access (To Investigate)
-
-**Goal:** Mount Nutanix container directly via NFS for faster vDisk export (~500+ MB/s vs 107 MB/s HTTP)
-
-**Current Status:** NOT WORKING
-
-**Configuration Done:**
-- Filesystem whitelist: Added Debian IP (10.16.16.167/255.255.255.255)
-- Container whitelist: Inherited from filesystem
-- Sophos XGS firewall: Rules created for NFS (TCP/UDP 111, 2049, 20048)
-- CVM iptables: Rules exist for 10.16.16.167 on port 2049 (CUSTOM chain)
-
-**Test Results:**
-- Ping to CVM: ✅ OK
-- SSH (22) to CVM: ✅ OK  
-- API (9440) to CVM: ✅ OK
-- NFS (2049) to CVM: ❌ Connection timeout
-- Port 111 (portmapper): ✅ OK
-- Port 20048 (mountd): ❌ Connection timeout
-
-**CVM IPs:**
-- nxchgvaimgt1: 10.16.22.81
-- nxchgvaimgt2: 10.16.22.82
-- nxchgvaimgt3: 10.16.22.83
-
-**iptables on CVM shows:**
-```
-ACCEPT tcp -- eth0 * 10.16.16.167 0.0.0.0/0 tcp dpt:2049
-```
-But packet counter stays at 0 - packets not reaching CVM despite firewall logs showing "Allowed"
-
-**Possible Causes:**
-1. Sophos XGS Application Control or IPS blocking NFS protocol
-2. NAT issue between VLANs (Debian: 10.16.16.x, CVMs: 10.16.22.x)
-3. Nutanix NFS only exposed on internal interface (eth1/eth2), not external (eth0)
-
-**Workaround:** Use HTTP API download (working at ~107 MB/s)
-
-**Future Investigation:**
-- Check Sophos IPS/Application Control settings
-- Test with Debian on same VLAN as CVMs (no firewall)
-- Contact Nutanix support about NFS external access requirements
-- Consider SCP via SSH (requires key management)
