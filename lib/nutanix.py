@@ -205,7 +205,7 @@ class NutanixClient:
         return False  # Timeout
 
     def download_image(self, image_uuid: str, dest_path: str, 
-                       progress_callback=None, use_aria2=True) -> bool:
+                       progress_callback=None, use_aria2=False) -> bool:
         """
         Download image to file.
         
@@ -213,14 +213,15 @@ class NutanixClient:
             image_uuid: UUID of the image
             dest_path: Destination file path
             progress_callback: Optional callback(downloaded, total) for progress
-            use_aria2: Use aria2c for faster multi-connection download
+            use_aria2: Use aria2c (disabled by default - Nutanix doesn't support Range requests)
         
         Returns:
             True if successful
         """
         url = self.get_image_download_url(image_uuid)
         
-        # Try aria2c first (much faster with multi-connection)
+        # aria2c disabled by default - Nutanix API doesn't support HTTP Range requests
+        # so multi-connection doesn't work (CN:1 instead of CN:16), making it slower
         if use_aria2:
             try:
                 return self._download_with_aria2(url, dest_path, progress_callback)
