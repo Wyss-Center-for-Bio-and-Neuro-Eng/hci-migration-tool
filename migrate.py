@@ -1937,11 +1937,19 @@ class MigrationTool:
             disk_size = int(size_input) if size_input else default_size
             disk_sizes.append(disk_size)
         
-        # Get available networks
-        networks = self.harvester.list_all_networks()
+        # Get available networks - filter by VM namespace
+        all_networks = self.harvester.list_all_networks()
+        
+        # Filter networks: include those in VM's namespace + default namespace (shared)
+        networks = []
+        for net in all_networks:
+            net_ns = net.get('metadata', {}).get('namespace', '')
+            if net_ns == namespace or net_ns == 'default':
+                networks.append(net)
         
         if not networks:
-            print(colored("❌ No networks available in Harvester", Colors.RED))
+            print(colored(f"❌ No networks available in namespace '{namespace}' or 'default'", Colors.RED))
+            print(colored("   Create a network in Harvester first", Colors.YELLOW))
             return
         
         # Build source NICs list from Nutanix VM info or vm-config.json
@@ -2092,6 +2100,60 @@ class MigrationTool:
         if boot == "UEFI":
             print(colored("   ⚠️  UEFI boot selected - make sure source VM was UEFI!", Colors.YELLOW))
         
+        # Storage Class selection
+        print(colored("\n💾 Storage Class Selection:", Colors.BOLD))
+        
+        all_scs = self.harvester.list_storage_classes()
+        
+        # Filter to only show relevant storage classes (exclude auto-created ones like longhorn-image-xxx)
+        valid_scs = []
+        default_sc_idx = None
+        for sc in all_scs:
+            sc_name = sc.get('metadata', {}).get('name', '')
+            # Skip auto-generated storage classes
+            if sc_name.startswith('longhorn-image-') or sc_name.startswith('longhorn-') and '-disk' in sc_name:
+                continue
+            # Skip vmstate
+            if 'vmstate' in sc_name:
+                continue
+            
+            valid_scs.append(sc)
+            
+            # Check if default
+            annotations = sc.get('metadata', {}).get('annotations', {})
+            if annotations.get('storageclass.kubernetes.io/is-default-class') == 'true':
+                default_sc_idx = len(valid_scs)  # 1-indexed
+        
+        if not valid_scs:
+            print(colored("❌ No storage classes available", Colors.RED))
+            return
+        
+        print("   Available storage classes:")
+        for i, sc in enumerate(valid_scs, 1):
+            sc_name = sc.get('metadata', {}).get('name', 'N/A')
+            provisioner = sc.get('provisioner', 'N/A')
+            annotations = sc.get('metadata', {}).get('annotations', {})
+            is_default = annotations.get('storageclass.kubernetes.io/is-default-class') == 'true'
+            default_marker = colored(" [DEFAULT]", Colors.GREEN) if is_default else ""
+            
+            # Try to get replica count from parameters
+            params = sc.get('parameters', {})
+            replicas = params.get('numberOfReplicas', '?')
+            
+            print(f"     {i}. {sc_name} ({replicas} replica(s)){default_marker}")
+        
+        default_choice = str(default_sc_idx) if default_sc_idx else "1"
+        sc_choice = self.input_prompt(f"   Storage class [{default_choice}]")
+        sc_choice = sc_choice if sc_choice else default_choice
+        
+        try:
+            sc_idx = int(sc_choice) - 1
+            selected_storage_class = valid_scs[sc_idx].get('metadata', {}).get('name')
+        except:
+            selected_storage_class = valid_scs[0].get('metadata', {}).get('name')
+        
+        print(colored(f"   ✅ Using storage class: {selected_storage_class}", Colors.GREEN))
+        
         # Disk bus selection
         print(colored("\n💾 Disk Bus Selection:", Colors.BOLD))
         print("   - sata   : Most compatible, works without extra drivers")
@@ -2121,10 +2183,10 @@ class MigrationTool:
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
         print(f"   Name: {vm_name}")
         print(f"   Namespace: {namespace}")
+        print(f"   Storage class: {selected_storage_class}")
         print(f"   Disks: {num_disks}")
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
-            img_sc = f"longhorn-{img['name']}"
-            print(f"      Disk {i}: {img['name']} - {size} GB (storage: {img_sc})")
+            print(f"      Disk {i}: {img['name']} - {size} GB")
         print(f"   Disk bus: {disk_bus}")
         print(f"   Network interfaces: {len(nic_configs)}")
         for i, nic in enumerate(nic_configs):
@@ -2157,9 +2219,6 @@ class MigrationTool:
             
             # Volume claim name
             volume_name = f"{vm_name}-disk{i}-{suffix}"
-            
-            # For Harvester, when using an image, we must use the image's storageClass
-            image_storage_class = f"longhorn-{img['name']}"
             
             # Disk spec
             disk_spec = {
@@ -2196,7 +2255,7 @@ class MigrationTool:
                         }
                     },
                     "volumeMode": "Block",
-                    "storageClassName": image_storage_class
+                    "storageClassName": selected_storage_class
                 }
             })
         
