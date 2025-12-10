@@ -2187,28 +2187,32 @@ class MigrationTool:
         
         # Disk bus selection
         print(colored("\n💾 Disk Bus Selection:", Colors.BOLD))
-        print("   - sata   : Most compatible, works without extra drivers")
-        print("   - virtio : Best performance, requires virtio drivers installed in guest")
-        print("   - scsi   : Uses virtio-scsi, also requires virtio drivers")
+        print("   - sata   : Most compatible, recommended for initial migration")
+        print("   - virtio : Best performance, requires Red Hat/Fedora VirtIO drivers")
+        print("   - scsi   : Uses virtio-scsi, also requires VirtIO drivers")
         
-        # Auto-select virtio if drivers detected
-        if virtio_installed:
-            default_bus = "virtio"
-            print(colored(f"\n   ✅ VirtIO drivers detected → recommending virtio bus", Colors.GREEN))
-        else:
-            default_bus = "sata"
-            print(colored(f"\n   ⚠️  VirtIO drivers not detected → recommending sata bus", Colors.YELLOW))
+        # For migrations from Nutanix, ALWAYS recommend SATA first
+        # Nutanix VirtIO drivers are NOT compatible with KVM/QEMU VirtIO!
+        print(colored("\n   ⚠️  IMPORTANT: Nutanix VirtIO drivers are NOT compatible with Harvester!", Colors.YELLOW))
+        print(colored("      Use SATA for initial migration, then switch to VirtIO after installing", Colors.YELLOW))
+        print(colored("      Red Hat VirtIO drivers on the running VM.", Colors.YELLOW))
+        
+        default_bus = "sata"
+        print(colored(f"\n   → Recommending SATA for safe initial boot", Colors.CYAN))
         
         disk_bus = self.input_prompt(f"Disk bus (sata/virtio/scsi) [{default_bus}]")
         disk_bus = disk_bus.lower() if disk_bus else default_bus
         if disk_bus not in ('sata', 'virtio', 'scsi'):
             disk_bus = default_bus
         
-        if disk_bus == "virtio" and not virtio_installed:
-            print(colored("   ⚠️  Warning: VirtIO selected but drivers not detected!", Colors.YELLOW))
-            print(colored("      VM may fail to boot if drivers are missing", Colors.YELLOW))
-        elif disk_bus == "sata" and virtio_installed:
-            print(colored("   ℹ️  Using SATA despite VirtIO available (lower performance)", Colors.CYAN))
+        if disk_bus == "virtio":
+            print(colored("\n   🚨 WARNING: VirtIO selected for initial migration!", Colors.RED))
+            print(colored("      This may fail to boot if Red Hat VirtIO drivers are not installed.", Colors.RED))
+            print(colored("      Nutanix VirtIO drivers will NOT work on Harvester!", Colors.RED))
+            confirm = self.input_prompt("   Type 'YES' to confirm VirtIO") or ""
+            if confirm != "YES":
+                disk_bus = "sata"
+                print(colored("   → Using SATA instead", Colors.GREEN))
         
         # Summary
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
@@ -2911,6 +2915,7 @@ try {{
                 ("9", "Delete volume"),
                 ("10", "List networks"),
                 ("11", "List storage classes"),
+                ("12", "Switch VM disk bus (SATA → VirtIO)"),
                 ("0", "Back")
             ])
             
@@ -2949,8 +2954,175 @@ try {{
             elif choice == "11":
                 self.list_harvester_storage()
                 self.pause()
+            elif choice == "12":
+                self.switch_vm_disk_bus()
+                self.pause()
             elif choice == "0":
                 break
+    
+    def switch_vm_disk_bus(self):
+        """Switch VM disk bus from SATA to VirtIO."""
+        print(colored("\n🔄 Switch VM Disk Bus (SATA → VirtIO)", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        # List VMs
+        vms = self.harvester.list_vms()
+        if not vms:
+            print(colored("❌ No VMs found in Harvester", Colors.RED))
+            return
+        
+        print("\nHarvester VMs:")
+        for i, vm in enumerate(vms, 1):
+            name = vm.get('metadata', {}).get('name', 'N/A')
+            ns = vm.get('metadata', {}).get('namespace', 'N/A')
+            status = vm.get('status', {})
+            running = status.get('ready', False)
+            state = "🟢 Running" if running else "🔴 Stopped"
+            
+            # Get current disk bus
+            disks = vm.get('spec', {}).get('template', {}).get('spec', {}).get('domain', {}).get('devices', {}).get('disks', [])
+            bus_types = set()
+            for disk in disks:
+                bus = disk.get('disk', {}).get('bus', 'unknown')
+                bus_types.add(bus)
+            bus_str = '/'.join(bus_types) if bus_types else 'unknown'
+            
+            print(f"  {i}. {name} ({ns}) - {state} - Bus: {bus_str}")
+        
+        choice = self.input_prompt("\nSelect VM number")
+        if not choice:
+            return
+        
+        try:
+            idx = int(choice) - 1
+            selected_vm = vms[idx]
+            vm_name = selected_vm.get('metadata', {}).get('name')
+            namespace = selected_vm.get('metadata', {}).get('namespace')
+        except:
+            print(colored("Invalid choice", Colors.RED))
+            return
+        
+        # Check current bus types
+        spec = selected_vm.get('spec', {}).get('template', {}).get('spec', {})
+        disks = spec.get('domain', {}).get('devices', {}).get('disks', [])
+        
+        print(f"\n📋 Current disk configuration for {vm_name}:")
+        needs_change = False
+        for i, disk in enumerate(disks):
+            name = disk.get('name', f'disk-{i}')
+            bus = disk.get('disk', {}).get('bus', 'unknown')
+            print(f"   {name}: {bus}")
+            if bus in ('sata', 'ide'):
+                needs_change = True
+        
+        if not needs_change:
+            print(colored("\n✅ All disks already using VirtIO!", Colors.GREEN))
+            return
+        
+        # Check if VM is running
+        vm_status = selected_vm.get('status', {})
+        if vm_status.get('ready', False):
+            print(colored(f"\n⚠️  VM {vm_name} is running", Colors.YELLOW))
+            print(colored("   VM must be stopped to change disk bus", Colors.YELLOW))
+            stop = self.input_prompt("Stop VM now? (y/n)")
+            if stop.lower() == 'y':
+                print("   Stopping VM...")
+                try:
+                    self.harvester.stop_vm(vm_name, namespace)
+                    print(colored("   ✅ Stop command sent. Waiting...", Colors.GREEN))
+                    
+                    # Wait for VM to stop
+                    import time
+                    max_wait = 120
+                    elapsed = 0
+                    while elapsed < max_wait:
+                        time.sleep(5)
+                        elapsed += 5
+                        vm_data = self.harvester.get_vm(vm_name, namespace)
+                        if not vm_data.get('status', {}).get('ready', False):
+                            print(colored("   ✅ VM stopped", Colors.GREEN))
+                            break
+                        print(f"   Waiting... ({elapsed}s)")
+                    else:
+                        print(colored("   ⚠️  VM did not stop in time", Colors.YELLOW))
+                        return
+                except Exception as e:
+                    print(colored(f"   ❌ Error: {e}", Colors.RED))
+                    return
+            else:
+                print("   Cancelled")
+                return
+        
+        # Confirm change
+        print(colored("\n🔧 Ready to switch disk bus to VirtIO", Colors.BOLD))
+        print(colored("   ⚠️  Make sure Red Hat VirtIO drivers are installed in the guest!", Colors.YELLOW))
+        print(colored("   If drivers are not installed, the VM will fail to boot!", Colors.RED))
+        
+        confirm = self.input_prompt("\nProceed with disk bus change? (y/n)")
+        if confirm.lower() != 'y':
+            print("Cancelled")
+            return
+        
+        # Patch the VM to change disk bus
+        print(colored("\n   Updating VM configuration...", Colors.CYAN))
+        
+        try:
+            # Get fresh VM data
+            vm_data = self.harvester.get_vm(vm_name, namespace)
+            
+            # Modify disk bus in the spec
+            new_disks = []
+            template_spec = vm_data.get('spec', {}).get('template', {}).get('spec', {})
+            for disk in template_spec.get('domain', {}).get('devices', {}).get('disks', []):
+                new_disk = disk.copy()
+                if 'disk' in new_disk:
+                    new_disk['disk'] = new_disk['disk'].copy()
+                    old_bus = new_disk['disk'].get('bus', 'sata')
+                    if old_bus in ('sata', 'ide', 'scsi'):
+                        new_disk['disk']['bus'] = 'virtio'
+                        print(f"   {new_disk.get('name')}: {old_bus} → virtio")
+                new_disks.append(new_disk)
+            
+            # Build patch
+            patch = {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "domain": {
+                                "devices": {
+                                    "disks": new_disks
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            # Apply patch via Harvester API
+            result = self.harvester._request(
+                "PATCH",
+                f"/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}",
+                json=patch,
+                headers={"Content-Type": "application/merge-patch+json"}
+            )
+            
+            print(colored("   ✅ VM configuration updated!", Colors.GREEN))
+            
+            # Offer to start VM
+            start = self.input_prompt("\nStart VM now? (y/n)")
+            if start.lower() == 'y':
+                print("   Starting VM...")
+                self.harvester.start_vm(vm_name, namespace)
+                print(colored("   ✅ Start command sent", Colors.GREEN))
+                print(colored("\n💡 Monitor VM boot via Harvester console", Colors.YELLOW))
+            
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+            import traceback
+            traceback.print_exc()
     
     def menu_migration(self):
         while True:
@@ -3016,6 +3188,7 @@ try {{
                 ("7", "Generate post-migration script"),
                 ("8", "Post-migration auto-configure"),
                 ("9", "Vault management"),
+                ("10", "Install Red Hat VirtIO drivers"),
                 ("0", "Back")
             ])
             
@@ -3047,8 +3220,250 @@ try {{
                 self.pause()
             elif choice == "9":
                 self.menu_vault()
+            elif choice == "10":
+                self.install_virtio_drivers()
+                self.pause()
             elif choice == "0":
                 break
+    
+    def install_virtio_drivers(self):
+        """Install Red Hat VirtIO drivers on a running Windows VM."""
+        print(colored("\n📦 Install Red Hat VirtIO Drivers", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        print(colored("   This will install the proper VirtIO drivers for KVM/Harvester.", Colors.CYAN))
+        print(colored("   Required BEFORE switching VM disk bus from SATA to VirtIO!", Colors.YELLOW))
+        
+        if not WINRM_AVAILABLE:
+            print(colored("❌ pywinrm not installed. Run: pip install pywinrm[kerberos]", Colors.RED))
+            return
+        
+        # Check tools exist
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        tools_dir = os.path.join(staging_dir, 'tools')
+        virtio_iso = os.path.join(tools_dir, 'virtio-win.iso')
+        
+        if not os.path.exists(virtio_iso):
+            print(colored(f"❌ VirtIO ISO not found: {virtio_iso}", Colors.RED))
+            print(colored("   Run 'Download virtio/qemu-ga tools' first (option 4)", Colors.YELLOW))
+            return
+        
+        # Get target host
+        windows_config = self.config.get('windows', {})
+        domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
+        use_kerberos = windows_config.get('use_kerberos', True)
+        
+        print(colored("\n   Target Windows VM (must be running)", Colors.CYAN))
+        host = self.input_prompt("Windows hostname (FQDN)")
+        if not host:
+            return
+        
+        # Add domain suffix if needed
+        if '.' not in host:
+            host = f"{host}.{domain}"
+            print(colored(f"   → Using FQDN: {host}", Colors.CYAN))
+        
+        # Determine authentication
+        username = None
+        password = None
+        transport = "ntlm"
+        
+        if use_kerberos and get_kerberos_auth():
+            print(colored("   Using Kerberos authentication", Colors.GREEN))
+            transport = "kerberos"
+        else:
+            print("   Using NTLM authentication")
+            try:
+                username, password = self.vault.get_credential("local-admin")
+                print(f"   Using: {username}")
+            except:
+                username = self.input_prompt("   Username [Administrator]") or "Administrator"
+                import getpass
+                password = getpass.getpass("   Password: ")
+        
+        # Connect
+        print(colored("\n🔌 Connecting...", Colors.CYAN))
+        
+        try:
+            client = WinRMClient(
+                host=host,
+                username=username,
+                password=password,
+                transport=transport
+            )
+            
+            if not client.test_connection():
+                print(colored("❌ WinRM connection failed", Colors.RED))
+                return
+            
+            print(colored("   ✅ Connected!", Colors.GREEN))
+        except Exception as e:
+            print(colored(f"❌ Connection error: {e}", Colors.RED))
+            return
+        
+        # Start HTTP server for file transfer
+        print(colored("\n🚀 Starting file transfer server...", Colors.CYAN))
+        
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            target_ip = socket.gethostbyname(host.split('.')[0])
+            s.connect((target_ip, 5985))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception as e:
+            print(colored(f"   ⚠️  Could not auto-detect local IP: {e}", Colors.YELLOW))
+            local_ip = self.input_prompt("   Enter this machine's IP (reachable from Windows)")
+            if not local_ip:
+                return
+        
+        http_port = 8888
+        http_url = f"http://{local_ip}:{http_port}"
+        
+        import threading
+        import http.server
+        import socketserver
+        
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=tools_dir, **kwargs)
+            def log_message(self, format, *args):
+                pass
+        
+        httpd = socketserver.TCPServer(("", http_port), QuietHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        
+        print(colored(f"   ✅ Server running at {http_url}", Colors.GREEN))
+        
+        try:
+            # Download ISO to Windows
+            print(colored("\n📥 Downloading VirtIO ISO to Windows...", Colors.CYAN))
+            
+            ps_download = f'''
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+$isoPath = "$env:TEMP\\virtio-win.iso"
+Invoke-WebRequest -Uri "{http_url}/virtio-win.iso" -OutFile $isoPath -UseBasicParsing
+if (Test-Path $isoPath) {{ "DOWNLOADED" }} else {{ "FAILED" }}
+'''
+            stdout, stderr, rc = client.run_powershell(ps_download, timeout=600)
+            
+            if "DOWNLOADED" not in stdout:
+                print(colored(f"   ❌ Download failed: {stderr}", Colors.RED))
+                return
+            
+            print(colored("   ✅ Downloaded", Colors.GREEN))
+            
+            # Mount and install
+            print(colored("\n📦 Installing VirtIO drivers...", Colors.CYAN))
+            
+            ps_install = '''
+$ErrorActionPreference = "Continue"
+$iso = "$env:TEMP\\virtio-win.iso"
+$logFile = "C:\\temp\\virtio-install.log"
+
+if (-not (Test-Path "C:\\temp")) {
+    New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null
+}
+
+function Log {
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}
+
+Log "=========================================="
+Log "VirtIO Driver Installation Started"
+Log "=========================================="
+
+# Mount ISO
+Log "Mounting ISO..."
+$mount = Mount-DiskImage -ImagePath $iso -PassThru
+Start-Sleep 2
+$driveLetter = ($mount | Get-Volume).DriveLetter + ":"
+Log "Mounted on $driveLetter"
+
+# Find installer
+$installers = @(
+    "$driveLetter\\virtio-win-guest-tools.exe",
+    "$driveLetter\\virtio-win-gt-x64.exe"
+)
+
+$installerPath = $null
+foreach ($path in $installers) {
+    if (Test-Path $path) {
+        $installerPath = $path
+        Log "Found installer: $path"
+        break
+    }
+}
+
+if (-not $installerPath) {
+    Log "ERROR: No installer found"
+    Dismount-DiskImage -ImagePath $iso
+    Write-Host "INSTALLER_NOT_FOUND"
+    exit 1
+}
+
+# Run silent install
+Log "Running silent installation..."
+$proc = Start-Process $installerPath -ArgumentList "/S" -PassThru -Wait
+Log "Installer exit code: $($proc.ExitCode)"
+
+# Wait for installation to complete
+Start-Sleep 5
+
+# Verify installation
+$virtioPath = "$env:ProgramFiles\\Virtio-Win"
+$redhatPath = "$env:ProgramFiles\\Red Hat"
+
+if ((Test-Path $virtioPath) -or (Test-Path $redhatPath)) {
+    Log "SUCCESS: VirtIO drivers installed"
+    Write-Host "INSTALL_SUCCESS"
+} else {
+    Log "WARNING: Installation may have failed"
+    Write-Host "INSTALL_UNKNOWN"
+}
+
+# Cleanup
+Log "Cleaning up..."
+Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+Remove-Item $iso -Force -ErrorAction SilentlyContinue
+
+Log "=========================================="
+Log "Installation Complete"
+Log "=========================================="
+'''
+            stdout, stderr, rc = client.run_powershell(ps_install, timeout=300)
+            
+            if "INSTALL_SUCCESS" in stdout:
+                print(colored("   ✅ VirtIO drivers installed successfully!", Colors.GREEN))
+                print(colored("      Log: C:\\temp\\virtio-install.log", Colors.CYAN))
+            elif "INSTALLER_NOT_FOUND" in stdout:
+                print(colored("   ❌ VirtIO installer not found in ISO", Colors.RED))
+            else:
+                print(colored("   ⚠️  Installation status unknown", Colors.YELLOW))
+                print(colored("      Check log: C:\\temp\\virtio-install.log", Colors.CYAN))
+            
+            # Recommend reboot
+            print(colored("\n   ⚠️  A reboot is recommended to activate drivers", Colors.YELLOW))
+            reboot = self.input_prompt("   Reboot now? (y/n) [n]") or "n"
+            if reboot.lower() == 'y':
+                print("   🔄 Rebooting...")
+                client.run_powershell("Restart-Computer -Force")
+                print(colored("   Reboot initiated. Wait for VM to come back.", Colors.GREEN))
+            
+            print(colored("\n✅ VirtIO drivers installation complete!", Colors.GREEN))
+            print(colored("\n💡 Next steps:", Colors.YELLOW))
+            print("   1. Reboot the VM if not done")
+            print("   2. Menu Harvester → Switch VM disk bus (option 12)")
+            print("   3. Start VM and verify boot")
+            
+        except Exception as e:
+            print(colored(f"❌ Error: {e}", Colors.RED))
+        finally:
+            httpd.shutdown()
     
     def check_winrm_prereqs(self):
         """Check WinRM prerequisites."""
@@ -4436,15 +4851,131 @@ try {{
             
             original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
             
+            # Offer to uninstall Nutanix tools
+            print(colored("\n🧹 Nutanix Tools Cleanup", Colors.BOLD))
+            print("   The following Nutanix tools should be removed after migration:")
+            print("   - Nutanix Guest Tools")
+            print("   - Nutanix VirtIO")
+            print("   - Nutanix VM Mobility")
+            
+            cleanup = self.input_prompt("\n   Remove Nutanix tools? (y/n) [y]") or "y"
+            if cleanup.lower() == 'y':
+                print(colored("\n   🗑️  Uninstalling Nutanix tools...", Colors.CYAN))
+                
+                ps_uninstall = '''
+$ErrorActionPreference = "Continue"
+$logFile = "C:\\temp\\nutanix-cleanup.log"
+
+function Log {
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}
+
+Log "=========================================="
+Log "Nutanix tools cleanup started"
+Log "=========================================="
+
+# Find and uninstall Nutanix products
+$nutanixApps = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Nutanix*" }
+
+if ($nutanixApps) {
+    foreach ($app in $nutanixApps) {
+        Log "Uninstalling: $($app.Name)"
+        try {
+            $result = $app.Uninstall()
+            if ($result.ReturnValue -eq 0) {
+                Log "SUCCESS: $($app.Name) uninstalled"
+            } else {
+                Log "WARNING: $($app.Name) returned code $($result.ReturnValue)"
+            }
+        } catch {
+            Log "ERROR: $($_.Exception.Message)"
+        }
+    }
+} else {
+    Log "No Nutanix applications found via WMI"
+}
+
+# Also try uninstall strings from registry
+$uninstallKeys = @(
+    "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
+    "HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
+)
+
+foreach ($key in $uninstallKeys) {
+    $apps = Get-ItemProperty $key -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*Nutanix*" }
+    foreach ($app in $apps) {
+        if ($app.UninstallString) {
+            Log "Found: $($app.DisplayName)"
+            $uninstall = $app.UninstallString
+            # Handle different uninstall string formats
+            if ($uninstall -match "msiexec") {
+                $uninstall = $uninstall -replace "/I", "/X"
+                $uninstall = "$uninstall /qn /norestart"
+            }
+            Log "Running: $uninstall"
+            try {
+                Start-Process cmd.exe -ArgumentList "/c $uninstall" -Wait -NoNewWindow
+                Log "Completed uninstall command"
+            } catch {
+                Log "ERROR: $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+# Stop and disable Nutanix services
+$services = Get-Service | Where-Object { $_.Name -like "*Nutanix*" -or $_.DisplayName -like "*Nutanix*" }
+foreach ($svc in $services) {
+    Log "Stopping service: $($svc.Name)"
+    Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+    Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction SilentlyContinue
+}
+
+# Clean up Nutanix folders
+$folders = @(
+    "$env:ProgramFiles\\Nutanix",
+    "${env:ProgramFiles(x86)}\\Nutanix",
+    "$env:ProgramData\\Nutanix"
+)
+foreach ($folder in $folders) {
+    if (Test-Path $folder) {
+        Log "Removing folder: $folder"
+        Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Log "=========================================="
+Log "Nutanix cleanup completed"
+Log "=========================================="
+Write-Host "CLEANUP_DONE"
+'''
+                try:
+                    stdout, stderr, rc = client.run_powershell(ps_uninstall, timeout=300)
+                    if "CLEANUP_DONE" in stdout:
+                        print(colored("   ✅ Nutanix tools cleanup completed", Colors.GREEN))
+                        print(colored("      Log: C:\\temp\\nutanix-cleanup.log", Colors.CYAN))
+                    else:
+                        print(colored("   ⚠️  Cleanup may be incomplete", Colors.YELLOW))
+                        print(colored("      Check log: C:\\temp\\nutanix-cleanup.log", Colors.CYAN))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Cleanup error: {e}", Colors.YELLOW))
+                    print(colored("      You may need to uninstall manually", Colors.YELLOW))
+            
             print(colored("\n" + "="*50, Colors.GREEN))
             print(colored("✅ Post-migration configuration complete!", Colors.GREEN))
             print(colored("="*50, Colors.GREEN))
             print(f"\n   VM: {vm_name}")
             print(f"   FQDN: {vm_fqdn}")
             print(f"   Static IP: {original_ip}")
-            print(colored("\n💡 Verify:", Colors.YELLOW))
-            print(f"   ping {original_ip}")
-            print(f"   ping {vm_fqdn}")
+            print(colored("\n💡 Next steps:", Colors.YELLOW))
+            print("   1. Verify network connectivity:")
+            print(f"      ping {original_ip}")
+            print(f"      ping {vm_fqdn}")
+            print("   2. Install Red Hat VirtIO drivers (Menu Windows → Install VirtIO)")
+            print("   3. Switch VM to VirtIO bus (Menu Harvester → Switch VM disk bus)")
+            print("   4. Reboot and verify performance")
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
