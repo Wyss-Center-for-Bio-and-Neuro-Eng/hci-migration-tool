@@ -1925,14 +1925,22 @@ class MigrationTool:
                 selected_image = active_images[idx]
                 image_name = selected_image.get('metadata', {}).get('name')
                 image_ns = selected_image.get('metadata', {}).get('namespace')
-                selected_images.append({'name': image_name, 'namespace': image_ns})
+                image_size_bytes = selected_image.get('status', {}).get('size', 0)
+                image_size_gb = max(1, image_size_bytes // (1024**3))  # Convert to GB, minimum 1
+                selected_images.append({'name': image_name, 'namespace': image_ns, 'size_gb': image_size_gb})
                 print(colored(f"   ✓ Selected: {image_name}", Colors.GREEN))
             except:
                 print(colored("Invalid choice", Colors.RED))
                 return
             
-            # Disk size
-            default_size = source_disks[disk_idx]['size_gb'] if disk_idx < len(source_disks) else 50
+            # Disk size - priority: source_disks > image size > 50GB default
+            if disk_idx < len(source_disks) and source_disks[disk_idx].get('size_gb', 0) > 0:
+                default_size = source_disks[disk_idx]['size_gb']
+            elif image_size_gb > 0:
+                default_size = image_size_gb
+            else:
+                default_size = 50
+            
             size_input = self.input_prompt(f"Disk {disk_idx} size in GB [{default_size}]")
             disk_size = int(size_input) if size_input else default_size
             disk_sizes.append(disk_size)
@@ -2092,13 +2100,35 @@ class MigrationTool:
         ram = self.input_prompt(f"RAM in GB [{default_ram}]")
         ram = int(ram) if ram else default_ram
         
-        boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
-        boot = boot.upper() if boot else default_boot
-        if boot not in ('BIOS', 'UEFI'):
-            boot = default_boot
-        
-        if boot == "UEFI":
-            print(colored("   ⚠️  UEFI boot selected - make sure source VM was UEFI!", Colors.YELLOW))
+        # Boot type - CRITICAL: must match source VM
+        print(colored(f"\n🔒 Boot Type:", Colors.BOLD))
+        if vm_info:
+            print(colored(f"   Source VM boot type: {default_boot}", Colors.CYAN))
+            print(colored(f"   ⚠️  Changing boot type will cause boot failure!", Colors.YELLOW))
+            print(f"   (BIOS disks cannot boot in UEFI mode and vice versa)")
+            
+            change_boot = self.input_prompt(f"   Keep {default_boot}? (Y/n) [Y]") or "Y"
+            if change_boot.lower() == 'n':
+                new_boot = "UEFI" if default_boot == "BIOS" else "BIOS"
+                print(colored(f"\n   🚨 DANGER: Changing from {default_boot} to {new_boot}!", Colors.RED))
+                print(colored(f"      This will almost certainly cause boot failure!", Colors.RED))
+                confirm = self.input_prompt(f"   Type 'YES' to confirm change to {new_boot}") or ""
+                if confirm == "YES":
+                    boot = new_boot
+                    print(colored(f"   → Changed to {boot} (at your own risk!)", Colors.YELLOW))
+                else:
+                    boot = default_boot
+                    print(colored(f"   → Keeping {boot}", Colors.GREEN))
+            else:
+                boot = default_boot
+                print(colored(f"   ✅ Using {boot} (from source)", Colors.GREEN))
+        else:
+            # No source info - ask user
+            boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
+            boot = boot.upper() if boot else default_boot
+            if boot not in ('BIOS', 'UEFI'):
+                boot = default_boot
+            print(colored(f"   ⚠️  No source VM info - make sure {boot} matches the original!", Colors.YELLOW))
         
         # Storage Class selection
         print(colored("\n💾 Storage Class Selection:", Colors.BOLD))
