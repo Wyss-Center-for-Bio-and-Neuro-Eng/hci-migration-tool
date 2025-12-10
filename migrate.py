@@ -32,6 +32,104 @@ def load_config(config_path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def detect_boot_type_from_disk(disk_path: str) -> str:
+    """
+    Detect boot type (UEFI or BIOS) by analyzing disk partition table.
+    GPT = UEFI, MBR = BIOS
+    
+    Args:
+        disk_path: Path to QCOW2 or RAW disk image
+        
+    Returns:
+        'UEFI' or 'BIOS'
+    """
+    import subprocess
+    
+    if not os.path.exists(disk_path):
+        print(colored(f"   ⚠️  Disk not found: {disk_path}", Colors.YELLOW))
+        return 'BIOS'  # Default fallback
+    
+    try:
+        # For QCOW2, we need to use qemu-nbd or qemu-img to inspect
+        if disk_path.endswith('.qcow2'):
+            # Use qemu-img map to check if we can read it
+            result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', disk_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                print(colored(f"   ⚠️  Cannot read QCOW2: {result.stderr}", Colors.YELLOW))
+                return 'BIOS'
+            
+            # Try to mount via nbd and check partition type
+            # First, find an available nbd device
+            nbd_device = None
+            for i in range(16):
+                dev = f'/dev/nbd{i}'
+                if os.path.exists(dev):
+                    # Check if it's in use
+                    check = subprocess.run(['lsblk', dev], capture_output=True, text=True)
+                    if 'disk' not in check.stdout or check.returncode != 0:
+                        nbd_device = dev
+                        break
+            
+            if not nbd_device:
+                # Try to load nbd module and use nbd0
+                subprocess.run(['modprobe', 'nbd', 'max_part=16'], capture_output=True)
+                nbd_device = '/dev/nbd0'
+            
+            # Connect qcow2 to nbd
+            disconnect_cmd = ['qemu-nbd', '-d', nbd_device]
+            subprocess.run(disconnect_cmd, capture_output=True)  # Disconnect if already connected
+            
+            connect_cmd = ['qemu-nbd', '-c', nbd_device, disk_path]
+            result = subprocess.run(connect_cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                print(colored(f"   ⚠️  Cannot connect NBD: {result.stderr}", Colors.YELLOW))
+                return 'BIOS'
+            
+            try:
+                # Give it a moment to settle
+                time.sleep(1)
+                
+                # Check partition table type with fdisk
+                fdisk_result = subprocess.run(
+                    ['fdisk', '-l', nbd_device],
+                    capture_output=True, text=True, timeout=30
+                )
+                
+                if 'Disklabel type: gpt' in fdisk_result.stdout.lower() or 'disklabel type: gpt' in fdisk_result.stdout.lower():
+                    return 'UEFI'
+                elif 'Disklabel type: dos' in fdisk_result.stdout.lower() or 'disklabel type: dos' in fdisk_result.stdout.lower():
+                    return 'BIOS'
+                elif 'gpt' in fdisk_result.stdout.lower():
+                    return 'UEFI'
+                else:
+                    return 'BIOS'
+            finally:
+                # Always disconnect
+                subprocess.run(disconnect_cmd, capture_output=True)
+        
+        else:
+            # For RAW images, we can use fdisk directly
+            result = subprocess.run(
+                ['fdisk', '-l', disk_path],
+                capture_output=True, text=True, timeout=30
+            )
+            
+            if 'gpt' in result.stdout.lower():
+                return 'UEFI'
+            else:
+                return 'BIOS'
+                
+    except subprocess.TimeoutExpired:
+        print(colored("   ⚠️  Timeout detecting boot type", Colors.YELLOW))
+        return 'BIOS'
+    except Exception as e:
+        print(colored(f"   ⚠️  Error detecting boot type: {e}", Colors.YELLOW))
+        return 'BIOS'
+
+
 class MigrationTool:
     """Migration tool with interactive menu."""
     
@@ -1140,6 +1238,11 @@ class MigrationTool:
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         vm_name_clean = self._selected_vm.lower().replace(' ', '-').replace('/', '-')
         
+        # Create VM-specific migrations folder
+        vm_migration_dir = os.path.join(staging_dir, 'migrations', vm_name_clean)
+        os.makedirs(vm_migration_dir, exist_ok=True)
+        print(colored(f"   📁 Migration folder: {vm_migration_dir}", Colors.CYAN))
+        
         # Get vdisks via API v2
         print(colored("\n📡 Getting vdisk info via API v2...", Colors.CYAN))
         try:
@@ -1171,13 +1274,13 @@ class MigrationTool:
             return
         
         # Copy disks
-        print(colored(f"\n🚀 Starting NFS copy to {staging_dir}", Colors.CYAN))
+        print(colored(f"\n🚀 Starting NFS copy to {vm_migration_dir}", Colors.CYAN))
         print(colored("   This should be MUCH faster than API download!\n", Colors.CYAN))
         
         downloaded_files = []
         
         for i, vdisk in enumerate(vdisks):
-            dest_file = os.path.join(staging_dir, f"{vm_name_clean}-disk{i}.raw")
+            dest_file = os.path.join(vm_migration_dir, f"{vm_name_clean}-disk{i}.raw")
             size_gb = vdisk['size_bytes'] // (1024**3)
             
             print(colored(f"   📀 Disk {i} ({size_gb} GB):", Colors.BOLD))
@@ -1288,7 +1391,11 @@ class MigrationTool:
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         vm_name_clean = self._selected_vm.lower().replace(' ', '-').replace('/', '-')
         
-        print(colored(f"\n🚀 Starting export to {staging_dir}", Colors.CYAN))
+        # Create VM-specific migrations folder
+        vm_migration_dir = os.path.join(staging_dir, 'migrations', vm_name_clean)
+        os.makedirs(vm_migration_dir, exist_ok=True)
+        
+        print(colored(f"\n🚀 Starting export to {vm_migration_dir}", Colors.CYAN))
         print(colored("   This may take a while depending on disk size...\n", Colors.CYAN))
         
         created_images = []
@@ -1375,7 +1482,7 @@ class MigrationTool:
         downloaded_files = []
         
         for img in created_images:
-            dest_file = os.path.join(staging_dir, f"{vm_name_clean}-disk{img['disk_index']}.raw")
+            dest_file = os.path.join(vm_migration_dir, f"{vm_name_clean}-disk{img['disk_index']}.raw")
             print(f"\n   Downloading {img['name']} → {dest_file}")
             print(f"   Size: ~{img['size_gb']} GB")
             
@@ -2093,7 +2200,25 @@ class MigrationTool:
         # CPU, RAM, Boot type
         default_cpu = vm_info['vcpu'] if vm_info else 2
         default_ram = vm_info['memory_mb'] // 1024 if vm_info else 4
-        default_boot = vm_info['boot_type'] if vm_info else 'BIOS'
+        
+        # Boot type detection - priority: disk analysis > vm-config.json > BIOS default
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        vm_migration_dir = os.path.join(staging_dir, 'migrations', vm_name.lower())
+        disk0_qcow2 = os.path.join(vm_migration_dir, f"{vm_name.lower()}-disk0.qcow2")
+        
+        detected_boot = None
+        if os.path.exists(disk0_qcow2):
+            print(colored("\n🔍 Detecting boot type from disk...", Colors.CYAN))
+            detected_boot = detect_boot_type_from_disk(disk0_qcow2)
+            print(colored(f"   Detected: {detected_boot} (from disk partition table)", Colors.GREEN))
+        
+        # Use detected boot type, or fallback to vm_info, or BIOS default
+        if detected_boot:
+            default_boot = detected_boot
+        elif vm_info and vm_info.get('boot_type'):
+            default_boot = vm_info['boot_type']
+        else:
+            default_boot = 'BIOS'
         
         cpu = self.input_prompt(f"CPU cores [{default_cpu}]")
         cpu = int(cpu) if cpu else default_cpu
@@ -2101,35 +2226,32 @@ class MigrationTool:
         ram = self.input_prompt(f"RAM in GB [{default_ram}]")
         ram = int(ram) if ram else default_ram
         
-        # Boot type - CRITICAL: must match source VM
+        # Boot type - CRITICAL: must match source disk
         print(colored(f"\n🔒 Boot Type:", Colors.BOLD))
-        if vm_info:
-            print(colored(f"   Source VM boot type: {default_boot}", Colors.CYAN))
+        if detected_boot:
+            print(colored(f"   Detected from disk: {default_boot}", Colors.CYAN))
+            print(colored(f"   ⚠️  This is determined by the disk partition table (GPT=UEFI, MBR=BIOS)", Colors.YELLOW))
+        elif vm_info:
+            print(colored(f"   From config: {default_boot}", Colors.CYAN))
             print(colored(f"   ⚠️  Changing boot type will cause boot failure!", Colors.YELLOW))
-            print(f"   (BIOS disks cannot boot in UEFI mode and vice versa)")
-            
-            change_boot = self.input_prompt(f"   Keep {default_boot}? (Y/n) [Y]") or "Y"
-            if change_boot.lower() == 'n':
-                new_boot = "UEFI" if default_boot == "BIOS" else "BIOS"
-                print(colored(f"\n   🚨 DANGER: Changing from {default_boot} to {new_boot}!", Colors.RED))
-                print(colored(f"      This will almost certainly cause boot failure!", Colors.RED))
-                confirm = self.input_prompt(f"   Type 'YES' to confirm change to {new_boot}") or ""
-                if confirm == "YES":
-                    boot = new_boot
-                    print(colored(f"   → Changed to {boot} (at your own risk!)", Colors.YELLOW))
-                else:
-                    boot = default_boot
-                    print(colored(f"   → Keeping {boot}", Colors.GREEN))
+        
+        print(f"   (BIOS disks cannot boot in UEFI mode and vice versa)")
+        
+        change_boot = self.input_prompt(f"   Keep {default_boot}? (Y/n) [Y]") or "Y"
+        if change_boot.lower() == 'n':
+            new_boot = "UEFI" if default_boot == "BIOS" else "BIOS"
+            print(colored(f"\n   🚨 DANGER: Changing from {default_boot} to {new_boot}!", Colors.RED))
+            print(colored(f"      This will almost certainly cause boot failure!", Colors.RED))
+            confirm = self.input_prompt(f"   Type 'YES' to confirm change to {new_boot}") or ""
+            if confirm == "YES":
+                boot = new_boot
+                print(colored(f"   → Changed to {boot} (at your own risk!)", Colors.YELLOW))
             else:
                 boot = default_boot
-                print(colored(f"   ✅ Using {boot} (from source)", Colors.GREEN))
+                print(colored(f"   → Keeping {boot}", Colors.GREEN))
         else:
-            # No source info - ask user
-            boot = self.input_prompt(f"Boot type (BIOS/UEFI) [{default_boot}]")
-            boot = boot.upper() if boot else default_boot
-            if boot not in ('BIOS', 'UEFI'):
-                boot = default_boot
-            print(colored(f"   ⚠️  No source VM info - make sure {boot} matches the original!", Colors.YELLOW))
+            boot = default_boot
+            print(colored(f"   ✅ Using {boot}", Colors.GREEN))
         
         # Storage Class selection
         print(colored("\n💾 Storage Class Selection:", Colors.BOLD))
@@ -3966,31 +4088,51 @@ Log "=========================================="
                         part_type = label if label else "System"
                         print(f"      [{part_type}] ({size} GB)")
             
-            print(colored("\n🔧 DRIVERS & AGENTS STATUS", Colors.BOLD))
-            agents = config.agents
-            
-            # Nutanix-specific
-            print(f"   NGT Installed: {'✅' if agents.ngt_installed else '❌'} {agents.ngt_version or ''}")
-            print(f"   VirtIO (Nutanix): {'✅' if agents.virtio_nutanix else '❌'}")
-            
-            # VirtIO Drivers (Fedora/Red Hat) - Critical for migration
-            print(colored("\n   VirtIO Drivers (Required for Harvester):", Colors.CYAN))
-            print(f"      Network (virtio-net):   {'✅' if agents.virtio_net else '❌ REQUIRED'}")
-            print(f"      Storage (virtio-scsi):  {'✅' if agents.virtio_storage else '❌ REQUIRED'}")
-            print(f"      Serial (virtio-serial): {'✅' if agents.virtio_serial else '❌ REQUIRED for Guest Agent'}")
-            print(f"      Balloon (optional):     {'✅' if agents.virtio_balloon else '⚪'}")
-            print(f"      Any VirtIO detected:    {'✅' if agents.virtio_fedora else '❌'}")
-            
-            # QEMU Guest Agent - Important for IP detection
-            print(colored("\n   QEMU Guest Agent (for IP detection in Harvester UI):", Colors.CYAN))
-            print(f"      Installed:   {'✅' if agents.qemu_guest_agent else '❌'}")
-            if agents.qemu_guest_agent:
-                print(f"      Running:     {'✅' if agents.qemu_guest_agent_running else '⚠️  NOT RUNNING'}")
-                print(f"      Auto-start:  {'✅' if agents.qemu_guest_agent_autostart else '⚠️  NOT AUTO'}")
-            
             print(colored("\n⚙️  SERVICES", Colors.BOLD))
             print(f"   WinRM: {'✅' if config.winrm_enabled else '❌'}")
             print(f"   RDP: {'✅' if config.rdp_enabled else '❌'}")
+            
+            # Display Nutanix tools (for post-migration cleanup planning)
+            print(colored("\n🔧 NUTANIX TOOLS INSTALLED (to remove post-migration)", Colors.BOLD))
+            agents = config.agents
+            nutanix_tools = []
+            if agents.ngt_installed:
+                nutanix_tools.append(f"Nutanix Guest Tools {agents.ngt_version or ''}")
+            if agents.virtio_nutanix:
+                nutanix_tools.append("Nutanix VirtIO")
+            
+            # Check for more Nutanix software via registry
+            ps_nutanix_check = '''
+Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*,
+                 HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue |
+    Where-Object { $_.DisplayName -like "*Nutanix*" } |
+    Select-Object DisplayName, DisplayVersion |
+    ForEach-Object { "$($_.DisplayName)|$($_.DisplayVersion)" }
+'''
+            stdout, _, _ = client.run_powershell(ps_nutanix_check)
+            if stdout.strip():
+                for line in stdout.strip().split('\n'):
+                    if '|' in line:
+                        name, version = line.split('|', 1)
+                        tool_str = f"{name.strip()} {version.strip()}".strip()
+                        if tool_str and tool_str not in nutanix_tools:
+                            nutanix_tools.append(tool_str)
+            
+            if nutanix_tools:
+                for tool in nutanix_tools:
+                    print(f"   • {tool}")
+                print(colored(f"\n   ℹ️  {len(nutanix_tools)} Nutanix tool(s) to remove after migration", Colors.CYAN))
+            else:
+                print("   No Nutanix tools detected")
+            
+            # QEMU Guest Agent status - the only thing we need to install
+            print(colored("\n📡 QEMU GUEST AGENT (required for Harvester)", Colors.BOLD))
+            if agents.qemu_guest_agent:
+                print(f"   Status: ✅ Installed")
+                print(f"   Running: {'✅' if agents.qemu_guest_agent_running else '⚠️  NOT RUNNING'}")
+                print(f"   Auto-start: {'✅' if agents.qemu_guest_agent_autostart else '⚠️  NOT AUTO'}")
+            else:
+                print(f"   Status: ❌ NOT INSTALLED")
             
             # Display listening services
             if config.listening_services:
@@ -4042,82 +4184,41 @@ Log "=========================================="
                 print(colored("\n🔌 LISTENING SERVICES", Colors.BOLD))
                 print("   No application services listening (only WinRM/RDP)")
             
-            # Migration readiness
-            print(colored("\n📊 MIGRATION READINESS", Colors.BOLD))
+            # Migration readiness - only QEMU Guest Agent is required for pre-migration
+            # VirtIO drivers will be installed post-migration (Nutanix VirtIO is incompatible)
+            print(colored("\n📊 PRE-MIGRATION READINESS", Colors.BOLD))
             
-            # Show warnings if any (not blocking but important)
-            if hasattr(config, 'warnings') and config.warnings:
-                print(colored("   ⚠️  Warnings:", Colors.YELLOW))
-                warning_messages = {
-                    'qemu_ga_not_running': "QEMU Guest Agent is installed but not running",
-                    'qemu_ga_not_autostart': "QEMU Guest Agent is not set to auto-start",
-                    'virtio_balloon_missing': "VirtIO Balloon driver not installed (optional)"
-                }
-                for warn in config.warnings:
-                    msg = warning_messages.get(warn, warn)
-                    print(f"      - {msg}")
+            qemu_ga_ready = config.agents.qemu_guest_agent
             
-            if config.migration_ready:
+            if qemu_ga_ready:
                 print(colored("   ✅ VM is ready for migration!", Colors.GREEN))
+                print(colored("   ℹ️  Note: VirtIO drivers will be installed post-migration", Colors.CYAN))
+                print(colored("   ℹ️  Nutanix tools will be removed post-migration", Colors.CYAN))
             else:
-                print(colored("   ❌ Missing prerequisites:", Colors.RED))
-                prereq_messages = {
-                    'virtio_drivers': "VirtIO drivers (network/storage)",
-                    'virtio_net': "VirtIO Network driver (required)",
-                    'virtio_storage': "VirtIO Storage driver (required)",
-                    'virtio_serial': "VirtIO Serial driver (required for Guest Agent)",
-                    'qemu_guest_agent': "QEMU Guest Agent (required for IP detection)"
-                }
-                for prereq in config.missing_prerequisites:
-                    msg = prereq_messages.get(prereq, prereq)
-                    print(f"      - {msg}")
+                print(colored("   ❌ QEMU Guest Agent not installed", Colors.RED))
+                print(colored("   This is required for Harvester to detect the VM's IP address", Colors.YELLOW))
                 
-                # Offer to install missing prerequisites
-                install = self.input_prompt("\n   Install missing prerequisites now? (y/n)")
+                # Offer to install QEMU Guest Agent only
+                install = self.input_prompt("\n   Install QEMU Guest Agent now? (y/n)")
                 if install.lower() == 'y':
-                    self._install_windows_prerequisites(client, config, host, username, password, transport)
+                    self._install_qemu_guest_agent(client, host)
                     
-                    # Re-check after installation - update ALL agent fields
-                    print("\n   🔄 Re-checking agents...")
+                    # Re-check after installation
+                    print("\n   🔄 Re-checking QEMU Guest Agent...")
                     new_agents = checker.collect_agent_status()
-                    config.agents.virtio_fedora = new_agents.get('VirtIOFedora', False)
-                    config.agents.virtio_net = new_agents.get('VirtIONet', False)
-                    config.agents.virtio_storage = new_agents.get('VirtIOStorage', False)
-                    config.agents.virtio_serial = new_agents.get('VirtIOSerial', False)
-                    config.agents.virtio_balloon = new_agents.get('VirtioBalloon', False)
                     config.agents.qemu_guest_agent = new_agents.get('QEMUGuestAgent', False)
                     config.agents.qemu_guest_agent_running = new_agents.get('QEMUGuestAgentRunning', False)
                     config.agents.qemu_guest_agent_autostart = new_agents.get('QEMUGuestAgentAutoStart', False)
                     
-                    # Recalculate missing prerequisites
-                    config.missing_prerequisites = []
-                    if not (config.agents.virtio_fedora or config.agents.virtio_nutanix):
-                        config.missing_prerequisites.append("virtio_drivers")
-                    if not config.agents.virtio_storage:
-                        config.missing_prerequisites.append("virtio_storage")
-                    if not config.agents.virtio_net:
-                        config.missing_prerequisites.append("virtio_net")
-                    if not config.agents.virtio_serial:
-                        config.missing_prerequisites.append("virtio_serial")
-                    if not config.agents.qemu_guest_agent:
-                        config.missing_prerequisites.append("qemu_guest_agent")
-                    
-                    # Recalculate warnings
-                    config.warnings = []
-                    if config.agents.qemu_guest_agent and not config.agents.qemu_guest_agent_running:
-                        config.warnings.append("qemu_ga_not_running")
-                    if config.agents.qemu_guest_agent and not config.agents.qemu_guest_agent_autostart:
-                        config.warnings.append("qemu_ga_not_autostart")
-                    
-                    config.migration_ready = len(config.missing_prerequisites) == 0
-                    
-                    if config.migration_ready:
-                        print(colored("\n   ✅ VM is now ready for migration!", Colors.GREEN))
+                    if config.agents.qemu_guest_agent:
+                        print(colored("\n   ✅ QEMU Guest Agent installed - VM is ready for migration!", Colors.GREEN))
                     else:
-                        print(colored("\n   ⚠️  Some prerequisites still missing (may need reboot):", Colors.YELLOW))
-                        for prereq in config.missing_prerequisites:
-                            msg = prereq_messages.get(prereq, prereq)
-                            print(f"      - {msg}")
+                        print(colored("\n   ⚠️  Installation may need a service restart", Colors.YELLOW))
+                        # Try to start the service
+                        client.run_powershell('Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue')
+            
+            # Mark as ready for migration (QEMU GA is the only requirement)
+            config.migration_ready = config.agents.qemu_guest_agent
             
             # Save config
             staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
@@ -4156,6 +4257,107 @@ Log "=========================================="
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
+    
+    def _install_qemu_guest_agent(self, client, host):
+        """Install only QEMU Guest Agent on Windows VM via WinRM."""
+        self.init_actions()
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        tools_dir = os.path.join(staging_dir, 'tools')
+        qemu_ga_msi = os.path.join(tools_dir, 'qemu-ga-x86_64.msi')
+        
+        if not os.path.exists(qemu_ga_msi):
+            print(colored(f"   ❌ QEMU GA MSI not found: {qemu_ga_msi}", Colors.RED))
+            print(colored("      Run 'Download virtio/qemu-ga tools' first (Menu Windows → 4)", Colors.YELLOW))
+            return False
+        
+        # Start HTTP server to serve files
+        print(colored("\n   🚀 Starting HTTP server for file transfer...", Colors.CYAN))
+        
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                target_ip = socket.gethostbyname(host)
+            except:
+                target_ip = socket.gethostbyname(host.split('.')[0])
+            s.connect((target_ip, 5985))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception as e:
+            print(colored(f"   ⚠️  Could not auto-detect local IP: {e}", Colors.YELLOW))
+            local_ip = self.input_prompt("   Enter this machine's IP (reachable from Windows)")
+            if not local_ip:
+                return False
+        
+        http_port = 8888
+        http_url = f"http://{local_ip}:{http_port}"
+        
+        import threading
+        import http.server
+        import socketserver
+        
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=tools_dir, **kwargs)
+            def log_message(self, format, *args):
+                pass
+        
+        httpd = socketserver.TCPServer(("", http_port), QuietHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        
+        print(colored(f"   ✅ HTTP server running at {http_url}", Colors.GREEN))
+        
+        try:
+            print(colored("\n   📦 Installing QEMU Guest Agent...", Colors.CYAN))
+            
+            ps_script = f'''
+$ErrorActionPreference = "Stop"
+$msiUrl = "{http_url}/qemu-ga-x86_64.msi"
+$msiPath = "$env:TEMP\\qemu-ga-x86_64.msi"
+
+# Download MSI
+Write-Host "Downloading QEMU Guest Agent..."
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+
+# Install silently
+Write-Host "Installing QEMU Guest Agent..."
+$process = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru -NoNewWindow
+if ($process.ExitCode -eq 0 -or $process.ExitCode -eq 3010) {{
+    Write-Host "QEMU Guest Agent installed successfully"
+    # Start the service
+    Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+    # Set to auto-start
+    Set-Service -Name "QEMU-GA" -StartupType Automatic -ErrorAction SilentlyContinue
+    Write-Host "INSTALL_SUCCESS"
+}} else {{
+    Write-Host "Installation failed with exit code: $($process.ExitCode)"
+    Write-Host "INSTALL_FAILED"
+}}
+
+# Cleanup
+Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
+'''
+            stdout, stderr, rc = client.run_powershell(ps_script, timeout=120)
+            
+            if "INSTALL_SUCCESS" in stdout:
+                print(colored("   ✅ QEMU Guest Agent installed successfully", Colors.GREEN))
+                return True
+            else:
+                print(colored(f"   ❌ Installation failed (exit code: {rc})", Colors.RED))
+                if stderr.strip():
+                    print(f"      {stderr.strip()}")
+                return False
+                
+        except Exception as e:
+            print(colored(f"   ❌ Error: {e}", Colors.RED))
+            return False
+        finally:
+            httpd.shutdown()
     
     def _install_windows_prerequisites(self, client, config, host, username, password, transport):
         """Install missing prerequisites on Windows VM via WinRM."""
@@ -4561,6 +4763,148 @@ Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
+    def _install_virtio_drivers_postmig(self, client, host):
+        """Install Red Hat VirtIO drivers during post-migration (reuses existing WinRM connection)."""
+        self.init_actions()
+        
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        tools_dir = os.path.join(staging_dir, 'tools')
+        virtio_iso = os.path.join(tools_dir, 'virtio-win.iso')
+        
+        if not os.path.exists(virtio_iso):
+            print(colored(f"   ❌ VirtIO ISO not found: {virtio_iso}", Colors.RED))
+            print(colored("      Run 'Download virtio/qemu-ga tools' first", Colors.YELLOW))
+            return False
+        
+        # Start HTTP server
+        print(colored("\n   🚀 Starting file server...", Colors.CYAN))
+        
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                target_ip = socket.gethostbyname(host)
+            except:
+                target_ip = socket.gethostbyname(host.split('.')[0])
+            s.connect((target_ip, 5985))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception as e:
+            print(colored(f"   ⚠️  Could not auto-detect local IP: {e}", Colors.YELLOW))
+            local_ip = self.input_prompt("   Enter this machine's IP")
+            if not local_ip:
+                return False
+        
+        http_port = 8889  # Use different port to avoid conflict
+        http_url = f"http://{local_ip}:{http_port}"
+        
+        import threading
+        import http.server
+        import socketserver
+        
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=tools_dir, **kwargs)
+            def log_message(self, format, *args):
+                pass
+        
+        httpd = socketserver.TCPServer(("", http_port), QuietHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        
+        try:
+            print(colored("   📥 Downloading VirtIO ISO...", Colors.CYAN))
+            
+            ps_download = f'''
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'
+$isoPath = "$env:TEMP\\virtio-win.iso"
+Invoke-WebRequest -Uri "{http_url}/virtio-win.iso" -OutFile $isoPath -UseBasicParsing
+if (Test-Path $isoPath) {{ "DOWNLOADED" }} else {{ "FAILED" }}
+'''
+            stdout, stderr, rc = client.run_powershell(ps_download, timeout=600)
+            
+            if "DOWNLOADED" not in stdout:
+                print(colored(f"   ❌ Download failed", Colors.RED))
+                return False
+            
+            print(colored("   ✅ Downloaded", Colors.GREEN))
+            print(colored("   📦 Installing VirtIO drivers...", Colors.CYAN))
+            
+            ps_install = '''
+$iso = "$env:TEMP\\virtio-win.iso"
+$logFile = "C:\\temp\\virtio-install.log"
+
+function Log {
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}
+
+Log "VirtIO installation started"
+
+$mount = Mount-DiskImage -ImagePath $iso -PassThru
+Start-Sleep 2
+$driveLetter = ($mount | Get-Volume).DriveLetter + ":"
+Log "Mounted on $driveLetter"
+
+$installers = @(
+    "$driveLetter\\virtio-win-guest-tools.exe",
+    "$driveLetter\\virtio-win-gt-x64.exe"
+)
+
+$installerPath = $null
+foreach ($path in $installers) {
+    if (Test-Path $path) {
+        $installerPath = $path
+        Log "Found: $path"
+        break
+    }
+}
+
+if (-not $installerPath) {
+    Log "No installer found"
+    Dismount-DiskImage -ImagePath $iso
+    Write-Host "FAILED"
+    exit 1
+}
+
+$proc = Start-Process $installerPath -ArgumentList "/S" -PassThru -Wait
+Log "Exit code: $($proc.ExitCode)"
+
+Start-Sleep 5
+
+$virtioPath = "$env:ProgramFiles\\Virtio-Win"
+$redhatPath = "$env:ProgramFiles\\Red Hat"
+
+if ((Test-Path $virtioPath) -or (Test-Path $redhatPath)) {
+    Log "SUCCESS"
+    Write-Host "SUCCESS"
+} else {
+    Log "May have failed"
+    Write-Host "UNKNOWN"
+}
+
+Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+Remove-Item $iso -Force -ErrorAction SilentlyContinue
+'''
+            stdout, stderr, rc = client.run_powershell(ps_install, timeout=300)
+            
+            if "SUCCESS" in stdout:
+                print(colored("   ✅ VirtIO drivers installed!", Colors.GREEN))
+                return True
+            else:
+                print(colored("   ⚠️  Installation status unknown", Colors.YELLOW))
+                print(colored("      Check log: C:\\temp\\virtio-install.log", Colors.CYAN))
+                return False
+                
+        except Exception as e:
+            print(colored(f"   ❌ Error: {e}", Colors.RED))
+            return False
+        finally:
+            httpd.shutdown()
+    
     def postmig_autoconfigure(self):
         """Auto-configure Windows VM after migration using ping FQDN."""
         print(colored("\n🔧 Post-Migration Auto-Configure", Colors.BOLD))
@@ -4963,19 +5307,108 @@ Write-Host "CLEANUP_DONE"
                     print(colored(f"   ⚠️  Cleanup error: {e}", Colors.YELLOW))
                     print(colored("      You may need to uninstall manually", Colors.YELLOW))
             
+            # Offer to install Red Hat VirtIO drivers
+            print(colored("\n📦 Red Hat VirtIO Drivers", Colors.BOLD))
+            print("   Required for switching from SATA to VirtIO disk bus (better performance)")
+            
+            install_virtio = self.input_prompt("\n   Install Red Hat VirtIO drivers now? (y/n) [y]") or "y"
+            virtio_installed = False
+            if install_virtio.lower() == 'y':
+                virtio_installed = self._install_virtio_drivers_postmig(client, vm_fqdn)
+            
+            # Summary and next steps
             print(colored("\n" + "="*50, Colors.GREEN))
             print(colored("✅ Post-migration configuration complete!", Colors.GREEN))
             print(colored("="*50, Colors.GREEN))
             print(f"\n   VM: {vm_name}")
             print(f"   FQDN: {vm_fqdn}")
             print(f"   Static IP: {original_ip}")
-            print(colored("\n💡 Next steps:", Colors.YELLOW))
-            print("   1. Verify network connectivity:")
-            print(f"      ping {original_ip}")
-            print(f"      ping {vm_fqdn}")
-            print("   2. Install Red Hat VirtIO drivers (Menu Windows → Install VirtIO)")
-            print("   3. Switch VM to VirtIO bus (Menu Harvester → Switch VM disk bus)")
-            print("   4. Reboot and verify performance")
+            
+            if virtio_installed:
+                # Offer to switch disk bus
+                print(colored("\n🔄 Disk Bus Optimization", Colors.BOLD))
+                print("   VirtIO drivers are installed. You can now switch from SATA to VirtIO for better performance.")
+                print(colored("   ⚠️  This requires stopping the VM, changing config, and restarting.", Colors.YELLOW))
+                
+                switch_bus = self.input_prompt("\n   Switch to VirtIO disk bus now? (y/n) [y]") or "y"
+                if switch_bus.lower() == 'y':
+                    print(colored("\n   🔄 Switching disk bus to VirtIO...", Colors.CYAN))
+                    
+                    # Stop VM
+                    print("   Stopping VM...")
+                    try:
+                        self.harvester.stop_vm(vm_name, namespace)
+                        
+                        # Wait for VM to stop
+                        max_wait = 120
+                        elapsed = 0
+                        while elapsed < max_wait:
+                            time.sleep(5)
+                            elapsed += 5
+                            vm_data = self.harvester.get_vm(vm_name, namespace)
+                            if not vm_data.get('status', {}).get('ready', False):
+                                print(colored("   ✅ VM stopped", Colors.GREEN))
+                                break
+                            print(f"   Waiting... ({elapsed}s)")
+                        
+                        # Get current VM config
+                        vm_data = self.harvester.get_vm(vm_name, namespace)
+                        template_spec = vm_data.get('spec', {}).get('template', {}).get('spec', {})
+                        
+                        # Update disk bus
+                        new_disks = []
+                        for disk in template_spec.get('domain', {}).get('devices', {}).get('disks', []):
+                            new_disk = disk.copy()
+                            if 'disk' in new_disk:
+                                new_disk['disk'] = new_disk['disk'].copy()
+                                old_bus = new_disk['disk'].get('bus', 'sata')
+                                if old_bus in ('sata', 'ide', 'scsi'):
+                                    new_disk['disk']['bus'] = 'virtio'
+                                    print(f"   {new_disk.get('name')}: {old_bus} → virtio")
+                            new_disks.append(new_disk)
+                        
+                        # Apply patch
+                        patch = {
+                            "spec": {
+                                "template": {
+                                    "spec": {
+                                        "domain": {
+                                            "devices": {
+                                                "disks": new_disks
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        self.harvester._request(
+                            "PATCH",
+                            f"/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}",
+                            json=patch,
+                            headers={"Content-Type": "application/merge-patch+json"}
+                        )
+                        
+                        print(colored("   ✅ Disk bus switched to VirtIO!", Colors.GREEN))
+                        
+                        # Start VM
+                        print("   Starting VM with VirtIO...")
+                        self.harvester.start_vm(vm_name, namespace)
+                        print(colored("   ✅ VM starting with VirtIO disk bus", Colors.GREEN))
+                        
+                        print(colored("\n🎉 Migration complete with VirtIO optimization!", Colors.GREEN))
+                        
+                    except Exception as e:
+                        print(colored(f"   ❌ Error switching disk bus: {e}", Colors.RED))
+                        print(colored("   You can do this manually: Menu Harvester → Switch VM disk bus", Colors.YELLOW))
+                else:
+                    print(colored("\n💡 To optimize later:", Colors.YELLOW))
+                    print("   Menu Harvester → Switch VM disk bus (option 12)")
+            else:
+                print(colored("\n💡 Next steps for VirtIO optimization:", Colors.YELLOW))
+                print("   1. Install Red Hat VirtIO drivers (Menu Windows → Install VirtIO)")
+                print("   2. Switch VM to VirtIO bus (Menu Harvester → Switch VM disk bus)")
+                print("   3. Reboot and verify performance")
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))

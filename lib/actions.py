@@ -76,7 +76,7 @@ class MigrationActions:
     
     def list_staging_files(self, filter_ext: str = None) -> List[Dict]:
         """
-        List all files in staging directory.
+        List all files in staging directory and migrations subfolders.
         
         Args:
             filter_ext: Optional extension filter (e.g., '.raw', '.qcow2')
@@ -88,19 +88,32 @@ class MigrationActions:
             return []
         
         files = []
+        
+        # Search paths: staging root + migrations subfolders
+        search_paths = [self.staging_path]
+        migrations_dir = os.path.join(self.staging_path, 'migrations')
+        if os.path.isdir(migrations_dir):
+            for vm_dir in os.listdir(migrations_dir):
+                vm_path = os.path.join(migrations_dir, vm_dir)
+                if os.path.isdir(vm_path):
+                    search_paths.append(vm_path)
+        
         try:
-            for f in os.listdir(self.staging_path):
-                fpath = os.path.join(self.staging_path, f)
-                if os.path.isfile(fpath):
-                    if filter_ext and not f.endswith(filter_ext):
-                        continue
-                    stat = os.stat(fpath)
-                    files.append({
-                        'name': f,
-                        'path': fpath,
-                        'size': stat.st_size,
-                        'mtime': stat.st_mtime,
-                    })
+            for search_path in search_paths:
+                for f in os.listdir(search_path):
+                    fpath = os.path.join(search_path, f)
+                    if os.path.isfile(fpath):
+                        if filter_ext and not f.endswith(filter_ext):
+                            continue
+                        stat = os.stat(fpath)
+                        # Include relative path from staging for display
+                        rel_path = os.path.relpath(fpath, self.staging_path)
+                        files.append({
+                            'name': rel_path,
+                            'path': fpath,
+                            'size': stat.st_size,
+                            'mtime': stat.st_mtime,
+                        })
         except Exception as e:
             pass
         
