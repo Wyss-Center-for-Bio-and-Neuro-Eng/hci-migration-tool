@@ -2309,81 +2309,65 @@ class MigrationTool:
                 print("   Use Menu Windows → Post-migration auto-configure")
                 return
             
-            # Step 1: Wait for IP from QEMU Guest Agent
-            # VM starts automatically with runStrategy: RerunOnFailure
-            print(colored("\n▶️  Step 1: Waiting for VM to boot and get IP...", Colors.BOLD))
-            print("   (VM is starting automatically, this may take 1-3 minutes)")
+            # Step 1: Wait for VM to boot by pinging FQDN
+            # Build FQDN from vm_name + domain
+            windows_config = self.config.get('windows', {})
+            domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
+            vm_fqdn = f"{vm_name}.{domain}"
+            
+            print(colored("\n▶️  Step 1: Waiting for VM to boot...", Colors.BOLD))
+            print(f"   FQDN: {vm_fqdn}")
+            print("   (Pinging to detect when VM is ready)")
             
             import time
+            import subprocess
             
-            # Wait initial time for VM to start and VMI to be created
-            print("   ⏳ Waiting for VM to initialize...")
+            # Wait initial time for VM to start
+            print("   ⏳ Waiting for VM to initialize (20s)...")
             time.sleep(20)
             
-            vm_ip = None
-            max_wait = 120  # 2 minutes to check if VM is Running
+            max_wait = 180  # 3 minutes max to wait for ping
             start_time = time.time()
-            vmi_running = False
-            last_status = ""
+            vm_reachable = False
             
             while time.time() - start_time < max_wait:
                 elapsed = int(time.time() - start_time) + 20  # Add initial wait
+                
+                # Ping the FQDN
                 try:
-                    # Check VMI status (silent to avoid error messages while waiting)
-                    vmi = self.harvester.get_vmi(vm_name, namespace, silent=True)
-                    vmi_phase = vmi.get('status', {}).get('phase', '')
+                    result = subprocess.run(
+                        ['ping', '-c', '1', '-W', '2', vm_fqdn],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
                     
-                    if vmi_phase != last_status:
-                        print(f"   ⏳ VM status: {vmi_phase} ({elapsed}s)")
-                        last_status = vmi_phase
-                    
-                    if vmi_phase == 'Running':
-                        vmi_running = True
-                        print(colored("   ✅ VM instance is Running", Colors.GREEN))
-                        
-                        # Check if IP is available from Guest Agent
-                        interfaces = vmi.get('status', {}).get('interfaces', [])
-                        for iface in interfaces:
-                            ip = iface.get('ipAddress', '')
-                            if ip and '/' in ip:
-                                ip = ip.split('/')[0]
-                            if ip and not ip.startswith('127.') and not ip.startswith('169.254.') and not ip.startswith('fe80:'):
-                                vm_ip = ip
-                                info_source = iface.get('infoSource', '')
-                                print(f"   ✅ Found IP via API: {vm_ip} (source: {info_source})")
-                                break
+                    if result.returncode == 0:
+                        vm_reachable = True
+                        print(colored(f"\n   ✅ VM responds to ping! ({elapsed}s)", Colors.GREEN))
                         break
-                    elif vmi_phase == 'Succeeded':
-                        # VM completed (shutdown) - shouldn't happen with RerunOnFailure
-                        print(colored(f"   ⚠️  VM phase is 'Succeeded' - it may have shut down", Colors.YELLOW))
-                        break
-                        
+                    else:
+                        if elapsed % 15 == 0:  # Print every 15s
+                            print(f"   ⏳ Waiting for VM to respond... ({elapsed}s)")
+                except subprocess.TimeoutExpired:
+                    pass
                 except Exception as e:
-                    # VMI not found yet - normal during startup
-                    if elapsed % 15 == 0:  # Print every 15s
-                        print(f"   ⏳ Waiting for VMI to be created... ({elapsed}s)")
+                    if elapsed % 30 == 0:
+                        print(f"   ⏳ Ping error: {e}")
                 
                 time.sleep(5)
             
-            # Even if we couldn't detect Running state via API, continue to ask for IP
-            # The VM might be running but API detection failed
-            if not vmi_running:
-                print(colored("   ⚠️  Could not confirm VM status via API", Colors.YELLOW))
-                print(colored("   Check Harvester UI to verify VM is Running", Colors.CYAN))
-            
-            if not vm_ip:
-                # IP not available via API - common for Windows VMs
-                print(colored("\n   ℹ️  IP not available via QEMU Guest Agent", Colors.CYAN))
-                print(colored("      This is normal - the Guest Agent service may need to start", Colors.CYAN))
-                print(colored("\n   👉 Check Harvester UI for the VM's DHCP IP address", Colors.BOLD))
-                print(colored("      (It should be visible in the IP Address column)", Colors.CYAN))
-                manual_ip = self.input_prompt("\n   Enter the DHCP IP from Harvester UI")
-                if not manual_ip:
+            if not vm_reachable:
+                print(colored(f"\n   ⚠️  VM not responding to ping after {max_wait + 20}s", Colors.YELLOW))
+                print(colored("   Possible causes:", Colors.CYAN))
+                print("      - VM still booting (Windows can take 2-3 minutes)")
+                print("      - DNS not yet updated with DHCP IP")
+                print("      - Network issue")
+                
+                retry = self.input_prompt("\n   Continue anyway? (y/n) [y]") or "y"
+                if retry.lower() != 'y':
                     print(colored("\n💡 Complete migration later with Menu Windows → Post-migration auto-configure", Colors.YELLOW))
                     return
-                vm_ip = manual_ip.strip()
-            
-            print(colored(f"\n   ✅ VM IP (DHCP): {vm_ip}", Colors.GREEN))
             
             # Step 2: Load network config and connect via WinRM
             print(colored("\n▶️  Step 2: Connecting via WinRM...", Colors.BOLD))
@@ -2419,41 +2403,23 @@ class MigrationTool:
                 print(colored("   Install with: pip install pywinrm --break-system-packages", Colors.YELLOW))
                 return
             
-            # Check if using IP or FQDN - determines auth method
-            import re
-            is_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', vm_ip))
-            
-            windows_config = self.config.get('windows', {})
+            # Use FQDN with Kerberos if available, otherwise NTLM
             use_kerberos = windows_config.get('use_kerberos', True)
-            domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
             
             username = None
             password = None
-            transport = "ntlm"  # Default for IP addresses
-            connect_host = vm_ip
+            transport = "ntlm"  # Default
+            connect_host = vm_fqdn
             
-            if is_ip and use_kerberos:
-                # IP address but user prefers Kerberos
-                print(colored("\n   ⚠️  Using IP address, but Kerberos requires FQDN", Colors.YELLOW))
-                print(colored("   Options:", Colors.CYAN))
-                print(colored("     1. Use FQDN (if DNS already updated to new IP)", Colors.CYAN))
-                print(colored("     2. Use NTLM with username/password", Colors.CYAN))
-                
-                choice = self.input_prompt("\n   Use FQDN instead? (enter FQDN or press Enter for NTLM)")
-                if choice and not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', choice):
-                    connect_host = choice
-                    if '.' not in connect_host:
-                        connect_host = f"{connect_host}.{domain}"
-                    is_ip = False
-                    print(f"   → Will connect to: {connect_host}")
-            
-            if not is_ip and use_kerberos and get_kerberos_auth():
+            if use_kerberos and get_kerberos_auth():
                 # FQDN with valid Kerberos ticket
                 print(colored("\n   Using Kerberos authentication", Colors.GREEN))
+                print(f"   Host: {vm_fqdn}")
                 transport = "kerberos"
             else:
-                # IP address or no Kerberos - use NTLM
+                # No Kerberos - use NTLM
                 print("\n   Using NTLM authentication")
+                print(f"   Host: {vm_fqdn}")
                 transport = "ntlm"
                 try:
                     username, password = self.vault.get_credential("local-admin")
@@ -2501,59 +2467,124 @@ class MigrationTool:
                 print(f"\n   Configuring {iface_name}...")
                 
                 ps_script = f'''
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+$logFile = "C:\\temp\\network-reconfig.log"
+
+# Ensure log directory exists
+if (-not (Test-Path "C:\\temp")) {{
+    New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null
+}}
+
+function Log {{
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}}
+
+Log "=========================================="
+Log "Network reconfiguration started"
+Log "=========================================="
+
 $ifName = "{iface_name}"
 $ip = "{ip}"
 $prefix = {prefix}
 $gateway = "{gateway}"
 $dns = @({','.join([f'"{d}"' for d in dns_list])})
 
-Write-Host "Configuring $ifName..."
+Log "Target interface: $ifName"
+Log "Target IP: $ip/$prefix"
+Log "Target gateway: $gateway"
+Log "Target DNS: $($dns -join ', ')"
 
-# Get adapter - try exact name first, then partial match
-$adapter = Get-NetAdapter -Name $ifName -ErrorAction SilentlyContinue
-if (-not $adapter) {{
-    $adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
-    if ($adapter) {{
-        $ifName = $adapter.Name
-        Write-Host "Using adapter: $ifName"
+try {{
+    # Get adapter - try exact name first, then partial match
+    Log "Looking for adapter '$ifName'..."
+    $adapter = Get-NetAdapter -Name $ifName -ErrorAction SilentlyContinue
+    if (-not $adapter) {{
+        Log "Exact name not found, trying partial match..."
+        $adapter = Get-NetAdapter | Where-Object {{ $_.Name -like "*Ethernet*" -and $_.Status -eq "Up" }} | Select-Object -First 1
+        if (-not $adapter) {{
+            $adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
+        }}
+        if ($adapter) {{
+            $ifName = $adapter.Name
+            Log "Using adapter: $ifName (InterfaceIndex: $($adapter.InterfaceIndex))"
+        }} else {{
+            Log "ERROR: No active adapter found!"
+            throw "No active adapter found"
+        }}
+    }} else {{
+        Log "Found exact adapter: $ifName (InterfaceIndex: $($adapter.InterfaceIndex))"
     }}
+
+    # Remove existing IP config
+    Log "Removing existing IP configuration..."
+    Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{
+        Log "  Removing IP: $($_.IPAddress)"
+        Remove-NetIPAddress -InterfaceAlias $ifName -IPAddress $_.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    
+    Log "Removing existing routes..."
+    Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Set new IP
+    Log "Setting new IP: $ip/$prefix gateway $gateway"
+    New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
+    Log "IP configured successfully"
+
+    # Set DNS
+    Log "Setting DNS: $($dns -join ', ')"
+    Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
+    Log "DNS configured successfully"
+
+    Log "=========================================="
+    Log "Network reconfiguration COMPLETED"
+    Log "=========================================="
+    Write-Host "SUCCESS"
+}} catch {{
+    Log "ERROR: $($_.Exception.Message)"
+    Log "Stack: $($_.ScriptStackTrace)"
+    throw
 }}
-
-# Remove existing IP config
-Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-
-# Set new IP
-New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
-Write-Host "IP set: $ip/$prefix via $gateway"
-
-# Set DNS
-Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
-Write-Host "DNS set: $($dns -join ', ')"
-
-Write-Host "SUCCESS"
 '''
                 try:
                     stdout, stderr, rc = client.run_powershell(ps_script)
                     
                     if rc == 0 and "SUCCESS" in stdout:
                         print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                    elif "SUCCESS" in stdout:
+                        # rc might be -1 due to connection reset when IP changes
+                        print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                        print(colored("      (Connection reset expected when IP changes)", Colors.CYAN))
                     else:
                         print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
+                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
                         if stdout:
-                            print(f"      {stdout[:200]}")
+                            print(f"      Output: {stdout[:200]}")
                 except Exception as e:
-                    print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
-                    print("      Network may have changed - this is expected")
+                    # Connection reset is expected when changing network
+                    if "Connection reset" in str(e) or "WinRM" in str(e):
+                        print(colored(f"   ✅ {iface_name} likely configured (connection reset)", Colors.GREEN))
+                        print(colored("      This is normal when changing IP - connection to old IP breaks", Colors.CYAN))
+                    else:
+                        print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
+                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
             
             # Final message
+            original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
+            
             print(colored("\n" + "="*50, Colors.GREEN))
             print(colored("🎉 MIGRATION COMPLETE!", Colors.GREEN))
             print(colored("="*50, Colors.GREEN))
             print(f"\n   VM: {vm_name}")
-            print(f"   Original IP: {static_interfaces[0].get('ip') if static_interfaces else 'N/A'}")
+            print(f"   FQDN: {vm_fqdn}")
+            print(f"   Static IP: {original_ip}")
             print(colored("\n   The VM should now be accessible at its original IP address.", Colors.CYAN))
+            print(colored("\n💡 Verify:", Colors.YELLOW))
+            print(f"   ping {original_ip}")
+            print(f"   ping {vm_fqdn}")
+            print(colored("\n💡 If network config failed, check log on VM:", Colors.YELLOW))
+            print("   C:\\temp\\network-reconfig.log")
             print(colored("\n💡 Don't forget to:", Colors.YELLOW))
             print("   - Test connectivity to the VM")
             print("   - Delete Nutanix export images when confirmed working")
