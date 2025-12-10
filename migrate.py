@@ -1752,11 +1752,13 @@ class MigrationTool:
                     print(colored(f"\n✅ Loaded saved config: {config_path}", Colors.GREEN))
                     
                     # Build vm_info from loaded config
-                    # The vm-config.json format uses nested structure: storage.disks, network.interfaces
+                    # Priority: nutanix block > root level > defaults
+                    nutanix_info = loaded_config.get('nutanix', {})
+                    
                     vm_info = {
-                        'vcpu': loaded_config.get('cpu_cores', 2),
-                        'memory_mb': loaded_config.get('memory_mb', 4096),
-                        'boot_type': loaded_config.get('boot_type', 'BIOS'),
+                        'vcpu': nutanix_info.get('cpu_cores', loaded_config.get('cpu_cores', 2)),
+                        'memory_mb': nutanix_info.get('memory_mb', loaded_config.get('memory_mb', 4096)),
+                        'boot_type': nutanix_info.get('boot_type', loaded_config.get('boot_type', 'BIOS')),
                         'disks': [],
                         'nics': []
                     }
@@ -1764,29 +1766,25 @@ class MigrationTool:
                     # Extract disk info from storage.disks
                     storage_disks = loaded_config.get('storage', {}).get('disks', [])
                     
-                    # Auto-detect UEFI from EFI System Partition (typically 100MB on disk 0)
-                    # GPT/UEFI disks have: EFI (100MB) + MSR (16MB) + Windows + Recovery
-                    if storage_disks:
-                        first_disk = storage_disks[0]
-                        partitions = first_disk.get('partitions', [])
-                        for part in partitions:
-                            size_gb = part.get('SizeGB', 0)
-                            # EFI partition is typically 100MB (0.1GB) or 260MB (0.25GB)
-                            if 0.08 <= size_gb <= 0.3 and part.get('Letter') is None:
-                                # Found EFI-like partition, assume UEFI
-                                vm_info['boot_type'] = 'UEFI'
-                                print(colored(f"   🔍 Auto-detected UEFI boot (EFI partition found)", Colors.CYAN))
-                                break
+                    # Note: We don't auto-detect UEFI from partitions as both BIOS (System Reserved)
+                    # and UEFI (EFI System) have similar ~100MB partitions. Boot type should come
+                    # from Nutanix API or be set manually.
                     
                     for disk in storage_disks:
-                        size_gb = disk.get('size_bytes', 0) // (1024**3)
+                        # vm-config.json uses size_gb directly
+                        size_gb = disk.get('size_gb', 0)
+                        if size_gb == 0:
+                            # Fallback to size_bytes if present
+                            size_gb = disk.get('size_bytes', 0) // (1024**3)
+                        
+                        disk_num = disk.get('number', len(vm_info['disks']))
                         vm_info['disks'].append({
-                            'size_bytes': disk.get('size_bytes', 0),
+                            'size_bytes': size_gb * (1024**3),
                             'adapter': disk.get('controller_type', 'SCSI'),
-                            'index': disk.get('index', 0)
+                            'index': disk_num
                         })
                         source_disks.append({
-                            'index': disk.get('index', 0),
+                            'index': disk_num,
                             'size_gb': size_gb,
                             'adapter': disk.get('controller_type', 'SCSI')
                         })
@@ -1797,7 +1795,10 @@ class MigrationTool:
                         vm_info['nics'].append(nic)
                     
                     print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}", Colors.GREEN))
-                    print(f"   Disks: {len(source_disks)}, NICs: {len(vm_info['nics'])}")
+                    print(f"   Disks: {len(source_disks)}")
+                    for d in source_disks:
+                        print(f"      Disk {d['index']}: {d['size_gb']} GB")
+                    print(f"   NICs: {len(vm_info['nics'])}")
                     
                 except Exception as e:
                     print(colored(f"   ⚠️  Error loading config: {e}", Colors.YELLOW))
@@ -3709,6 +3710,33 @@ try {{
             os.makedirs(vm_dir, exist_ok=True)
             config_path = os.path.join(vm_dir, 'vm-config.json')
             config.save(config_path)
+            
+            # Add Nutanix VM info (boot_type, cpu, ram) to the saved config
+            if self.nutanix:
+                try:
+                    nutanix_vm = self.nutanix.get_vm_by_name(config.hostname)
+                    if nutanix_vm:
+                        vm_info = NutanixClient.parse_vm_info(nutanix_vm)
+                        
+                        # Reload and enhance the config with Nutanix data
+                        with open(config_path, 'r') as f:
+                            saved_config = json.load(f)
+                        
+                        saved_config['nutanix'] = {
+                            'boot_type': vm_info.get('boot_type', 'BIOS'),
+                            'cpu_cores': vm_info.get('vcpu', 2),
+                            'memory_mb': vm_info.get('memory_mb', 4096),
+                            'num_sockets': vm_info.get('num_sockets', 1),
+                            'num_vcpus_per_socket': vm_info.get('num_vcpus_per_socket', 2)
+                        }
+                        
+                        with open(config_path, 'w') as f:
+                            json.dump(saved_config, f, indent=2)
+                        
+                        print(colored(f"   ✅ Added Nutanix info: Boot={vm_info.get('boot_type')}, CPU={vm_info.get('vcpu')}, RAM={vm_info.get('memory_mb')//1024}GB", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not get Nutanix VM info: {e}", Colors.YELLOW))
+            
             print(colored(f"\n   💾 Configuration saved: {config_path}", Colors.GREEN))
             
         except Exception as e:
