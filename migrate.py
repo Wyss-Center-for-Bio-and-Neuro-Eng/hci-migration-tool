@@ -1572,9 +1572,11 @@ class MigrationTool:
             print(colored("Invalid choice", Colors.RED))
             return
         
-        image_name = self.input_prompt(f"Image name [{selected_file['name'].replace('.qcow2', '')}]")
+        # Extract just the filename (without path) for the default image name
+        file_basename = os.path.basename(selected_file['name']).replace('.qcow2', '')
+        image_name = self.input_prompt(f"Image name [{file_basename}]")
         if not image_name:
-            image_name = selected_file['name'].replace('.qcow2', '')
+            image_name = file_basename
         
         # Get available namespaces
         namespaces = self.get_harvester_namespaces()
