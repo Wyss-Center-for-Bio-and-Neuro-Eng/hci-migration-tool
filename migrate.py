@@ -2842,19 +2842,87 @@ class MigrationTool:
                 print(colored(f"   ❌ Connection error: {e}", Colors.RED))
                 return
             
-            # Step 3: Apply network configuration
-            print(colored("\n▶️  Step 3: Applying network configuration...", Colors.BOLD))
+            # Step 3: Uninstall ALL Nutanix software
+            print(colored("\n▶️  Step 3: Uninstalling Nutanix software...", Colors.BOLD))
+            print("   (Guest Tools, VirtIO drivers, VM Mobility, etc.)")
             
-            for iface in static_interfaces:
-                iface_name = iface.get('name', 'Ethernet')
-                ip = iface.get('ip')
-                prefix = iface.get('prefix', 24)
-                gateway = iface.get('gateway', '')
-                dns_list = iface.get('dns', [])
+            try:
+                post_config = WindowsPostConfig(client)
                 
-                print(f"\n   Configuring {iface_name}...")
+                print("   🗑️  Removing all Nutanix software...")
+                success, uninstalled, failed = post_config.uninstall_all_nutanix()
                 
-                ps_script = f'''
+                if success:
+                    if uninstalled > 0:
+                        print(colored(f"   ✅ Removed {uninstalled} Nutanix component(s)", Colors.GREEN))
+                    else:
+                        print(colored("   ✅ No Nutanix software found (already clean)", Colors.GREEN))
+                else:
+                    print(colored(f"   ⚠️  Some components failed to uninstall: {failed}", Colors.YELLOW))
+                    print(colored("   Check log: C:\\temp\\nutanix-uninstall.log", Colors.CYAN))
+                    
+            except Exception as e:
+                print(colored(f"   ⚠️  Nutanix uninstall error: {e}", Colors.YELLOW))
+                print(colored("   You can uninstall manually via Programs & Features", Colors.CYAN))
+            
+            # Step 4: Install Red Hat VirtIO drivers
+            print(colored("\n▶️  Step 4: Installing Red Hat VirtIO drivers...", Colors.BOLD))
+            print("   (Downloading ISO from Fedora and installing drivers)")
+            
+            try:
+                print("   📦 This may take 2-5 minutes (downloading ~500MB ISO)...")
+                success, installed, skipped, failed = post_config.install_virtio_redhat()
+                
+                if success:
+                    print(colored(f"   ✅ VirtIO drivers installed: {installed} new, {skipped} already present", Colors.GREEN))
+                else:
+                    print(colored(f"   ⚠️  Some drivers failed to install: {failed}", Colors.YELLOW))
+                    print(colored("   Check log: C:\\temp\\virtio-install.log", Colors.CYAN))
+                    
+            except Exception as e:
+                print(colored(f"   ⚠️  VirtIO install error: {e}", Colors.YELLOW))
+                print(colored("   You can install manually from: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
+            
+            # Step 5: Apply network configuration (LAST - after drivers are installed)
+            print(colored("\n▶️  Step 5: Applying network configuration...", Colors.BOLD))
+            print("   (Now that new VirtIO network drivers are installed)")
+            
+            # Need to reconnect - drivers installation may have changed network
+            print("   🔄 Waiting 10s for new drivers to stabilize...")
+            time.sleep(10)
+            
+            # Try to reconnect
+            reconnected = False
+            for attempt in range(3):
+                try:
+                    client = WinRMClient(
+                        host=connect_host,
+                        username=username,
+                        password=password,
+                        transport=transport
+                    )
+                    if client.test_connection():
+                        reconnected = True
+                        print(colored("   ✅ Reconnected to VM", Colors.GREEN))
+                        break
+                except Exception as e:
+                    print(f"   ⏳ Reconnection attempt {attempt + 1}/3...")
+                    time.sleep(5)
+            
+            if not reconnected:
+                print(colored("   ⚠️  Could not reconnect - network config must be done manually", Colors.YELLOW))
+                print(colored("   The VM should still be accessible via console", Colors.CYAN))
+            else:
+                for iface in static_interfaces:
+                    iface_name = iface.get('name', 'Ethernet')
+                    ip = iface.get('ip')
+                    prefix = iface.get('prefix', 24)
+                    gateway = iface.get('gateway', '')
+                    dns_list = iface.get('dns', [])
+                    
+                    print(f"\n   Configuring {iface_name}...")
+                    
+                    ps_script = f'''
 $ErrorActionPreference = "Continue"
 $logFile = "C:\\temp\\network-reconfig.log"
 
@@ -2935,84 +3003,52 @@ try {{
     throw
 }}
 '''
-                try:
-                    stdout, stderr, rc = client.run_powershell(ps_script)
-                    
-                    if rc == 0 and "SUCCESS" in stdout:
-                        print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
-                    elif "SUCCESS" in stdout:
-                        # rc might be -1 due to connection reset when IP changes
-                        print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
-                        print(colored("      (Connection reset expected when IP changes)", Colors.CYAN))
-                    else:
-                        print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
-                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-                        if stdout:
-                            print(f"      Output: {stdout[:200]}")
-                except Exception as e:
-                    # Connection reset is expected when changing network
-                    if "Connection reset" in str(e) or "WinRM" in str(e):
-                        print(colored(f"   ✅ {iface_name} likely configured (connection reset)", Colors.GREEN))
-                        print(colored("      This is normal when changing IP - connection to old IP breaks", Colors.CYAN))
-                    else:
-                        print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
-                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-            
-            # Step 4: Uninstall Nutanix Guest Tools
-            print(colored("\n▶️  Step 4: Uninstalling Nutanix Guest Tools...", Colors.BOLD))
-            
-            try:
-                # Reconnect if needed (after IP change, we may have lost connection)
-                original_ip = static_interfaces[0].get('ip') if static_interfaces else None
-                
-                if original_ip:
-                    # Try to reconnect using the new static IP
                     try:
-                        client = WinRMClient(
-                            original_ip,
-                            username=username,
-                            password=password,
-                            transport=transport
-                        )
-                        client.test_connection()
-                        print(colored(f"   ✅ Reconnected via {original_ip}", Colors.GREEN))
+                        stdout, stderr, rc = client.run_powershell(ps_script)
+                        
+                        if rc == 0 and "SUCCESS" in stdout:
+                            print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                        elif "SUCCESS" in stdout:
+                            # rc might be -1 due to connection reset when IP changes
+                            print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                            print(colored("      (Connection reset expected when IP changes)", Colors.CYAN))
+                        else:
+                            print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
+                            print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
+                            if stdout:
+                                print(f"      Output: {stdout[:200]}")
                     except Exception as e:
-                        print(colored(f"   ⚠️  Could not reconnect: {e}", Colors.YELLOW))
-                        print(colored("   Skipping NGT uninstall - do it manually later", Colors.YELLOW))
-                        client = None
-                
-                if client:
-                    post_config = WindowsPostConfig(client)
-                    
-                    # Uninstall NGT
-                    print("   🗑️  Removing Nutanix Guest Tools...")
-                    ngt_result = post_config.uninstall_ngt()
-                    if ngt_result:
-                        print(colored("   ✅ Nutanix Guest Tools removed", Colors.GREEN))
-                    else:
-                        print(colored("   ⚠️  NGT removal returned non-zero (may already be absent)", Colors.YELLOW))
-                    
-            except Exception as e:
-                print(colored(f"   ⚠️  NGT uninstall error: {e}", Colors.YELLOW))
-                print(colored("   You can uninstall manually via Programs & Features", Colors.CYAN))
+                        # Connection reset is expected when changing network
+                        if "Connection reset" in str(e) or "WinRM" in str(e):
+                            print(colored(f"   ✅ {iface_name} likely configured (connection reset)", Colors.GREEN))
+                            print(colored("      This is normal when changing IP - connection to old IP breaks", Colors.CYAN))
+                        else:
+                            print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
+                            print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
             
             # Final message
             original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
             
-            print(colored("\n" + "="*50, Colors.GREEN))
+            print(colored("\n" + "="*60, Colors.GREEN))
             print(colored("🎉 MIGRATION COMPLETE!", Colors.GREEN))
-            print(colored("="*50, Colors.GREEN))
+            print(colored("="*60, Colors.GREEN))
             print(f"\n   VM: {vm_name}")
             print(f"   FQDN: {vm_fqdn}")
             print(f"   Static IP: {original_ip}")
-            print(colored("\n   ✅ Network configured", Colors.GREEN))
-            print(colored("   ✅ Nutanix Guest Tools removed", Colors.GREEN))
+            print(colored("\n   ✅ Nutanix software removed", Colors.GREEN))
+            print(colored("   ✅ Red Hat VirtIO drivers installed", Colors.GREEN))
+            print(colored("   ✅ Network configured", Colors.GREEN))
             print(colored("\n   The VM should now be accessible at its original IP address.", Colors.CYAN))
             print(colored("\n💡 Verify:", Colors.YELLOW))
             print(f"   ping {original_ip}")
             print(f"   ping {vm_fqdn}")
-            print(colored("\n💡 If network config failed, check log on VM:", Colors.YELLOW))
+            print(colored("\n💡 Check logs on VM if issues:", Colors.YELLOW))
+            print("   C:\\temp\\nutanix-uninstall.log")
+            print("   C:\\temp\\virtio-install.log")
             print("   C:\\temp\\network-reconfig.log")
+            print(colored("\n💡 Optional next steps:", Colors.YELLOW))
+            print("   - Switch disk bus from SATA to VirtIO (Menu Harvester → 12)")
+            print("   - Reboot VM to ensure all drivers are active")
             print(colored("\n💡 Cleanup when confirmed working:", Colors.YELLOW))
             print("   - Delete Nutanix export images (staging)")
             print("   - Delete Harvester source images")

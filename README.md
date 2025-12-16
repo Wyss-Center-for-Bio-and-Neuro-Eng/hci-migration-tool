@@ -174,9 +174,12 @@ python3 migrate.py
 | Step | Menu | Option | Description |
 |------|------|--------|-------------|
 | 1.1 | Windows (4) | 2 | **Pre-migration check** → Connect via WinRM, collect config |
-| 1.2 | Windows (4) | 2 | **Install prerequisites** → VirtIO drivers + QEMU Guest Agent |
-| 1.3 | Windows (4) | 2 | **Reboot** → Activate drivers, verify installation |
-| 1.4 | Windows (4) | 5 | **Stop services** → Stop application services (optional) |
+| 1.2 | Windows (4) | 2 | **Install QEMU Guest Agent** → Only QEMU GA (NO VirtIO drivers!) |
+| 1.3 | Windows (4) | 5 | **Stop services** → Stop application services (optional) |
+
+**⚠️ IMPORTANT:** Do NOT install VirtIO drivers before migration!
+- Nutanix VirtIO drivers are NOT compatible with Harvester/KVM
+- VirtIO drivers will be installed AFTER migration
 
 **Result:** VM config saved to `/mnt/data/migrations/<hostname>/vm-config.json`
 
@@ -200,29 +203,79 @@ python3 migrate.py
 | Step | Menu | Option | Description |
 |------|------|--------|-------------|
 | 3.1 | Migration (3) | 6 | **Import image** → Upload QCOW2 to Harvester |
-| 3.2 | Migration (3) | 7 | **Create VM** → Uses saved config (CPU, RAM, disks, network) |
+| 3.2 | Migration (3) | 7 | **Create VM** → Uses SATA bus (for safe boot without VirtIO) |
 
-**Result:** VM created in Harvester (powered off)
+**Result:** VM created in Harvester (boots automatically with SATA)
 
 ### PHASE 4 - POST-MIGRATION (Target VM on Harvester)
 
 | Step | Menu | Option | Description |
 |------|------|--------|-------------|
-| 4.1 | Harvester (2) | 2 | **Start VM** on Harvester |
-| 4.2 | Windows (4) | 8 | **Auto-configure network** → Apply static IP from saved config |
-| 4.3 | Windows (4) | 6 | **Start services** → Restart application services |
-| 4.4 | - | - | **Uninstall Nutanix tools** (TODO - manual for now) |
+| 4.1 | - | - | VM boots automatically with SATA bus |
+| 4.2 | Windows (4) | 8 | **Auto post-migration** → Executes the following sequence: |
 
-**Result:** VM running on Harvester with original IP address!
+**Post-migration sequence (automatic):**
+1. ⏳ Wait for VM to boot (ping FQDN)
+2. 🔌 Connect via WinRM
+3. 🗑️ **Uninstall ALL Nutanix software** (Guest Tools, VirtIO, VM Mobility)
+4. 📦 **Install Red Hat VirtIO drivers** (download ISO from Fedora)
+5. 🌐 **Configure network** (apply static IP from saved config)
 
-### PHASE 5 - CLEANUP (Optional)
+**Result:** VM running on Harvester with original IP address and proper VirtIO drivers!
+
+### PHASE 5 - OPTIMIZATION (Optional)
 
 | Step | Menu | Option | Description |
 |------|------|--------|-------------|
-| 5.1 | Harvester (2) | 5 | **Dissociate from image** → Clone volume to remove dependency |
-| 5.2 | Harvester (2) | 7 | **Delete Harvester image** |
-| 5.3 | Nutanix (1) | 7 | **Delete Nutanix export image** |
-| 5.4 | Migration (3) | 8 | **Delete staging files** (RAW/QCOW2) |
+| 5.1 | Harvester (2) | 12 | **Switch disk bus** → SATA → VirtIO (better performance) |
+| 5.2 | - | - | **Reboot VM** to activate VirtIO disk drivers |
+
+### PHASE 6 - CLEANUP (Optional)
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 6.1 | Harvester (2) | 5 | **Dissociate from image** → Clone volume to remove dependency |
+| 6.2 | Harvester (2) | 7 | **Delete Harvester image** |
+| 6.3 | Nutanix (1) | 7 | **Delete Nutanix export image** |
+| 6.4 | Migration (3) | 8 | **Delete staging files** (RAW/QCOW2) |
+
+---
+
+## Post-Migration Workflow Explained
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  PRÉ-MIGRATION (Nutanix, VM ON)                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│  • Collecter config (CPU, RAM, réseau, disques)                     │
+│  • Installer QEMU Guest Agent seulement (PAS VirtIO!)               │
+│  • PAS de reboot nécessaire                                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  MIGRATION                                                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  • Export NFS → Convert → Import                                    │
+│  • Créer VM avec bus SATA (boot sûr)                                │
+│  • La VM démarre automatiquement                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│  POST-MIGRATION (Harvester, VM ON, bus SATA)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Ping FQDN → attendre que la VM réponde                          │
+│  2. Connexion WinRM                                                 │
+│  3. 🗑️ Désinstaller outils Nutanix (AVANT réseau!)                  │
+│  4. 📦 Installer drivers VirtIO Red Hat                             │
+│  5. 🌐 Configurer réseau statique (EN DERNIER)                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  OPTIMISATION (Optionnel)                                           │
+├─────────────────────────────────────────────────────────────────────┤
+│  • Switch disk bus SATA → VirtIO (meilleures performances)          │
+│  • Reboot pour activer les drivers VirtIO disque                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why this order matters:**
+- Uninstalling Nutanix VirtIO drivers may break network temporarily
+- Installing Red Hat VirtIO drivers restores network capability
+- Network config MUST be last, after new drivers are installed
 
 ---
 
@@ -290,14 +343,15 @@ python3 migrate.py
 | Option | Description |
 |--------|-------------|
 | 1 | Check WinRM/Prerequisites |
-| 2 | **Pre-migration check** (collect config + install VirtIO/QEMU-GA) |
+| 2 | **Pre-migration check** (collect config + install QEMU-GA only) |
 | 3 | View VM config |
 | 4 | Download virtio/qemu-ga tools |
 | 5 | **Stop services** (pre-migration) |
 | 6 | **Start services** (post-migration) |
 | 7 | Generate post-migration script |
-| 8 | **Post-migration auto-configure** |
+| 8 | **Post-migration auto-configure** (uninstall Nutanix → install VirtIO → config network) |
 | 9 | Vault management |
+| 10 | Install Red Hat VirtIO drivers (standalone) |
 
 ---
 
@@ -532,7 +586,7 @@ The tool uses Nutanix API v2 `/vms/?include_vm_disk_config=true` to retrieve:
 
 ## TODO / Future Improvements
 
-- [ ] Uninstall Nutanix tools post-migration (automated)
+- [x] Uninstall Nutanix tools post-migration (automated) ✅
 - [ ] Full migration option (single command)
 - [ ] Linux VM support
 - [ ] Parallel disk export for multi-disk VMs

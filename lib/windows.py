@@ -822,9 +822,370 @@ if ($ngtUninstall) {
 }
 '''
 
+    # Script to uninstall ALL Nutanix software (Guest Tools, VirtIO, VM Mobility)
+    PS_UNINSTALL_ALL_NUTANIX = r'''
+$ErrorActionPreference = "Continue"
+$logFile = "C:\temp\nutanix-uninstall.log"
+
+# Ensure log directory exists
+if (-not (Test-Path "C:\temp")) {
+    New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
+}
+
+function Log {
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}
+
+Log "=========================================="
+Log "Nutanix Software Uninstallation Started"
+Log "=========================================="
+
+# List of Nutanix software patterns to uninstall
+$nutanixPatterns = @(
+    "*Nutanix*Guest*",
+    "*Nutanix*VirtIO*",
+    "*Nutanix*VM*Mobility*",
+    "*Nutanix*Frame*",
+    "*Nutanix*Move*"
+)
+
+$uninstalledCount = 0
+$failedCount = 0
+
+# Search in both 32-bit and 64-bit registry locations
+$registryPaths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+
+foreach ($regPath in $registryPaths) {
+    foreach ($pattern in $nutanixPatterns) {
+        $apps = Get-ItemProperty $regPath -ErrorAction SilentlyContinue | 
+            Where-Object { $_.DisplayName -like $pattern }
+        
+        foreach ($app in $apps) {
+            $displayName = $app.DisplayName
+            $uninstallString = $app.UninstallString
+            
+            if ($uninstallString) {
+                Log "Uninstalling: $displayName"
+                Log "  Uninstall string: $uninstallString"
+                
+                try {
+                    if ($uninstallString -match "msiexec") {
+                        # MSI-based uninstall
+                        $productCode = $uninstallString -replace '.*({[^}]+}).*', '$1'
+                        if ($productCode -match '{.*}') {
+                            Log "  Using MSI product code: $productCode"
+                            $proc = Start-Process msiexec.exe -ArgumentList "/x $productCode /qn /norestart" -Wait -NoNewWindow -PassThru
+                            if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                                Log "  SUCCESS: $displayName uninstalled (exit code: $($proc.ExitCode))"
+                                $uninstalledCount++
+                            } else {
+                                Log "  WARNING: Exit code $($proc.ExitCode) for $displayName"
+                                $failedCount++
+                            }
+                        }
+                    } else {
+                        # EXE-based uninstall
+                        Log "  Using EXE uninstaller"
+                        $proc = Start-Process $uninstallString -ArgumentList "/S /NORESTART" -Wait -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                        if ($proc -and ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010)) {
+                            Log "  SUCCESS: $displayName uninstalled"
+                            $uninstalledCount++
+                        } else {
+                            # Try without arguments
+                            $proc = Start-Process $uninstallString -Wait -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                            if ($proc) {
+                                Log "  Completed: $displayName (exit code: $($proc.ExitCode))"
+                                $uninstalledCount++
+                            }
+                        }
+                    }
+                } catch {
+                    Log "  ERROR: Failed to uninstall $displayName - $($_.Exception.Message)"
+                    $failedCount++
+                }
+            }
+        }
+    }
+}
+
+# Also try WMI-based uninstall for any remaining Nutanix products
+Log "Checking for remaining Nutanix products via WMI..."
+try {
+    $wmiProducts = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue | 
+        Where-Object { $_.Name -like "*Nutanix*" }
+    
+    foreach ($product in $wmiProducts) {
+        Log "Found via WMI: $($product.Name)"
+        try {
+            $result = $product.Uninstall()
+            if ($result.ReturnValue -eq 0) {
+                Log "  SUCCESS: $($product.Name) uninstalled via WMI"
+                $uninstalledCount++
+            } else {
+                Log "  WARNING: WMI uninstall returned $($result.ReturnValue)"
+            }
+        } catch {
+            Log "  ERROR: WMI uninstall failed - $($_.Exception.Message)"
+        }
+    }
+} catch {
+    Log "WMI query failed (may not have Nutanix products): $($_.Exception.Message)"
+}
+
+Log "=========================================="
+Log "Uninstallation Summary"
+Log "  Uninstalled: $uninstalledCount"
+Log "  Failed: $failedCount"
+Log "=========================================="
+
+# Return result
+if ($uninstalledCount -gt 0) {
+    Write-Output "UNINSTALLED:$uninstalledCount"
+} elseif ($failedCount -eq 0) {
+    Write-Output "NONE_FOUND"
+} else {
+    Write-Output "FAILED:$failedCount"
+}
+'''
+
+    # Script to install Red Hat VirtIO drivers from ISO
+    PS_INSTALL_VIRTIO_REDHAT = r'''
+$ErrorActionPreference = "Continue"
+$logFile = "C:\temp\virtio-install.log"
+
+# Ensure log directory exists
+if (-not (Test-Path "C:\temp")) {
+    New-Item -ItemType Directory -Path "C:\temp" -Force | Out-Null
+}
+
+function Log {
+    param([string]$msg)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
+}
+
+Log "=========================================="
+Log "Red Hat VirtIO Drivers Installation"
+Log "=========================================="
+
+# Determine Windows version for driver folder
+$osVersion = [System.Environment]::OSVersion.Version
+$osBuild = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuild
+
+Log "OS Version: $($osVersion.Major).$($osVersion.Minor) Build $osBuild"
+
+# Map to virtio-win driver folder names
+$driverFolder = switch -Regex ($osBuild) {
+    "^(9200|9600)$"     { "2k12R2" }    # Server 2012 R2
+    "^1(0240|4393)$"    { "2k16" }       # Server 2016
+    "^1(7763|8362|8363)$" { "2k19" }     # Server 2019
+    "^20348$"           { "2k22" }       # Server 2022
+    "^2(2000|2621|2631|6100)$" { "2k25" } # Server 2025 / Windows 11
+    default { 
+        if ([int]$osBuild -ge 22000) { "2k22" }  # Fallback for newer
+        else { "2k19" }  # Fallback for older
+    }
+}
+
+Log "Using driver folder: $driverFolder"
+
+# Download VirtIO ISO if not present
+$isoUrl = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+$isoPath = "C:\temp\virtio-win.iso"
+
+if (-not (Test-Path $isoPath)) {
+    Log "Downloading VirtIO ISO..."
+    try {
+        # Try with BITS first (better for large files)
+        Import-Module BitsTransfer -ErrorAction SilentlyContinue
+        Start-BitsTransfer -Source $isoUrl -Destination $isoPath -ErrorAction Stop
+        Log "Downloaded via BITS"
+    } catch {
+        # Fallback to WebClient
+        Log "BITS failed, trying WebClient..."
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($isoUrl, $isoPath)
+            Log "Downloaded via WebClient"
+        } catch {
+            Log "ERROR: Failed to download ISO - $($_.Exception.Message)"
+            Write-Output "DOWNLOAD_FAILED"
+            exit 1
+        }
+    }
+} else {
+    Log "ISO already exists at $isoPath"
+}
+
+# Mount the ISO
+Log "Mounting ISO..."
+try {
+    $mountResult = Mount-DiskImage -ImagePath $isoPath -PassThru -ErrorAction Stop
+    $driveLetter = ($mountResult | Get-Volume).DriveLetter
+    Log "Mounted at drive $driveLetter`:"
+} catch {
+    Log "ERROR: Failed to mount ISO - $($_.Exception.Message)"
+    Write-Output "MOUNT_FAILED"
+    exit 1
+}
+
+# Driver categories to install
+$driverCategories = @(
+    @{Name="NetKVM"; Desc="Network (virtio-net)"},
+    @{Name="vioscsi"; Desc="SCSI Controller"},
+    @{Name="viostor"; Desc="Block Storage"},
+    @{Name="vioserial"; Desc="Serial Port (Guest Agent)"},
+    @{Name="Balloon"; Desc="Memory Balloon"},
+    @{Name="viogpudo"; Desc="GPU"},
+    @{Name="viorng"; Desc="RNG"},
+    @{Name="pvpanic"; Desc="PV Panic"},
+    @{Name="fwcfg"; Desc="FW Config"},
+    @{Name="vioinput"; Desc="Input"}
+)
+
+$installed = 0
+$skipped = 0
+$failed = 0
+
+foreach ($driver in $driverCategories) {
+    $driverPath = "${driveLetter}:\$($driver.Name)\$driverFolder\amd64"
+    
+    if (Test-Path $driverPath) {
+        Log "Installing $($driver.Name) ($($driver.Desc))..."
+        $infFiles = Get-ChildItem -Path $driverPath -Filter "*.inf" -ErrorAction SilentlyContinue
+        
+        foreach ($inf in $infFiles) {
+            try {
+                $result = pnputil.exe /add-driver $inf.FullName /install 2>&1
+                if ($LASTEXITCODE -eq 0 -or $result -match "successfully") {
+                    Log "  Installed: $($inf.Name)"
+                    $installed++
+                } elseif ($result -match "already exists") {
+                    Log "  Skipped (exists): $($inf.Name)"
+                    $skipped++
+                } else {
+                    Log "  Warning: $($inf.Name) - $result"
+                    $failed++
+                }
+            } catch {
+                Log "  Error installing $($inf.Name): $($_.Exception.Message)"
+                $failed++
+            }
+        }
+    } else {
+        Log "Driver path not found: $driverPath"
+        # Try without version folder
+        $altPath = "${driveLetter}:\$($driver.Name)\amd64"
+        if (Test-Path $altPath) {
+            Log "  Trying alternate path: $altPath"
+            $infFiles = Get-ChildItem -Path $altPath -Filter "*.inf" -ErrorAction SilentlyContinue
+            foreach ($inf in $infFiles) {
+                try {
+                    pnputil.exe /add-driver $inf.FullName /install 2>&1 | Out-Null
+                    Log "  Installed from alt path: $($inf.Name)"
+                    $installed++
+                } catch {
+                    $failed++
+                }
+            }
+        }
+    }
+}
+
+# Install guest-tools MSI if present
+$guestToolsMsi = "${driveLetter}:\virtio-win-gt-x64.msi"
+if (Test-Path $guestToolsMsi) {
+    Log "Installing virtio-win-guest-tools MSI..."
+    try {
+        $proc = Start-Process msiexec.exe -ArgumentList "/i `"$guestToolsMsi`" /qn /norestart" -Wait -NoNewWindow -PassThru
+        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+            Log "Guest tools MSI installed successfully"
+            $installed++
+        } else {
+            Log "Guest tools MSI exit code: $($proc.ExitCode)"
+        }
+    } catch {
+        Log "Failed to install guest tools MSI: $($_.Exception.Message)"
+    }
+}
+
+# Unmount ISO
+Log "Unmounting ISO..."
+try {
+    Dismount-DiskImage -ImagePath $isoPath -ErrorAction SilentlyContinue
+    Log "ISO unmounted"
+} catch {
+    Log "Warning: Could not unmount ISO"
+}
+
+# Restart QEMU Guest Agent service if present
+$qemuga = Get-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue
+if ($qemuga) {
+    Log "Restarting QEMU Guest Agent service..."
+    Restart-Service -Name "QEMU-GA" -Force -ErrorAction SilentlyContinue
+    Log "QEMU-GA service restarted"
+}
+
+Log "=========================================="
+Log "Installation Summary"
+Log "  Installed: $installed"
+Log "  Skipped: $skipped"  
+Log "  Failed: $failed"
+Log "=========================================="
+
+Write-Output "INSTALLED:$installed,SKIPPED:$skipped,FAILED:$failed"
+'''
+
     def __init__(self, client: WinRMClient):
         """Initialize with WinRM client."""
         self.client = client
+    
+    def uninstall_all_nutanix(self) -> Tuple[bool, int, int]:
+        """
+        Uninstall ALL Nutanix software (Guest Tools, VirtIO, VM Mobility).
+        
+        Returns:
+            Tuple of (success, uninstalled_count, failed_count)
+        """
+        stdout, stderr, rc = self.client.run_powershell(self.PS_UNINSTALL_ALL_NUTANIX)
+        
+        if "UNINSTALLED:" in stdout:
+            count = int(stdout.split("UNINSTALLED:")[1].strip())
+            return (True, count, 0)
+        elif "NONE_FOUND" in stdout:
+            return (True, 0, 0)
+        elif "FAILED:" in stdout:
+            count = int(stdout.split("FAILED:")[1].strip())
+            return (False, 0, count)
+        else:
+            return (rc == 0, 0, 0)
+    
+    def install_virtio_redhat(self) -> Tuple[bool, int, int, int]:
+        """
+        Install Red Hat VirtIO drivers from ISO.
+        
+        Returns:
+            Tuple of (success, installed_count, skipped_count, failed_count)
+        """
+        stdout, stderr, rc = self.client.run_powershell(self.PS_INSTALL_VIRTIO_REDHAT)
+        
+        if "INSTALLED:" in stdout:
+            # Parse "INSTALLED:X,SKIPPED:Y,FAILED:Z"
+            parts = stdout.strip().split(",")
+            installed = int(parts[0].split(":")[1]) if len(parts) > 0 else 0
+            skipped = int(parts[1].split(":")[1]) if len(parts) > 1 else 0
+            failed = int(parts[2].split(":")[1]) if len(parts) > 2 else 0
+            return (failed == 0, installed, skipped, failed)
+        elif "DOWNLOAD_FAILED" in stdout or "MOUNT_FAILED" in stdout:
+            return (False, 0, 0, 1)
+        else:
+            return (rc == 0, 0, 0, 0)
     
     def apply_network_config(self, config: NetworkConfig) -> bool:
         """
