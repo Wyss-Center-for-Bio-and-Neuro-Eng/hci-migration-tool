@@ -2255,8 +2255,8 @@ class MigrationTool:
             boot = default_boot
             print(colored(f"   ✅ Using {boot}", Colors.GREEN))
         
-        # Storage Class selection
-        print(colored("\n💾 Storage Class Selection:", Colors.BOLD))
+        # Storage Class selection - PER DISK
+        print(colored("\n💾 Storage Class Selection (per disk):", Colors.BOLD))
         
         all_scs = self.harvester.list_storage_classes()
         
@@ -2298,16 +2298,25 @@ class MigrationTool:
             print(f"     {i}. {sc_name} ({replicas} replica(s)){default_marker}")
         
         default_choice = str(default_sc_idx) if default_sc_idx else "1"
-        sc_choice = self.input_prompt(f"   Storage class [{default_choice}]")
-        sc_choice = sc_choice if sc_choice else default_choice
         
-        try:
-            sc_idx = int(sc_choice) - 1
-            selected_storage_class = valid_scs[sc_idx].get('metadata', {}).get('name')
-        except:
-            selected_storage_class = valid_scs[0].get('metadata', {}).get('name')
+        # Ask for storage class for each disk
+        disk_storage_classes = []
+        print(colored("\n   Select storage class for each disk:", Colors.CYAN))
         
-        print(colored(f"   ✅ Using storage class: {selected_storage_class}", Colors.GREEN))
+        for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
+            img_name = img['name']
+            prompt_text = f"   Disk {i} ({img_name}, {size}GB) - Storage class [{default_choice}]"
+            sc_choice = self.input_prompt(prompt_text)
+            sc_choice = sc_choice if sc_choice else default_choice
+            
+            try:
+                sc_idx = int(sc_choice) - 1
+                selected_sc = valid_scs[sc_idx].get('metadata', {}).get('name')
+            except:
+                selected_sc = valid_scs[int(default_choice) - 1].get('metadata', {}).get('name')
+            
+            disk_storage_classes.append(selected_sc)
+            print(colored(f"      → {selected_sc}", Colors.GREEN))
         
         # Disk bus selection
         print(colored("\n💾 Disk Bus Selection:", Colors.BOLD))
@@ -2342,10 +2351,10 @@ class MigrationTool:
         print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
         print(f"   Name: {vm_name}")
         print(f"   Namespace: {namespace}")
-        print(f"   Storage class: {selected_storage_class}")
         print(f"   Disks: {num_disks}")
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
-            print(f"      Disk {i}: {img['name']} - {size} GB")
+            sc = disk_storage_classes[i]
+            print(f"      Disk {i}: {img['name']} - {size} GB - SC: {sc}")
         print(f"   Disk bus: {disk_bus}")
         print(f"   Network interfaces: {len(nic_configs)}")
         for i, nic in enumerate(nic_configs):
@@ -2385,10 +2394,10 @@ class MigrationTool:
             img_name = img['name']
             img_ns = img['namespace']
             
-            # The image's storage class
-            image_storage_class = f"longhorn-{img_name}"
+            # Use the storage class selected for this disk
+            selected_sc = disk_storage_classes[i]
             
-            print(f"   Volume {volume_name} from image {img_ns}/{img_name}")
+            print(f"   Volume {volume_name} from image {img_ns}/{img_name} → SC: {selected_sc}")
             
             # Disk spec
             disk_spec = {
@@ -2426,7 +2435,7 @@ class MigrationTool:
                         }
                     },
                     "volumeMode": "Block",
-                    "storageClassName": image_storage_class
+                    "storageClassName": selected_sc
                 }
             })
         
@@ -2492,12 +2501,12 @@ class MigrationTool:
                     },
                     "annotations": {
                         "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
-                        "harvesterhci.io/vmRunStrategy": "Halted",
+                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
                         "network.harvesterhci.io/ips": "[]"
                     }
                 },
                 "spec": {
-                    "runStrategy": "Halted",
+                    "runStrategy": "RerunOnFailure",
                     "template": {
                         "metadata": {
                             "labels": {
@@ -2949,6 +2958,44 @@ try {{
                         print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
                         print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
             
+            # Step 4: Uninstall Nutanix Guest Tools
+            print(colored("\n▶️  Step 4: Uninstalling Nutanix Guest Tools...", Colors.BOLD))
+            
+            try:
+                # Reconnect if needed (after IP change, we may have lost connection)
+                original_ip = static_interfaces[0].get('ip') if static_interfaces else None
+                
+                if original_ip:
+                    # Try to reconnect using the new static IP
+                    try:
+                        client = WinRMClient(
+                            original_ip,
+                            username=username,
+                            password=password,
+                            transport=transport
+                        )
+                        client.test_connection()
+                        print(colored(f"   ✅ Reconnected via {original_ip}", Colors.GREEN))
+                    except Exception as e:
+                        print(colored(f"   ⚠️  Could not reconnect: {e}", Colors.YELLOW))
+                        print(colored("   Skipping NGT uninstall - do it manually later", Colors.YELLOW))
+                        client = None
+                
+                if client:
+                    post_config = WindowsPostConfig(client)
+                    
+                    # Uninstall NGT
+                    print("   🗑️  Removing Nutanix Guest Tools...")
+                    ngt_result = post_config.uninstall_ngt()
+                    if ngt_result:
+                        print(colored("   ✅ Nutanix Guest Tools removed", Colors.GREEN))
+                    else:
+                        print(colored("   ⚠️  NGT removal returned non-zero (may already be absent)", Colors.YELLOW))
+                    
+            except Exception as e:
+                print(colored(f"   ⚠️  NGT uninstall error: {e}", Colors.YELLOW))
+                print(colored("   You can uninstall manually via Programs & Features", Colors.CYAN))
+            
             # Final message
             original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
             
@@ -2958,16 +3005,18 @@ try {{
             print(f"\n   VM: {vm_name}")
             print(f"   FQDN: {vm_fqdn}")
             print(f"   Static IP: {original_ip}")
+            print(colored("\n   ✅ Network configured", Colors.GREEN))
+            print(colored("   ✅ Nutanix Guest Tools removed", Colors.GREEN))
             print(colored("\n   The VM should now be accessible at its original IP address.", Colors.CYAN))
             print(colored("\n💡 Verify:", Colors.YELLOW))
             print(f"   ping {original_ip}")
             print(f"   ping {vm_fqdn}")
             print(colored("\n💡 If network config failed, check log on VM:", Colors.YELLOW))
             print("   C:\\temp\\network-reconfig.log")
-            print(colored("\n💡 Don't forget to:", Colors.YELLOW))
-            print("   - Test connectivity to the VM")
-            print("   - Delete Nutanix export images when confirmed working")
-            print("   - Delete Harvester source images when confirmed working")
+            print(colored("\n💡 Cleanup when confirmed working:", Colors.YELLOW))
+            print("   - Delete Nutanix export images (staging)")
+            print("   - Delete Harvester source images")
+            print("   - Power off source VM on Nutanix")
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
