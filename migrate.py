@@ -4433,6 +4433,22 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
             config.save(config_path)
             
             # Add Nutanix VM info (boot_type, cpu, ram) to the saved config
+            # Auto-connect to Nutanix if not already connected
+            if not self.nutanix:
+                print(colored("\n   🔗 Connecting to Nutanix to get VM boot type...", Colors.CYAN))
+                try:
+                    nutanix_config = self.config.get('nutanix', {})
+                    if nutanix_config.get('prism_central'):
+                        self.nutanix = NutanixClient(
+                            host=nutanix_config['prism_central'],
+                            username=nutanix_config.get('username'),
+                            password=nutanix_config.get('password'),
+                            verify_ssl=nutanix_config.get('verify_ssl', False)
+                        )
+                        print(colored("   ✅ Connected to Nutanix", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not connect to Nutanix: {e}", Colors.YELLOW))
+            
             if self.nutanix:
                 try:
                     nutanix_vm = self.nutanix.get_vm_by_name(config.hostname)
@@ -4455,8 +4471,12 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
                             json.dump(saved_config, f, indent=2)
                         
                         print(colored(f"   ✅ Added Nutanix info: Boot={vm_info.get('boot_type')}, CPU={vm_info.get('vcpu')}, RAM={vm_info.get('memory_mb')//1024}GB", Colors.GREEN))
+                    else:
+                        print(colored(f"   ⚠️  VM '{config.hostname}' not found in Nutanix", Colors.YELLOW))
                 except Exception as e:
                     print(colored(f"   ⚠️  Could not get Nutanix VM info: {e}", Colors.YELLOW))
+            else:
+                print(colored("   ⚠️  Nutanix not configured - boot_type will need to be set manually", Colors.YELLOW))
             
             print(colored(f"\n   💾 Configuration saved: {config_path}", Colors.GREEN))
             
