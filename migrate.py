@@ -4301,13 +4301,22 @@ Log "=========================================="
             # Only list MAIN programs visible in Programs and Features, not sub-components
             print(colored("\n🔧 NUTANIX TOOLS INSTALLED (to remove post-migration)", Colors.BOLD))
             
-            # These are the main programs that appear in Programs and Features
-            # Sub-components like "Infrastructure Components", "VSS Modules", etc.
-            # are removed automatically when uninstalling the main programs
+            # These are the ONLY main programs that appear in Programs and Features
+            # Everything else (Infrastructure Components, VSS Modules, Guest Agent, etc.)
+            # are sub-components that get removed automatically
             main_nutanix_programs = [
                 "Nutanix Guest Tools",
                 "Nutanix VirtIO", 
                 "Nutanix VM Mobility"
+            ]
+            
+            # Sub-components to EXCLUDE (not visible in Programs and Features)
+            exclude_patterns = [
+                "Infrastructure Components",
+                "VSS Modules",
+                "Guest Agent",
+                "Checks & Prereqs",
+                "Self Service Restore"
             ]
             
             # Check for Nutanix software via registry - only main programs
@@ -4327,11 +4336,20 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
                         name = name.strip()
                         version = version.strip()
                         
-                        # Only include main programs, not sub-components
+                        # Exclude sub-components
+                        is_subcomponent = False
+                        for pattern in exclude_patterns:
+                            if pattern in name:
+                                is_subcomponent = True
+                                break
+                        
+                        if is_subcomponent:
+                            continue
+                        
+                        # Only include if it's a main program
                         is_main_program = False
                         for main_prog in main_nutanix_programs:
-                            # Exact match or starts with main program name (for versioned names)
-                            if name == main_prog or name.startswith(main_prog + " "):
+                            if name.startswith(main_prog):
                                 is_main_program = True
                                 break
                         
@@ -4344,7 +4362,6 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
                 for tool in nutanix_tools:
                     print(f"   • {tool}")
                 print(colored(f"\n   ℹ️  {len(nutanix_tools)} Nutanix program(s) to remove after migration", Colors.CYAN))
-                print(colored("   ℹ️  Sub-components will be removed automatically", Colors.CYAN))
             else:
                 print("   No Nutanix programs detected")
             
@@ -4408,41 +4425,22 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
                 print(colored("\n🔌 LISTENING SERVICES", Colors.BOLD))
                 print("   No application services listening (only WinRM/RDP)")
             
-            # Migration readiness - only QEMU Guest Agent is required for pre-migration
-            # VirtIO drivers will be installed post-migration (Nutanix VirtIO is incompatible)
+            # Migration readiness - QEMU Guest Agent will be installed post-migration
+            # VirtIO drivers will also be installed post-migration (Nutanix VirtIO is incompatible)
             print(colored("\n📊 PRE-MIGRATION READINESS", Colors.BOLD))
             
-            qemu_ga_ready = config.agents.qemu_guest_agent
+            qemu_ga_installed = config.agents.qemu_guest_agent
             
-            if qemu_ga_ready:
-                print(colored("   ✅ VM is ready for migration!", Colors.GREEN))
-                print(colored("   ℹ️  Note: VirtIO drivers will be installed post-migration", Colors.CYAN))
-                print(colored("   ℹ️  Nutanix tools will be removed post-migration", Colors.CYAN))
-            else:
-                print(colored("   ❌ QEMU Guest Agent not installed", Colors.RED))
-                print(colored("   This is required for Harvester to detect the VM's IP address", Colors.YELLOW))
-                
-                # Offer to install QEMU Guest Agent only
-                install = self.input_prompt("\n   Install QEMU Guest Agent now? (y/n)")
-                if install.lower() == 'y':
-                    self._install_qemu_guest_agent(client, host)
-                    
-                    # Re-check after installation
-                    print("\n   🔄 Re-checking QEMU Guest Agent...")
-                    new_agents = checker.collect_agent_status()
-                    config.agents.qemu_guest_agent = new_agents.get('QEMUGuestAgent', False)
-                    config.agents.qemu_guest_agent_running = new_agents.get('QEMUGuestAgentRunning', False)
-                    config.agents.qemu_guest_agent_autostart = new_agents.get('QEMUGuestAgentAutoStart', False)
-                    
-                    if config.agents.qemu_guest_agent:
-                        print(colored("\n   ✅ QEMU Guest Agent installed - VM is ready for migration!", Colors.GREEN))
-                    else:
-                        print(colored("\n   ⚠️  Installation may need a service restart", Colors.YELLOW))
-                        # Try to start the service
-                        client.run_powershell('Start-Service -Name "QEMU-GA" -ErrorAction SilentlyContinue')
+            print(colored("   ✅ VM is ready for migration!", Colors.GREEN))
+            print(colored("   ℹ️  Post-migration steps (automatic):", Colors.CYAN))
+            print(colored("      1. Uninstall Nutanix tools", Colors.CYAN))
+            print(colored("      2. Install Red Hat VirtIO drivers", Colors.CYAN))
+            if not qemu_ga_installed:
+                print(colored("      3. Install QEMU Guest Agent", Colors.CYAN))
+            print(colored("      4. Configure network", Colors.CYAN))
             
-            # Mark as ready for migration (QEMU GA is the only requirement)
-            config.migration_ready = config.agents.qemu_guest_agent
+            # Mark as ready for migration (no QEMU GA required pre-migration)
+            config.migration_ready = True
             
             # Save config
             staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
