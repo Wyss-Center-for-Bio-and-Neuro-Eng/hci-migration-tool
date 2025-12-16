@@ -2203,22 +2203,32 @@ class MigrationTool:
         default_cpu = vm_info['vcpu'] if vm_info else 2
         default_ram = vm_info['memory_mb'] // 1024 if vm_info else 4
         
-        # Boot type detection - priority: disk analysis > vm-config.json > BIOS default
+        # Boot type detection - priority: vm-config.json > disk analysis > BIOS default
+        # IMPORTANT: vm-config.json contains the ACTUAL boot type from the source VM
+        # Disk analysis (GPT=UEFI) is just a heuristic and can be WRONG (GPT+BIOS is valid!)
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         vm_migration_dir = os.path.join(staging_dir, 'migrations', vm_name.lower())
         disk0_qcow2 = os.path.join(vm_migration_dir, f"{vm_name.lower()}-disk0.qcow2")
         
+        # First check vm-config.json (most reliable source)
+        config_boot = None
+        if vm_info and vm_info.get('boot_type'):
+            config_boot = vm_info['boot_type']
+        
+        # Only detect from disk if no config available
         detected_boot = None
-        if os.path.exists(disk0_qcow2):
+        if not config_boot and os.path.exists(disk0_qcow2):
             print(colored("\n🔍 Detecting boot type from disk...", Colors.CYAN))
             detected_boot = detect_boot_type_from_disk(disk0_qcow2)
             print(colored(f"   Detected: {detected_boot} (from disk partition table)", Colors.GREEN))
+            print(colored(f"   ⚠️  Warning: GPT doesn't always mean UEFI! Check source VM.", Colors.YELLOW))
         
-        # Use detected boot type, or fallback to vm_info, or BIOS default
-        if detected_boot:
+        # Priority: config > detected > BIOS default
+        if config_boot:
+            default_boot = config_boot
+            print(colored(f"\n🔒 Boot Type: {default_boot} (from saved config)", Colors.GREEN))
+        elif detected_boot:
             default_boot = detected_boot
-        elif vm_info and vm_info.get('boot_type'):
-            default_boot = vm_info['boot_type']
         else:
             default_boot = 'BIOS'
         
@@ -2230,12 +2240,15 @@ class MigrationTool:
         
         # Boot type - CRITICAL: must match source disk
         print(colored(f"\n🔒 Boot Type:", Colors.BOLD))
-        if detected_boot:
+        if config_boot:
+            print(colored(f"   From saved config: {default_boot}", Colors.CYAN))
+            print(colored(f"   ✅ This is the ACTUAL boot type from the source VM", Colors.GREEN))
+        elif detected_boot:
             print(colored(f"   Detected from disk: {default_boot}", Colors.CYAN))
-            print(colored(f"   ⚠️  This is determined by the disk partition table (GPT=UEFI, MBR=BIOS)", Colors.YELLOW))
-        elif vm_info:
-            print(colored(f"   From config: {default_boot}", Colors.CYAN))
-            print(colored(f"   ⚠️  Changing boot type will cause boot failure!", Colors.YELLOW))
+            print(colored(f"   ⚠️  Warning: GPT partition doesn't always mean UEFI!", Colors.YELLOW))
+            print(colored(f"   ⚠️  If source VM was BIOS, change this to BIOS!", Colors.YELLOW))
+        else:
+            print(colored(f"   Default: {default_boot}", Colors.CYAN))
         
         print(f"   (BIOS disks cannot boot in UEFI mode and vice versa)")
         
