@@ -2368,7 +2368,9 @@ class MigrationTool:
         
         disks_spec = []
         volumes_spec = []
-        volume_claim_templates = []
+        volume_claim_templates = []  # Harvester-specific format for image-based volumes
+        
+        print(colored("\n📦 Preparing volume configurations...", Colors.BOLD))
         
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
             disk_name = f"disk-{i}"
@@ -2378,6 +2380,15 @@ class MigrationTool:
             
             # Volume claim name
             volume_name = f"{vm_name}-disk{i}-{suffix}"
+            
+            # Get the image info
+            img_name = img['name']
+            img_ns = img['namespace']
+            
+            # The image's storage class
+            image_storage_class = f"longhorn-{img_name}"
+            
+            print(f"   Volume {volume_name} from image {img_ns}/{img_name}")
             
             # Disk spec
             disk_spec = {
@@ -2390,7 +2401,7 @@ class MigrationTool:
                 disk_spec["bootOrder"] = 1
             disks_spec.append(disk_spec)
             
-            # Volume spec - use persistentVolumeClaim (not dataVolume!)
+            # Volume spec - use persistentVolumeClaim
             volumes_spec.append({
                 "name": disk_name,
                 "persistentVolumeClaim": {
@@ -2398,12 +2409,13 @@ class MigrationTool:
                 }
             })
             
-            # VolumeClaimTemplate for annotation (Harvester-specific format)
+            # VolumeClaimTemplate for Harvester annotation
+            # This creates the volume with image data when VM is created
             volume_claim_templates.append({
                 "metadata": {
                     "name": volume_name,
                     "annotations": {
-                        "harvesterhci.io/imageId": f"{img['namespace']}/{img['name']}"
+                        "harvesterhci.io/imageId": f"{img_ns}/{img_name}"
                     }
                 },
                 "spec": {
@@ -2414,7 +2426,7 @@ class MigrationTool:
                         }
                     },
                     "volumeMode": "Block",
-                    "storageClassName": selected_storage_class
+                    "storageClassName": image_storage_class
                 }
             })
         
@@ -2456,7 +2468,9 @@ class MigrationTool:
         print(f"   VolumeClaimTemplates: {len(volume_claim_templates)} template(s)")
         
         for i, vct in enumerate(volume_claim_templates):
-            print(f"      VCT {i}: {vct['metadata']['name']} → {vct['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')}")
+            vct_name = vct['metadata']['name']
+            vct_image = vct['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')
+            print(f"      VCT {i}: {vct_name} ← {vct_image}")
         
         # Build MAC address annotation
         mac_annotation = {}
@@ -2478,14 +2492,12 @@ class MigrationTool:
                     },
                     "annotations": {
                         "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
-                        # RerunOnFailure = VM starts automatically and restarts on failure
-                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
                         "harvesterhci.io/vmRunStrategy": "Halted",
                         "network.harvesterhci.io/ips": "[]"
                     }
                 },
                 "spec": {
-                    "runStrategy": "RerunOnFailure",
+                    "runStrategy": "Halted",
                     "template": {
                         "metadata": {
                             "labels": {
@@ -2567,15 +2579,108 @@ class MigrationTool:
                 json.dump(manifest, f, indent=2)
             print(colored(f"   📄 Manifest saved: {manifest_path}", Colors.CYAN))
             
+            # === DISSOCIATE VOLUMES FROM IMAGES ===
+            # This removes the image dependency so images can be deleted
+            print(colored("\n🔗 Dissociating volumes from source images...", Colors.BOLD))
+            
+            # Get the volume names from volumeClaimTemplates
+            volume_names = [vct['metadata']['name'] for vct in volume_claim_templates]
+            
+            # Wait for PVCs to be created and bound
+            import time
+            print("   ⏳ Waiting for volumes to be provisioned...")
+            max_wait = 300  # 5 minutes
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait:
+                all_bound = True
+                for vol_name in volume_names:
+                    try:
+                        pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
+                        phase = pvc.get('status', {}).get('phase', '')
+                        if phase != 'Bound':
+                            all_bound = False
+                            break
+                    except:
+                        all_bound = False
+                        break
+                
+                if all_bound:
+                    break
+                
+                elapsed = int(time.time() - start_time)
+                if elapsed % 15 == 0:
+                    print(f"      Waiting... ({elapsed}s)")
+                time.sleep(5)
+            
+            # Dissociate each volume by removing harvesterhci.io/imageId annotation
+            dissociated_count = 0
+            for vol_name in volume_names:
+                try:
+                    # Get current PVC
+                    pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
+                    
+                    annotations = pvc.get('metadata', {}).get('annotations', {})
+                    if 'harvesterhci.io/imageId' in annotations:
+                        # Remove the imageId annotation using JSON Patch
+                        patch = [
+                            {"op": "remove", "path": "/metadata/annotations/harvesterhci.io~1imageId"}
+                        ]
+                        
+                        self.harvester._request(
+                            "PATCH",
+                            f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}",
+                            patch,
+                            content_type="application/json-patch+json"
+                        )
+                        dissociated_count += 1
+                        print(colored(f"   ✅ {vol_name} dissociated from image", Colors.GREEN))
+                    else:
+                        print(f"   ℹ️  {vol_name} already independent")
+                        
+                except Exception as e:
+                    print(colored(f"   ⚠️  Failed to dissociate {vol_name}: {e}", Colors.YELLOW))
+            
+            if dissociated_count > 0:
+                print(colored(f"\n✅ {dissociated_count} volume(s) dissociated - source images can now be deleted!", Colors.GREEN))
+            
+            # === DELETE SOURCE IMAGES ===
+            # Now that volumes are independent, offer to delete the source images
+            print(colored("\n🗑️  Cleanup: Delete source images from Harvester?", Colors.BOLD))
+            print("   (Images are no longer needed - volumes are independent)")
+            
+            for img in selected_images:
+                img_name = img['name']
+                img_ns = img['namespace']
+                print(f"   • {img_ns}/{img_name}")
+            
+            delete_images = self.input_prompt("\nDelete these images? (y/n) [y]") or "y"
+            if delete_images.lower() == 'y':
+                deleted_count = 0
+                for img in selected_images:
+                    img_name = img['name']
+                    img_ns = img['namespace']
+                    try:
+                        self.harvester.delete_image(img_name, img_ns)
+                        deleted_count += 1
+                        print(colored(f"   ✅ Deleted {img_ns}/{img_name}", Colors.GREEN))
+                    except Exception as e:
+                        print(colored(f"   ⚠️  Failed to delete {img_name}: {e}", Colors.YELLOW))
+                
+                if deleted_count > 0:
+                    print(colored(f"\n✅ {deleted_count} image(s) deleted - storage freed!", Colors.GREEN))
+            else:
+                print("   Images kept. You can delete them manually later.")
+            
             # === FULL MIGRATION WORKFLOW ===
-            # Ask to continue with start + network config
             print(colored("\n" + "="*50, Colors.BLUE))
             print(colored("🚀 COMPLETE MIGRATION WORKFLOW", Colors.BOLD))
             print(colored("="*50, Colors.BLUE))
-            print("\nThe VM will start automatically. Next steps:")
-            print("  1. Wait for VM boot and DHCP IP (via QEMU Guest Agent)")
-            print("  2. Connect via WinRM")
-            print("  3. Reconfigure static network")
+            print("\nNext steps:")
+            print("  1. Start VM")
+            print("  2. Wait for DHCP IP (via QEMU Guest Agent)")
+            print("  3. Connect via WinRM")
+            print("  4. Reconfigure static network")
             
             continue_migration = self.input_prompt("\nContinue with full migration? (y/n) [y]")
             if continue_migration.lower() == 'n':

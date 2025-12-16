@@ -66,22 +66,35 @@ class HarvesterClient:
             except:
                 pass
     
-    def _request(self, method: str, endpoint: str, data: dict = None) -> dict:
+    def _request(self, method: str, endpoint: str, data: dict = None, content_type: str = None) -> dict:
         """Execute API request."""
         url = f"{self.base_url}{endpoint}"
         
         headers = {}
         if method == "PATCH":
-            headers['Content-Type'] = 'application/merge-patch+json'
+            # Use provided content_type or default to merge-patch
+            headers['Content-Type'] = content_type or 'application/merge-patch+json'
         
-        response = requests.request(
-            method=method,
-            url=url,
-            json=data,
-            headers=headers if headers else None,
-            cert=self.cert,
-            verify=self.verify if self.verify else False
-        )
+        # For JSON Patch, send data directly (not as json=)
+        if content_type == "application/json-patch+json":
+            import json as json_module
+            response = requests.request(
+                method=method,
+                url=url,
+                data=json_module.dumps(data),
+                headers=headers,
+                cert=self.cert,
+                verify=self.verify if self.verify else False
+            )
+        else:
+            response = requests.request(
+                method=method,
+                url=url,
+                json=data,
+                headers=headers if headers else None,
+                cert=self.cert,
+                verify=self.verify if self.verify else False
+            )
         
         if not response.ok:
             # Try to get detailed error message
