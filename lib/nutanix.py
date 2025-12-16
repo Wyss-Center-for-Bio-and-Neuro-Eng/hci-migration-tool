@@ -60,10 +60,26 @@ class NutanixClient:
         return self._request("GET", f"vms/{vm_uuid}")
     
     def get_vm_by_name(self, vm_name: str) -> Optional[dict]:
-        """Get VM by name."""
-        payload = {"kind": "vm", "filter": f"vm_name=={vm_name}", "length": 1}
+        """Get VM by name (case-insensitive, partial match)."""
+        # Use contains filter for partial match
+        payload = {"kind": "vm", "filter": f"vm_name==.*{vm_name.lower()}.*", "length": 10}
         result = self._request("POST", "vms/list", payload)
         entities = result.get('entities', [])
+        
+        # If regex doesn't work, try listing all and filtering client-side
+        if not entities:
+            payload = {"kind": "vm", "length": 500}
+            result = self._request("POST", "vms/list", payload)
+            all_vms = result.get('entities', [])
+            
+            # Case-insensitive search
+            search_name = vm_name.lower()
+            for vm in all_vms:
+                nutanix_name = vm.get('spec', {}).get('name', '').lower()
+                if search_name in nutanix_name or nutanix_name in search_name:
+                    return vm
+        
+        # Return first match if found
         return entities[0] if entities else None
     
     def power_off_vm(self, vm_uuid: str) -> dict:

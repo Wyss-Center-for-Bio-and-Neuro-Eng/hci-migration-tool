@@ -4298,15 +4298,19 @@ Log "=========================================="
             print(f"   RDP: {'✅' if config.rdp_enabled else '❌'}")
             
             # Display Nutanix tools (for post-migration cleanup planning)
+            # Only list MAIN programs visible in Programs and Features, not sub-components
             print(colored("\n🔧 NUTANIX TOOLS INSTALLED (to remove post-migration)", Colors.BOLD))
-            agents = config.agents
-            nutanix_tools = []
-            if agents.ngt_installed:
-                nutanix_tools.append(f"Nutanix Guest Tools {agents.ngt_version or ''}")
-            if agents.virtio_nutanix:
-                nutanix_tools.append("Nutanix VirtIO")
             
-            # Check for more Nutanix software via registry
+            # These are the main programs that appear in Programs and Features
+            # Sub-components like "Infrastructure Components", "VSS Modules", etc.
+            # are removed automatically when uninstalling the main programs
+            main_nutanix_programs = [
+                "Nutanix Guest Tools",
+                "Nutanix VirtIO", 
+                "Nutanix VM Mobility"
+            ]
+            
+            # Check for Nutanix software via registry - only main programs
             ps_nutanix_check = '''
 Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*,
                  HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue |
@@ -4314,24 +4318,39 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
     Select-Object DisplayName, DisplayVersion |
     ForEach-Object { "$($_.DisplayName)|$($_.DisplayVersion)" }
 '''
+            nutanix_tools = []
             stdout, _, _ = client.run_powershell(ps_nutanix_check)
             if stdout.strip():
                 for line in stdout.strip().split('\n'):
                     if '|' in line:
                         name, version = line.split('|', 1)
-                        tool_str = f"{name.strip()} {version.strip()}".strip()
-                        if tool_str and tool_str not in nutanix_tools:
-                            nutanix_tools.append(tool_str)
+                        name = name.strip()
+                        version = version.strip()
+                        
+                        # Only include main programs, not sub-components
+                        is_main_program = False
+                        for main_prog in main_nutanix_programs:
+                            # Exact match or starts with main program name (for versioned names)
+                            if name == main_prog or name.startswith(main_prog + " "):
+                                is_main_program = True
+                                break
+                        
+                        if is_main_program:
+                            tool_str = f"{name} {version}".strip() if version else name
+                            if tool_str not in nutanix_tools:
+                                nutanix_tools.append(tool_str)
             
             if nutanix_tools:
                 for tool in nutanix_tools:
                     print(f"   • {tool}")
-                print(colored(f"\n   ℹ️  {len(nutanix_tools)} Nutanix tool(s) to remove after migration", Colors.CYAN))
+                print(colored(f"\n   ℹ️  {len(nutanix_tools)} Nutanix program(s) to remove after migration", Colors.CYAN))
+                print(colored("   ℹ️  Sub-components will be removed automatically", Colors.CYAN))
             else:
-                print("   No Nutanix tools detected")
+                print("   No Nutanix programs detected")
             
             # QEMU Guest Agent status - the only thing we need to install
             print(colored("\n📡 QEMU GUEST AGENT (required for Harvester)", Colors.BOLD))
+            agents = config.agents
             if agents.qemu_guest_agent:
                 print(f"   Status: ✅ Installed")
                 print(f"   Running: {'✅' if agents.qemu_guest_agent_running else '⚠️  NOT RUNNING'}")
