@@ -621,22 +621,42 @@ class MigrationTool:
         
         pvcs = self.harvester.list_all_pvcs()
         
-        print(f"\n{'='*90}")
-        print(f"{'Volume Name':<45} {'Namespace':<20} {'Size':<12} {'Status'}")
-        print(f"{'='*90}")
+        # Separate scratch volumes
+        scratch_pvcs = [p for p in pvcs if 'scratch' in p.get('metadata', {}).get('name', '').lower() 
+                        or p.get('metadata', {}).get('name', '').startswith('prime-')]
+        regular_pvcs = [p for p in pvcs if p not in scratch_pvcs]
         
-        for pvc in sorted(pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower()):
-            name = pvc.get('metadata', {}).get('name', 'N/A')[:44]
-            ns = pvc.get('metadata', {}).get('namespace', 'N/A')[:19]
+        print(f"\n{'='*100}")
+        print(f"{'Volume Name':<50} {'Namespace':<18} {'Size':<10} {'Status':<10} {'Type'}")
+        print(f"{'='*100}")
+        
+        for pvc in sorted(regular_pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower()):
+            name = pvc.get('metadata', {}).get('name', 'N/A')[:49]
+            ns = pvc.get('metadata', {}).get('namespace', 'N/A')[:17]
             size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
             status = pvc.get('status', {}).get('phase', 'N/A')
-            print(f"{name:<45} {ns:<20} {size:<12} {status}")
+            
+            # Check if it has image dependency
+            annotations = pvc.get('metadata', {}).get('annotations', {})
+            if 'harvesterhci.io/imageId' in annotations:
+                vol_type = colored("image-backed", Colors.YELLOW)
+            else:
+                vol_type = colored("independent", Colors.GREEN)
+            
+            print(f"{name:<50} {ns:<18} {size:<10} {status:<10} {vol_type}")
         
-        print(f"{'='*90}")
-        print(f"Total: {len(pvcs)} volumes")
+        if scratch_pvcs:
+            print(f"\n{colored('Scratch/Temporary volumes (CDI):', Colors.YELLOW)}")
+            for pvc in scratch_pvcs:
+                name = pvc.get('metadata', {}).get('name', 'N/A')[:49]
+                ns = pvc.get('metadata', {}).get('namespace', 'N/A')[:17]
+                print(f"  {name} ({ns})")
+        
+        print(f"{'='*100}")
+        print(f"Total: {len(regular_pvcs)} volumes" + (f", {len(scratch_pvcs)} scratch" if scratch_pvcs else ""))
     
     def delete_harvester_volume(self):
-        """Delete a Harvester volume (PVC)."""
+        """Delete a Harvester volume (PVC) or DataVolume."""
         if not self.harvester and not self.connect_harvester():
             return
         
@@ -646,17 +666,54 @@ class MigrationTool:
             print(colored("❌ No volumes found", Colors.YELLOW))
             return
         
+        # Separate scratch volumes and regular volumes
+        scratch_pvcs = [p for p in pvcs if 'scratch' in p.get('metadata', {}).get('name', '').lower() 
+                        or p.get('metadata', {}).get('name', '').startswith('prime-')]
+        regular_pvcs = [p for p in pvcs if p not in scratch_pvcs]
+        
+        print(colored("\n📦 Volume Management", Colors.BOLD))
+        print(f"   Regular volumes: {len(regular_pvcs)}")
+        print(f"   Scratch/temp volumes (prime-*): {len(scratch_pvcs)}")
+        
+        if scratch_pvcs:
+            print(colored(f"\n⚠️  Found {len(scratch_pvcs)} scratch volumes (CDI temporary)", Colors.YELLOW))
+            clean_scratch = self.input_prompt("Clean up scratch volumes? (y/n) [n]")
+            if clean_scratch and clean_scratch.lower() == 'y':
+                for pvc in scratch_pvcs:
+                    name = pvc.get('metadata', {}).get('name')
+                    ns = pvc.get('metadata', {}).get('namespace')
+                    try:
+                        self.harvester.delete_pvc(name, ns)
+                        print(colored(f"   ✅ Deleted scratch: {name}", Colors.GREEN))
+                    except Exception as e:
+                        print(colored(f"   ⚠️  Could not delete {name}: {e}", Colors.YELLOW))
+                return
+        
         print("\nAvailable volumes (Enter to cancel):")
-        sorted_pvcs = sorted(pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower())
+        sorted_pvcs = sorted(regular_pvcs, key=lambda x: x.get('metadata', {}).get('name', '').lower())
         for i, pvc in enumerate(sorted_pvcs, 1):
             name = pvc.get('metadata', {}).get('name', 'N/A')
             ns = pvc.get('metadata', {}).get('namespace', 'N/A')
             size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
-            print(f"  {i}. {name} ({ns}) - {size}")
+            phase = pvc.get('status', {}).get('phase', '')
+            status = colored("Bound", Colors.GREEN) if phase == 'Bound' else colored(phase, Colors.YELLOW)
+            print(f"  {i}. {name} ({ns}) - {size} - {status}")
         
-        choice = self.input_prompt("Volume number to delete")
+        choice = self.input_prompt("Volume number to delete (or 'all-scratch' to clean scratch)")
         if not choice:
             return
+        
+        if choice.lower() == 'all-scratch':
+            for pvc in scratch_pvcs:
+                name = pvc.get('metadata', {}).get('name')
+                ns = pvc.get('metadata', {}).get('namespace')
+                try:
+                    self.harvester.delete_pvc(name, ns)
+                    print(colored(f"   ✅ Deleted: {name}", Colors.GREEN))
+                except:
+                    pass
+            return
+        
         try:
             idx = int(choice) - 1
             selected = sorted_pvcs[idx]
@@ -666,6 +723,24 @@ class MigrationTool:
         
         vol_name = selected.get('metadata', {}).get('name')
         vol_ns = selected.get('metadata', {}).get('namespace')
+        
+        # Check if there's also a DataVolume with this name
+        try:
+            dv = self.harvester.get_datavolume(vol_name, vol_ns)
+            has_dv = True
+        except:
+            has_dv = False
+        
+        if has_dv:
+            print(colored(f"   Note: This volume has an associated DataVolume", Colors.CYAN))
+            delete_dv = self.input_prompt(f"Delete DataVolume '{vol_name}' (will also delete PVC)? (yes to confirm)")
+            if delete_dv.lower() == 'yes':
+                try:
+                    self.harvester.delete_datavolume(vol_name, vol_ns)
+                    print(colored(f"✅ Deleted DataVolume: {vol_name}", Colors.GREEN))
+                except Exception as e:
+                    print(colored(f"❌ Error deleting DataVolume: {e}", Colors.RED))
+            return
         
         confirm = self.input_prompt(f"Delete volume '{vol_name}' from {vol_ns}? (yes to confirm)")
         if confirm.lower() == 'yes':
@@ -1638,6 +1713,7 @@ class MigrationTool:
         
         # Volume size - get virtual size
         import subprocess
+        import math
         try:
             result = subprocess.run(
                 ['qemu-img', 'info', '--output=json', selected_file['path']],
@@ -1647,17 +1723,19 @@ class MigrationTool:
                 info = json.loads(result.stdout)
                 virtual_size = info.get('virtual-size', 0)
                 virtual_size_gb = virtual_size / (1024**3)
-                min_size_gi = int(virtual_size_gb) + 1
-                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB")
+                # Use ceil to ensure we have enough space
+                min_size_gi = math.ceil(virtual_size_gb)
+                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB → minimum {min_size_gi} GiB")
             else:
                 min_size_gi = int(selected_file['size'] / (1024**3)) + 10
         except:
             min_size_gi = int(selected_file['size'] / (1024**3)) + 10
         
         default_size = max(min_size_gi, 10)
-        size_input = self.input_prompt(f"Volume size in GiB (min {min_size_gi}) [{default_size}]")
+        size_input = self.input_prompt(f"Volume size in GiB [{default_size}]")
         size_gi = int(size_input) if size_input else default_size
         if size_gi < min_size_gi:
+            print(colored(f"   ⚠️  Size {size_gi} < minimum {min_size_gi}, using {min_size_gi} GiB", Colors.YELLOW))
             size_gi = min_size_gi
         
         # Summary
@@ -1713,9 +1791,11 @@ class MigrationTool:
         # Wait for completion
         print(colored("\n⏳ Waiting for CDI to download and process...", Colors.CYAN))
         print("   Press Ctrl+C to stop waiting (import continues in background)")
+        print("   Note: 'prime-*' scratch volumes are normal and will be cleaned up")
         
         import time
         start_time = time.time()
+        last_phase = ""
         
         try:
             while True:
@@ -1724,19 +1804,39 @@ class MigrationTool:
                 progress = status.get('progress', '')
                 elapsed = int(time.time() - start_time)
                 
-                progress_str = f" ({progress})" if progress and progress != 'N/A' else ""
-                print(f"\r   Status: {phase}{progress_str} - {elapsed}s     ", end='', flush=True)
+                # Show phase changes
+                if phase != last_phase:
+                    print(f"\n   Phase: {phase}")
+                    last_phase = phase
+                
+                # Progress display
+                progress_str = f" {progress}" if progress and progress != 'N/A' else ""
+                print(f"\r   [{elapsed}s]{progress_str}     ", end='', flush=True)
                 
                 if phase == 'Succeeded':
                     print(colored(f"\n\n✅ Volume created: {namespace}/{vol_name}", Colors.GREEN))
                     print(colored("   Ready for VM creation!", Colors.GREEN))
                     break
-                elif phase in ('Failed', 'Error'):
-                    print(colored(f"\n\n❌ Failed: {phase}", Colors.RED))
+                elif phase == 'Failed':
+                    print(colored(f"\n\n❌ Import failed!", Colors.RED))
+                    # Get error details from conditions
+                    conditions = status.get('conditions', [])
+                    for cond in conditions:
+                        if cond.get('type') == 'Running' and cond.get('status') == 'False':
+                            print(f"   Reason: {cond.get('reason', 'Unknown')}")
+                            msg = cond.get('message', '')
+                            if msg:
+                                print(f"   Message: {msg[:200]}")
+                    break
+                elif 'Error' in phase:
+                    print(colored(f"\n\n❌ Error: {phase}", Colors.RED))
                     break
                 
-                if elapsed > 1800:
-                    print(colored(f"\n\n⚠️  Timeout - check: kubectl get dv {vol_name} -n {namespace}", Colors.YELLOW))
+                # Long timeout for large files
+                if elapsed > 3600:  # 1 hour
+                    print(colored(f"\n\n⚠️  Timeout after 1h - check manually:", Colors.YELLOW))
+                    print(f"   kubectl get dv {vol_name} -n {namespace}")
+                    print(f"   kubectl describe dv {vol_name} -n {namespace}")
                     break
                 
                 time.sleep(5)

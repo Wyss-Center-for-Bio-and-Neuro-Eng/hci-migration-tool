@@ -330,14 +330,46 @@ class MigrationActions:
         if self._http_server:
             self.stop_http_server()
         
-        handler = http.server.SimpleHTTPRequestHandler
+        # Use a custom handler with better support for large files
+        staging_path = self.staging_path
         
-        class QuietHandler(handler):
+        class RobustHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=staging_path, **kwargs)
+            
             def log_message(self, format, *args):
                 pass  # Suppress logging
+            
+            def log_error(self, format, *args):
+                pass  # Suppress error logging too
+            
+            def handle_one_request(self):
+                """Handle a single HTTP request with better error handling."""
+                try:
+                    super().handle_one_request()
+                except (ConnectionResetError, BrokenPipeError):
+                    # Client disconnected - this is normal for CDI retries
+                    pass
+                except Exception:
+                    pass
         
-        os.chdir(self.staging_path)
-        self._http_server = socketserver.TCPServer(("", port), QuietHandler)
+        # Use ThreadingHTTPServer for better concurrent handling
+        class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+        
+        try:
+            self._http_server = ThreadingHTTPServer(("0.0.0.0", port), RobustHandler)
+        except OSError as e:
+            if "Address already in use" in str(e):
+                # Try to kill existing process on port
+                import subprocess
+                subprocess.run(['fuser', '-k', f'{port}/tcp'], capture_output=True)
+                import time
+                time.sleep(1)
+                self._http_server = ThreadingHTTPServer(("0.0.0.0", port), RobustHandler)
+            else:
+                raise
         
         self._http_thread = threading.Thread(target=self._http_server.serve_forever)
         self._http_thread.daemon = True
