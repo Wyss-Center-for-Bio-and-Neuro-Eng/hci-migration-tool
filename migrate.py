@@ -2384,33 +2384,184 @@ class MigrationTool:
             print("Cancelled")
             return
         
-        # Build disks and volumes arrays
+        # =====================================================
+        # NEW WORKFLOW: Create volumes from images with cloning
+        # =====================================================
+        # Step 1: Create temporary PVCs from images (using image's storageClass)
+        # Step 2: Wait for data to be fully copied (check actualSize > 0)
+        # Step 3: Clone to final PVCs with user's chosen storageClass
+        # Step 4: Wait for clone to complete
+        # Step 5: Delete temporary PVCs
+        # Step 6: Create VM with final PVCs (no image dependency)
+        # =====================================================
+        
         import random
         import string
+        import time
         
-        disks_spec = []
-        volumes_spec = []
-        volume_claim_templates = []  # Harvester-specific format for image-based volumes
+        print(colored("\n" + "="*60, Colors.BLUE))
+        print(colored("📦 VOLUME CREATION WORKFLOW", Colors.BOLD))
+        print(colored("="*60, Colors.BLUE))
         
-        print(colored("\n📦 Preparing volume configurations...", Colors.BOLD))
+        final_pvc_names = []  # The PVCs that will be attached to the VM
+        temp_pvc_names = []   # Temporary PVCs to delete after cloning
         
         for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
-            disk_name = f"disk-{i}"
-            
-            # Generate random suffix for volume names (like Harvester does)
-            suffix = ''.join(random.choices(string.ascii_lowercase, k=5))
-            
-            # Volume claim name
-            volume_name = f"{vm_name}-disk{i}-{suffix}"
-            
-            # Get the image info
             img_name = img['name']
             img_ns = img['namespace']
+            target_sc = disk_storage_classes[i]
             
-            # Use the storage class selected for this disk
-            selected_sc = disk_storage_classes[i]
+            suffix = ''.join(random.choices(string.ascii_lowercase, k=5))
+            temp_pvc_name = f"{vm_name}-disk{i}-temp-{suffix}"
+            final_pvc_name = f"{vm_name}-disk{i}-{suffix}"
             
-            print(f"   Volume {volume_name} from image {img_ns}/{img_name} → SC: {selected_sc}")
+            print(colored(f"\n--- Disk {i}: {img_name} ({size} GB) ---", Colors.BOLD))
+            
+            # Step 1: Create temporary PVC from image
+            print(colored(f"   📥 Step 1: Creating temporary PVC from image...", Colors.CYAN))
+            print(f"      Image: {img_ns}/{img_name}")
+            print(f"      Temp PVC: {temp_pvc_name}")
+            print(f"      StorageClass: longhorn-{img_name}")
+            
+            try:
+                self.harvester.create_pvc_from_image(
+                    pvc_name=temp_pvc_name,
+                    image_name=img_name,
+                    image_namespace=img_ns,
+                    size_gi=size,
+                    namespace=namespace
+                )
+                temp_pvc_names.append(temp_pvc_name)
+                print(colored(f"      ✅ Temporary PVC created", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"      ❌ Failed to create temp PVC: {e}", Colors.RED))
+                # Cleanup any created temp PVCs
+                for tmp in temp_pvc_names:
+                    try:
+                        self.harvester.delete_pvc(tmp, namespace)
+                    except:
+                        pass
+                return
+            
+            # Step 2: Wait for data to be copied (actualSize > 0)
+            print(colored(f"   ⏳ Step 2: Waiting for image data to be copied...", Colors.CYAN))
+            max_wait = 600  # 10 minutes per disk
+            start_time = time.time()
+            last_size = 0
+            
+            while time.time() - start_time < max_wait:
+                # First check PVC is Bound
+                try:
+                    pvc = self.harvester.get_pvc(temp_pvc_name, namespace)
+                    phase = pvc.get('status', {}).get('phase', '')
+                    if phase != 'Bound':
+                        elapsed = int(time.time() - start_time)
+                        print(f"\r      PVC status: {phase}... ({elapsed}s)   ", end='', flush=True)
+                        time.sleep(5)
+                        continue
+                except Exception as e:
+                    time.sleep(5)
+                    continue
+                
+                # Check actualSize
+                actual_size = self.harvester.get_pvc_actual_size(temp_pvc_name, namespace)
+                elapsed = int(time.time() - start_time)
+                
+                if actual_size > 0:
+                    actual_mb = actual_size / (1024*1024)
+                    print(f"\r      Data copied: {actual_mb:.1f} MB ({elapsed}s)                    ")
+                    print(colored(f"      ✅ Image data copied successfully!", Colors.GREEN))
+                    break
+                else:
+                    if elapsed % 10 == 0:
+                        print(f"\r      Waiting for data copy... ({elapsed}s)   ", end='', flush=True)
+                    time.sleep(5)
+            else:
+                print(colored(f"\n      ❌ Timeout waiting for data copy!", Colors.RED))
+                # Cleanup
+                for tmp in temp_pvc_names:
+                    try:
+                        self.harvester.delete_pvc(tmp, namespace)
+                    except:
+                        pass
+                return
+            
+            # Step 3: Clone to final PVC with user's storage class
+            print(colored(f"   📋 Step 3: Cloning to final PVC...", Colors.CYAN))
+            print(f"      Source: {temp_pvc_name}")
+            print(f"      Target: {final_pvc_name}")
+            print(f"      StorageClass: {target_sc}")
+            
+            try:
+                self.harvester.clone_pvc_to_storage_class(
+                    source_name=temp_pvc_name,
+                    clone_name=final_pvc_name,
+                    target_storage_class=target_sc,
+                    size_gi=size,
+                    namespace=namespace
+                )
+                final_pvc_names.append(final_pvc_name)
+                print(colored(f"      ✅ Clone PVC created", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"      ❌ Failed to create clone: {e}", Colors.RED))
+                # Cleanup
+                for tmp in temp_pvc_names:
+                    try:
+                        self.harvester.delete_pvc(tmp, namespace)
+                    except:
+                        pass
+                return
+            
+            # Step 4: Wait for clone to complete
+            print(colored(f"   ⏳ Step 4: Waiting for clone to complete...", Colors.CYAN))
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait:
+                try:
+                    pvc = self.harvester.get_pvc(final_pvc_name, namespace)
+                    phase = pvc.get('status', {}).get('phase', '')
+                    if phase != 'Bound':
+                        elapsed = int(time.time() - start_time)
+                        print(f"\r      Clone status: {phase}... ({elapsed}s)   ", end='', flush=True)
+                        time.sleep(5)
+                        continue
+                except:
+                    time.sleep(5)
+                    continue
+                
+                # Check actualSize of clone
+                actual_size = self.harvester.get_pvc_actual_size(final_pvc_name, namespace)
+                elapsed = int(time.time() - start_time)
+                
+                if actual_size > 0:
+                    actual_mb = actual_size / (1024*1024)
+                    print(f"\r      Clone data: {actual_mb:.1f} MB ({elapsed}s)                    ")
+                    print(colored(f"      ✅ Clone completed!", Colors.GREEN))
+                    break
+                else:
+                    if elapsed % 10 == 0:
+                        print(f"\r      Waiting for clone data... ({elapsed}s)   ", end='', flush=True)
+                    time.sleep(5)
+            else:
+                print(colored(f"\n      ❌ Timeout waiting for clone!", Colors.RED))
+                return
+            
+            # Step 5: Delete temporary PVC
+            print(colored(f"   🗑️  Step 5: Deleting temporary PVC...", Colors.CYAN))
+            try:
+                self.harvester.delete_pvc(temp_pvc_name, namespace)
+                print(colored(f"      ✅ Temp PVC deleted: {temp_pvc_name}", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"      ⚠️  Failed to delete temp PVC: {e}", Colors.YELLOW))
+        
+        print(colored(f"\n✅ All {len(final_pvc_names)} volume(s) created and ready!", Colors.GREEN))
+        
+        # Build disks and volumes arrays for VM (using existing PVCs)
+        disks_spec = []
+        volumes_spec = []
+        
+        for i, pvc_name in enumerate(final_pvc_names):
+            disk_name = f"disk-{i}"
             
             # Disk spec
             disk_spec = {
@@ -2423,32 +2574,11 @@ class MigrationTool:
                 disk_spec["bootOrder"] = 1
             disks_spec.append(disk_spec)
             
-            # Volume spec - use persistentVolumeClaim
+            # Volume spec - reference existing PVC (no volumeClaimTemplates needed!)
             volumes_spec.append({
                 "name": disk_name,
                 "persistentVolumeClaim": {
-                    "claimName": volume_name
-                }
-            })
-            
-            # VolumeClaimTemplate for Harvester annotation
-            # This creates the volume with image data when VM is created
-            volume_claim_templates.append({
-                "metadata": {
-                    "name": volume_name,
-                    "annotations": {
-                        "harvesterhci.io/imageId": f"{img_ns}/{img_name}"
-                    }
-                },
-                "spec": {
-                    "accessModes": ["ReadWriteMany"],
-                    "resources": {
-                        "requests": {
-                            "storage": f"{size}Gi"
-                        }
-                    },
-                    "volumeMode": "Block",
-                    "storageClassName": selected_sc
+                    "claimName": pvc_name
                 }
             })
         
@@ -2487,12 +2617,10 @@ class MigrationTool:
         print(f"   Disks spec: {len(disks_spec)} disk(s)")
         print(f"   Volumes spec: {len(volumes_spec)} volume(s)")
         print(f"   Networks spec: {len(networks_spec)} network(s)")
-        print(f"   VolumeClaimTemplates: {len(volume_claim_templates)} template(s)")
+        print(f"   PVCs (pre-created, independent): {len(final_pvc_names)}")
         
-        for i, vct in enumerate(volume_claim_templates):
-            vct_name = vct['metadata']['name']
-            vct_image = vct['metadata']['annotations'].get('harvesterhci.io/imageId', 'N/A')
-            print(f"      VCT {i}: {vct_name} ← {vct_image}")
+        for i, pvc_name in enumerate(final_pvc_names):
+            print(f"      Disk {i}: {pvc_name}")
         
         # Build MAC address annotation
         mac_annotation = {}
@@ -2513,7 +2641,6 @@ class MigrationTool:
                         "harvesterhci.io/os": "windows"
                     },
                     "annotations": {
-                        "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
                         "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
                         "network.harvesterhci.io/ips": "[]"
                     }
@@ -2601,75 +2728,10 @@ class MigrationTool:
                 json.dump(manifest, f, indent=2)
             print(colored(f"   📄 Manifest saved: {manifest_path}", Colors.CYAN))
             
-            # === DISSOCIATE VOLUMES FROM IMAGES ===
-            # This removes the image dependency so images can be deleted
-            print(colored("\n🔗 Dissociating volumes from source images...", Colors.BOLD))
-            
-            # Get the volume names from volumeClaimTemplates
-            volume_names = [vct['metadata']['name'] for vct in volume_claim_templates]
-            
-            # Wait for PVCs to be created and bound
-            import time
-            print("   ⏳ Waiting for volumes to be provisioned...")
-            max_wait = 300  # 5 minutes
-            start_time = time.time()
-            
-            while time.time() - start_time < max_wait:
-                all_bound = True
-                for vol_name in volume_names:
-                    try:
-                        pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
-                        phase = pvc.get('status', {}).get('phase', '')
-                        if phase != 'Bound':
-                            all_bound = False
-                            break
-                    except:
-                        all_bound = False
-                        break
-                
-                if all_bound:
-                    break
-                
-                elapsed = int(time.time() - start_time)
-                if elapsed % 15 == 0:
-                    print(f"      Waiting... ({elapsed}s)")
-                time.sleep(5)
-            
-            # Dissociate each volume by removing harvesterhci.io/imageId annotation
-            dissociated_count = 0
-            for vol_name in volume_names:
-                try:
-                    # Get current PVC
-                    pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
-                    
-                    annotations = pvc.get('metadata', {}).get('annotations', {})
-                    if 'harvesterhci.io/imageId' in annotations:
-                        # Remove the imageId annotation using JSON Patch
-                        patch = [
-                            {"op": "remove", "path": "/metadata/annotations/harvesterhci.io~1imageId"}
-                        ]
-                        
-                        self.harvester._request(
-                            "PATCH",
-                            f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}",
-                            patch,
-                            content_type="application/json-patch+json"
-                        )
-                        dissociated_count += 1
-                        print(colored(f"   ✅ {vol_name} dissociated from image", Colors.GREEN))
-                    else:
-                        print(f"   ℹ️  {vol_name} already independent")
-                        
-                except Exception as e:
-                    print(colored(f"   ⚠️  Failed to dissociate {vol_name}: {e}", Colors.YELLOW))
-            
-            if dissociated_count > 0:
-                print(colored(f"\n✅ {dissociated_count} volume(s) dissociated - source images can now be deleted!", Colors.GREEN))
-            
             # === DELETE SOURCE IMAGES ===
-            # Now that volumes are independent, offer to delete the source images
+            # Volumes are already independent (cloned), images can be deleted safely
             print(colored("\n🗑️  Cleanup: Delete source images from Harvester?", Colors.BOLD))
-            print("   (Images are no longer needed - volumes are independent)")
+            print("   (Volumes are independent - images are no longer needed)")
             
             for img in selected_images:
                 img_name = img['name']

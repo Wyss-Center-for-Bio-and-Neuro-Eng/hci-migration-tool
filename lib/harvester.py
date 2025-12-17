@@ -419,6 +419,87 @@ class HarvesterClient:
         ns = namespace or self.namespace
         return self._request("GET", f"/api/v1/namespaces/{ns}/persistentvolumeclaims/{name}")
     
+    def get_pvc_actual_size(self, pvc_name: str, namespace: str = None) -> int:
+        """Get the actual data size of a PVC from Longhorn.
+        Returns actualSize in bytes, or 0 if not found/not ready."""
+        ns = namespace or self.namespace
+        try:
+            # Get the PVC to find the bound PV name
+            pvc = self.get_pvc(pvc_name, ns)
+            pv_name = pvc.get('spec', {}).get('volumeName', '')
+            if not pv_name:
+                return 0
+            
+            # Get the Longhorn volume (name matches PV name)
+            lh_volume = self._request("GET", f"/apis/longhorn.io/v1beta2/namespaces/longhorn-system/volumes/{pv_name}")
+            actual_size = lh_volume.get('status', {}).get('actualSize', 0)
+            return int(actual_size) if actual_size else 0
+        except Exception:
+            return 0
+    
+    def create_pvc_from_image(self, pvc_name: str, image_name: str, image_namespace: str,
+                              size_gi: int, namespace: str = None) -> dict:
+        """Create a PVC from a Harvester image using the image's auto-created storageClass."""
+        ns = namespace or self.namespace
+        
+        # The storageClass auto-created by Harvester for the image
+        storage_class = f"longhorn-{image_name}"
+        
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": ns,
+                "annotations": {
+                    "harvesterhci.io/imageId": f"{image_namespace}/{image_name}"
+                }
+            },
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "volumeMode": "Block",
+                "storageClassName": storage_class,
+                "resources": {
+                    "requests": {
+                        "storage": f"{size_gi}Gi"
+                    }
+                }
+            }
+        }
+        
+        return self._request("POST", f"/api/v1/namespaces/{ns}/persistentvolumeclaims", pvc_manifest)
+    
+    def clone_pvc_to_storage_class(self, source_name: str, clone_name: str, 
+                                    target_storage_class: str, size_gi: int,
+                                    namespace: str = None) -> dict:
+        """Clone a PVC to a new PVC with a specific storage class."""
+        ns = namespace or self.namespace
+        
+        clone_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": clone_name,
+                "namespace": ns
+            },
+            "spec": {
+                "storageClassName": target_storage_class,
+                "dataSource": {
+                    "name": source_name,
+                    "kind": "PersistentVolumeClaim"
+                },
+                "accessModes": ["ReadWriteMany"],
+                "volumeMode": "Block",
+                "resources": {
+                    "requests": {
+                        "storage": f"{size_gi}Gi"
+                    }
+                }
+            }
+        }
+        
+        return self._request("POST", f"/api/v1/namespaces/{ns}/persistentvolumeclaims", clone_manifest)
+    
     def update_vm_volume(self, vm_name: str, old_volume_name: str, new_volume_name: str, namespace: str = None) -> dict:
         """Update VM to use a different volume."""
         ns = namespace or self.namespace
