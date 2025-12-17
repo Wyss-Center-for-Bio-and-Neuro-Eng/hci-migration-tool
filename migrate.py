@@ -1547,6 +1547,13 @@ class MigrationTool:
             print(f"      - {img['name']} ({img['uuid']})")
     
     def import_to_harvester(self):
+        """Create independent volume in Harvester using CDI DataVolume."""
+        print(colored("\n📦 Create Volume in Harvester (DataVolume)", Colors.BOLD))
+        print(colored("=" * 60, Colors.BLUE))
+        print(colored("Creates a PVC with NO backing image dependency.", Colors.GREEN))
+        print(colored("The volume is 100% independent.", Colors.GREEN))
+        print(colored("=" * 60, Colors.BLUE))
+        
         self.init_actions()
         
         if not self.harvester and not self.connect_harvester():
@@ -1572,15 +1579,13 @@ class MigrationTool:
             print(colored("Invalid choice", Colors.RED))
             return
         
-        # Extract just the filename (without path) for the default image name
+        # Volume name
         file_basename = os.path.basename(selected_file['name']).replace('.qcow2', '')
-        image_name = self.input_prompt(f"Image name [{file_basename}]")
-        if not image_name:
-            image_name = file_basename
+        vol_name = self.input_prompt(f"Volume name [{file_basename}]") or file_basename
+        vol_name = vol_name.lower().replace('_', '-')
         
-        # Get available namespaces
+        # Namespace
         namespaces = self.get_harvester_namespaces()
-        
         print("\nAvailable namespaces:")
         for i, ns in enumerate(namespaces, 1):
             print(f"  {i}. {ns}")
@@ -1592,219 +1597,156 @@ class MigrationTool:
         except:
             namespace = namespaces[0]
         
-        # Choose StorageClass template
-        print(colored("\n💾 Storage Class Template:", Colors.BOLD))
-        print("   The image will create a storageClass 'longhorn-<image-name>'")
-        print("   that inherits parameters (replicas, node selectors) from your choice.")
+        # Storage Class
+        print(colored("\n💾 Storage Class:", Colors.BOLD))
         
         all_scs = self.harvester.list_storage_classes()
-        # Filter to show only user-relevant storage classes
-        relevant_scs = []
+        valid_scs = []
+        default_sc_idx = 0
+        
         for sc in all_scs:
             sc_name = sc.get('metadata', {}).get('name', '')
-            # Exclude auto-created image storage classes
             if sc_name.startswith('longhorn-image-') or (sc_name.startswith('longhorn-') and '-disk' in sc_name):
                 continue
-            relevant_scs.append(sc_name)
+            if 'vmstate' in sc_name:
+                continue
+            valid_scs.append(sc)
+            if 'dual-node' in sc_name:
+                default_sc_idx = len(valid_scs)
+            annotations = sc.get('metadata', {}).get('annotations', {})
+            if annotations.get('storageclass.kubernetes.io/is-default-class') == 'true' and default_sc_idx == 0:
+                default_sc_idx = len(valid_scs)
         
-        print("\n   Available StorageClasses:")
-        for i, sc_name in enumerate(relevant_scs, 1):
-            default_marker = " (default)" if sc_name == "harvester-longhorn" else ""
-            print(f"     {i}. {sc_name}{default_marker}")
+        print("   Available storage classes:")
+        for i, sc in enumerate(valid_scs, 1):
+            sc_name = sc.get('metadata', {}).get('name', 'N/A')
+            params = sc.get('parameters', {})
+            replicas = params.get('numberOfReplicas', '?')
+            marker = " ← recommended" if i == default_sc_idx else ""
+            print(f"     {i}. {sc_name} ({replicas} replicas){marker}")
         
-        sc_choice = self.input_prompt("StorageClass number [1]")
+        default_choice = str(default_sc_idx) if default_sc_idx else "1"
+        sc_choice = self.input_prompt(f"Storage class [{default_choice}]") or default_choice
+        
         try:
-            sc_idx = int(sc_choice) - 1 if sc_choice else 0
-            selected_storage_class = relevant_scs[sc_idx]
+            sc_idx = int(sc_choice) - 1
+            selected_sc = valid_scs[sc_idx].get('metadata', {}).get('name')
         except:
-            selected_storage_class = relevant_scs[0] if relevant_scs else "harvester-longhorn"
+            selected_sc = valid_scs[0].get('metadata', {}).get('name')
         
-        print(colored(f"   ✓ Using StorageClass template: {selected_storage_class}", Colors.GREEN))
+        print(colored(f"   ✓ Using: {selected_sc}", Colors.GREEN))
         
-        # Choose import method
-        print(colored("\n📤 Import Method:", Colors.BOLD))
-        print("  1. HTTP - Start HTTP server, Harvester downloads from it")
-        print("     (Requires network access from Harvester to this machine)")
-        print("  2. Upload - Push file directly to Harvester")
-        print("     (Uses virtctl or CDI upload proxy)")
-        
-        method = self.input_prompt("Method (1/2) [1]")
-        if not method or method == "1":
-            self._import_via_http(image_name, selected_file, namespace, selected_storage_class)
-        elif method == "2":
-            self._import_via_upload(image_name, selected_file, namespace, selected_storage_class)
-        else:
-            print(colored("Invalid choice", Colors.RED))
-    
-    def _import_via_http(self, image_name: str, selected_file: dict, namespace: str, storage_class: str):
-        """Import image via HTTP server method."""
-        import time
-        
-        # Get HTTP server IP from config if specified
-        transfer_config = self.config.get('transfer', {})
-        http_server_ip = transfer_config.get('http_server_ip', None)
-        
-        print(f"\n🚀 Starting HTTP server...")
-        http_url = self.actions.start_http_server(8080, bind_ip=http_server_ip)
-        print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
-        
-        # Verify the URL is reachable from Harvester perspective
-        if "127.0" in http_url:
-            print(colored("⚠️  Warning: URL contains localhost address!", Colors.YELLOW))
-            print(colored("   Harvester cannot reach this. Add to config.yaml:", Colors.YELLOW))
-            print(colored("   transfer:", Colors.YELLOW))
-            print(colored("     http_server_ip: 10.16.16.167  # Your Debian IP", Colors.YELLOW))
-        
-        print(f"\n📤 Creating image in Harvester ({namespace})...")
-        print(f"   StorageClass template: {storage_class}")
-        try:
-            result = self.actions.create_harvester_image(image_name, selected_file['name'], http_url, namespace, storage_class)
-            print(colored(f"✅ Image created: {image_name} in {namespace}", Colors.GREEN))
-        except Exception as e:
-            print(colored(f"❌ Error: {e}", Colors.RED))
-            self.actions.stop_http_server()
-            return
-        
-        # Wait for image to be ready
-        print(f"\n⏳ Waiting for Harvester to download the image...")
-        print(f"   (Checking every 5 seconds, press Ctrl+C to abort)")
-        
-        max_wait = 3600  # 1 hour max
-        check_interval = 5
-        elapsed = 0
-        last_progress = -1
-        
-        try:
-            while elapsed < max_wait:
-                try:
-                    image = self.harvester.get_image(image_name, namespace)
-                    status = image.get('status', {})
-                    
-                    # Check progress
-                    progress = status.get('progress', 0)
-                    if progress != last_progress:
-                        print(f"   Progress: {progress}%")
-                        last_progress = progress
-                    
-                    # Check conditions for completion
-                    conditions = status.get('conditions', [])
-                    
-                    # Look for "Imported" or "Ready" condition
-                    is_ready = False
-                    is_failed = False
-                    error_msg = None
-                    
-                    for cond in conditions:
-                        cond_type = cond.get('type', '')
-                        cond_status = cond.get('status', '')
-                        
-                        if cond_type == 'Imported' and cond_status == 'True':
-                            is_ready = True
-                            break
-                        elif cond_type == 'Initialized' and cond_status == 'True' and progress == 100:
-                            is_ready = True
-                            break
-                        elif cond_status == 'False' and cond.get('reason') == 'ImportFailed':
-                            is_failed = True
-                            error_msg = cond.get('message', 'Unknown error')
-                            break
-                    
-                    # Also check if progress is 100
-                    if progress == 100:
-                        is_ready = True
-                    
-                    if is_ready:
-                        print(colored(f"\n   ✅ Image download complete!", Colors.GREEN))
-                        break
-                    
-                    if is_failed:
-                        print(colored(f"\n   ❌ Image import failed: {error_msg}", Colors.RED))
-                        break
-                    
-                except Exception as e:
-                    print(f"   ⚠️  Error checking status: {e}")
-                
-                time.sleep(check_interval)
-                elapsed += check_interval
-            
-            else:
-                print(colored(f"\n   ⚠️  Timeout after {max_wait}s. Check Harvester UI.", Colors.YELLOW))
-        
-        except KeyboardInterrupt:
-            print(colored("\n   ⚠️  Interrupted by user", Colors.YELLOW))
-        
-        finally:
-            self.actions.stop_http_server()
-            print(colored("✅ HTTP server stopped", Colors.GREEN))
-    
-    def _import_via_upload(self, image_name: str, selected_file: dict, namespace: str, storage_class: str):
-        """Import image via direct upload to Harvester."""
-        print(colored("\n📤 Upload Method", Colors.BOLD))
-        print("\nThis method requires 'virtctl' to be installed on this machine.")
-        print("Install: https://kubevirt.io/user-guide/operations/virtctl/")
-        
-        # Check if virtctl is available
-        import shutil
-        virtctl_path = shutil.which('virtctl')
-        
-        if not virtctl_path:
-            print(colored("\n⚠️  'virtctl' not found in PATH", Colors.YELLOW))
-            print("\nAlternative: Manual upload via Harvester UI")
-            print(f"  1. Go to Harvester UI → Images → Create")
-            print(f"  2. Select 'Upload' as source type")
-            print(f"  3. Upload file: {selected_file['path']}")
-            print(f"  4. Name: {image_name}")
-            print(f"  5. Namespace: {namespace}")
-            print(f"  6. StorageClass: {storage_class}")
-            return
-        
-        print(colored(f"✅ virtctl found: {virtctl_path}", Colors.GREEN))
-        
-        # Get kubeconfig path
-        kubeconfig = self.input_prompt("Kubeconfig path [~/.kube/harvester.yaml]")
-        if not kubeconfig:
-            kubeconfig = os.path.expanduser("~/.kube/harvester.yaml")
-        
-        # Build virtctl command
-        file_size = selected_file['size']
-        print(f"\n📤 Uploading {selected_file['name']} ({format_size(file_size)}) to Harvester...")
-        print(f"   StorageClass template: {storage_class}")
-        print(colored("   This may take a while for large images...", Colors.YELLOW))
-        
-        # Create image first, then upload
+        # Volume size - get virtual size
         import subprocess
+        try:
+            result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', selected_file['path']],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+                virtual_size = info.get('virtual-size', 0)
+                virtual_size_gb = virtual_size / (1024**3)
+                min_size_gi = int(virtual_size_gb) + 1
+                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB")
+            else:
+                min_size_gi = int(selected_file['size'] / (1024**3)) + 10
+        except:
+            min_size_gi = int(selected_file['size'] / (1024**3)) + 10
         
-        # Use virtctl to upload
-        cmd = [
-            'virtctl', 'image-upload',
-            f'--image-path={selected_file["path"]}',
-            f'--storage-class={storage_class}',
-            f'--size={file_size}',
-            f'--uploadproxy-url=https://{self.config["harvester"]["api_url"].replace("https://", "").split(":")[0]}:31001',
-            f'--namespace={namespace}',
-            f'--kubeconfig={kubeconfig}',
-            '--insecure',
-            '--force-bind',
-            f'pvc/{image_name}'
-        ]
+        default_size = max(min_size_gi, 10)
+        size_input = self.input_prompt(f"Volume size in GiB (min {min_size_gi}) [{default_size}]")
+        size_gi = int(size_input) if size_input else default_size
+        if size_gi < min_size_gi:
+            size_gi = min_size_gi
         
-        print(f"Command: {' '.join(cmd)}")
-        confirm = self.input_prompt("\nRun upload? (y/n)")
+        # Summary
+        print(colored("\n📋 Summary:", Colors.BOLD))
+        print(f"   Source: {selected_file['name']}")
+        print(f"   Volume: {vol_name}")
+        print(f"   Namespace: {namespace}")
+        print(f"   Storage class: {selected_sc}")
+        print(f"   Size: {size_gi} GiB")
+        
+        confirm = self.input_prompt("\nCreate volume? (y/n)")
         if confirm.lower() != 'y':
             print("Cancelled")
             return
         
+        # Start HTTP server
+        print(colored("\n🚀 Starting HTTP server...", Colors.CYAN))
+        
+        transfer_config = self.config.get('transfer', {})
+        http_server_ip = transfer_config.get('http_server_ip', None)
+        
+        http_url = self.actions.start_http_server(8080, bind_ip=http_server_ip)
+        print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
+        
+        if "127.0" in http_url:
+            print(colored("⚠️  Warning: URL contains localhost!", Colors.YELLOW))
+            print(colored("   Add http_server_ip to config.yaml", Colors.YELLOW))
+            self.actions.stop_http_server()
+            return
+        
+        # Build file URL
+        file_url = f"{http_url}/{selected_file['name']}"
+        print(f"   File URL: {file_url}")
+        
+        # Create DataVolume
+        print(colored("\n📦 Creating DataVolume...", Colors.CYAN))
+        print("   CDI will download and convert qcow2 → raw")
+        
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(colored(f"✅ Upload complete!", Colors.GREEN))
-                print(result.stdout)
-            else:
-                print(colored(f"❌ Upload failed", Colors.RED))
-                print(result.stderr)
-                print("\nAlternative: Use HTTP method or upload via Harvester UI")
+            result = self.harvester.create_datavolume(
+                name=vol_name,
+                http_url=file_url,
+                size_gi=size_gi,
+                storage_class=selected_sc,
+                namespace=namespace
+            )
+            print(colored(f"✅ DataVolume created: {vol_name}", Colors.GREEN))
         except Exception as e:
-            print(colored(f"❌ Error: {e}", Colors.RED))
+            print(colored(f"❌ Failed to create DataVolume: {e}", Colors.RED))
+            self.actions.stop_http_server()
+            return
+        
+        # Wait for completion
+        print(colored("\n⏳ Waiting for CDI to download and process...", Colors.CYAN))
+        print("   Press Ctrl+C to stop waiting (import continues in background)")
+        
+        import time
+        start_time = time.time()
+        
+        try:
+            while True:
+                status = self.harvester.get_datavolume_status(vol_name, namespace)
+                phase = status.get('phase', 'Unknown')
+                progress = status.get('progress', '')
+                elapsed = int(time.time() - start_time)
+                
+                progress_str = f" ({progress})" if progress and progress != 'N/A' else ""
+                print(f"\r   Status: {phase}{progress_str} - {elapsed}s     ", end='', flush=True)
+                
+                if phase == 'Succeeded':
+                    print(colored(f"\n\n✅ Volume created: {namespace}/{vol_name}", Colors.GREEN))
+                    print(colored("   Ready for VM creation!", Colors.GREEN))
+                    break
+                elif phase in ('Failed', 'Error'):
+                    print(colored(f"\n\n❌ Failed: {phase}", Colors.RED))
+                    break
+                
+                if elapsed > 1800:
+                    print(colored(f"\n\n⚠️  Timeout - check: kubectl get dv {vol_name} -n {namespace}", Colors.YELLOW))
+                    break
+                
+                time.sleep(5)
+                
+        except KeyboardInterrupt:
+            print(colored(f"\n\n⚠️  Import continues in background", Colors.YELLOW))
+        
+        finally:
+            self.actions.stop_http_server()
+            print(colored("✅ HTTP server stopped", Colors.GREEN))
     
     def get_harvester_namespaces(self) -> list:
         """Get list of namespaces from Harvester."""
@@ -1826,52 +1768,58 @@ class MigrationTool:
             return ['default']
     
     def create_harvester_vm(self):
-        """Create a VM in Harvester from Nutanix specs - using imported Harvester images."""
+        """Create a VM in Harvester using existing PVCs (created via DataVolume)."""
         if not self.harvester and not self.connect_harvester():
             return
         
         print(colored("\n🖥️  Create VM in Harvester", Colors.BOLD))
         print(colored("-" * 50, Colors.BLUE))
         
-        # Get available images first
-        images = self.harvester.list_all_images()
-        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100]
+        # Get namespace first
+        namespaces = self.get_harvester_namespaces()
+        print("\nAvailable namespaces:")
+        for i, ns in enumerate(namespaces, 1):
+            print(f"  {i}. {ns}")
         
-        if not active_images:
-            print(colored("❌ No active images available. Import images first.", Colors.RED))
+        choice = self.input_prompt("Namespace number [1]")
+        try:
+            idx = int(choice) - 1 if choice else 0
+            namespace = namespaces[idx]
+        except:
+            namespace = namespaces[0]
+        
+        # List available PVCs
+        all_pvcs = self.harvester.list_pvcs(namespace)
+        if not all_pvcs:
+            print(colored(f"❌ No PVCs found in {namespace}. Import volumes first (option 6).", Colors.RED))
             return
         
-        # Detect VM names from images (e.g., "wlchgvaopefs1-disk0" → "wlchgvaopefs1")
+        # Detect VM names from PVCs (e.g., "vm-name-disk0" → "vm-name")
         detected_vms = {}
-        for img in active_images:
-            name = img.get('metadata', {}).get('name', '')
-            if '-disk' in name:
-                vm_base = name.rsplit('-disk', 1)[0]
+        for pvc in all_pvcs:
+            pvc_name = pvc.get('metadata', {}).get('name', '')
+            if '-disk' in pvc_name:
+                vm_base = pvc_name.rsplit('-disk', 1)[0]
                 if vm_base not in detected_vms:
                     detected_vms[vm_base] = []
-                detected_vms[vm_base].append(img)
+                detected_vms[vm_base].append(pvc)
         
         # Look for saved VM configs
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         migrations_dir = os.path.join(staging_dir, 'migrations')
         
-        # If no VM selected, try to auto-detect from saved configs
         vm_info = None
-        source_mac = None
-        source_ip = None
-        source_disks = []
         loaded_config = None
         
         if not self._selected_vm:
-            # Show detected VMs with their configs
             if detected_vms:
-                print(colored("\n🔍 Detected VMs from imported images:", Colors.BOLD))
+                print(colored("\n🔍 Detected VMs from PVCs:", Colors.BOLD))
                 detected_list = list(detected_vms.keys())
                 for i, vm_base in enumerate(detected_list, 1):
                     disk_count = len(detected_vms[vm_base])
                     config_path = os.path.join(migrations_dir, vm_base.lower(), 'vm-config.json')
                     has_config = os.path.exists(config_path)
-                    status = colored("✓ config found", Colors.GREEN) if has_config else colored("○ no config", Colors.YELLOW)
+                    status = colored("✓ config", Colors.GREEN) if has_config else colored("○ manual", Colors.YELLOW)
                     print(f"   {i}. {vm_base} ({disk_count} disk(s)) {status}")
                 print(f"   0. Enter manually")
                 
@@ -1890,1290 +1838,198 @@ class MigrationTool:
                 try:
                     with open(config_path) as f:
                         loaded_config = json.load(f)
-                    print(colored(f"\n✅ Loaded saved config: {config_path}", Colors.GREEN))
+                    print(colored(f"\n✅ Loaded config: {config_path}", Colors.GREEN))
                     
-                    # Build vm_info from loaded config
-                    # Priority: nutanix block > root level > defaults
                     nutanix_info = loaded_config.get('nutanix', {})
-                    
                     vm_info = {
-                        'vcpu': nutanix_info.get('cpu_cores', loaded_config.get('cpu_cores', 2)),
-                        'memory_mb': nutanix_info.get('memory_mb', loaded_config.get('memory_mb', 4096)),
-                        'boot_type': nutanix_info.get('boot_type', loaded_config.get('boot_type', 'BIOS')),
-                        'disks': [],
-                        'nics': []
+                        'vcpu': nutanix_info.get('cpu_cores', loaded_config.get('cpu_cores', 4)),
+                        'memory_mb': nutanix_info.get('memory_mb', loaded_config.get('memory_mb', 8192)),
+                        'boot_type': nutanix_info.get('boot_type', loaded_config.get('boot_type', 'UEFI')),
                     }
-                    
-                    # Extract disk info from storage.disks
-                    storage_disks = loaded_config.get('storage', {}).get('disks', [])
-                    
-                    # Note: We don't auto-detect UEFI from partitions as both BIOS (System Reserved)
-                    # and UEFI (EFI System) have similar ~100MB partitions. Boot type should come
-                    # from Nutanix API or be set manually.
-                    
-                    for disk in storage_disks:
-                        # vm-config.json uses size_gb directly
-                        size_gb = disk.get('size_gb', 0)
-                        if size_gb == 0:
-                            # Fallback to size_bytes if present
-                            size_gb = disk.get('size_bytes', 0) // (1024**3)
-                        
-                        disk_num = disk.get('number', len(vm_info['disks']))
-                        vm_info['disks'].append({
-                            'size_bytes': size_gb * (1024**3),
-                            'adapter': disk.get('controller_type', 'SCSI'),
-                            'index': disk_num
-                        })
-                        source_disks.append({
-                            'index': disk_num,
-                            'size_gb': size_gb,
-                            'adapter': disk.get('controller_type', 'SCSI')
-                        })
-                    
-                    # Extract network info from network.interfaces
-                    network_interfaces = loaded_config.get('network', {}).get('interfaces', [])
-                    for nic in network_interfaces:
-                        vm_info['nics'].append(nic)
-                    
-                    print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}", Colors.GREEN))
-                    print(f"   Disks: {len(source_disks)}")
-                    for d in source_disks:
-                        print(f"      Disk {d['index']}: {d['size_gb']} GB")
-                    print(f"   NICs: {len(vm_info['nics'])}")
-                    
+                    print(f"   CPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}")
                 except Exception as e:
                     print(colored(f"   ⚠️  Error loading config: {e}", Colors.YELLOW))
         
-        # Fallback: Get Nutanix VM specs if connected
-        if not vm_info and self._selected_vm and self.nutanix:
-            print(f"\n📋 Getting specs from Nutanix VM: {self._selected_vm}")
-            vm = self.nutanix.get_vm_by_name(self._selected_vm)
-            if vm:
-                vm_info = NutanixClient.parse_vm_info(vm)
-                print(colored(f"   vCPU: {vm_info['vcpu']}, RAM: {format_size(vm_info['memory_mb'] * 1024 * 1024)}, Boot: {vm_info['boot_type']}", Colors.GREEN))
-                
-                # Display disk info
-                if vm_info['disks']:
-                    print(colored(f"\n💾 Source Disks ({len(vm_info['disks'])}):", Colors.BOLD))
-                    for i, disk in enumerate(vm_info['disks']):
-                        size_gb = disk['size_bytes'] // (1024**3)
-                        adapter = disk.get('adapter', 'N/A')
-                        index = disk.get('index', i)
-                        print(f"   Disk {i}: {adapter}.{index} - {size_gb} GB")
-                        source_disks.append({
-                            'index': i,
-                            'size_gb': size_gb,
-                            'adapter': adapter
-                        })
-                
-                # Display network info
-                if vm_info['nics']:
-                    print(colored("\n🌐 Source Network Configuration:", Colors.BOLD))
-                    for i, nic in enumerate(vm_info['nics']):
-                        source_mac = nic.get('mac')
-                        source_ip = nic.get('ip')
-                        subnet = nic.get('subnet', 'N/A')
-                        print(f"   NIC {i}: {subnet}")
-                        print(f"      MAC: {colored(source_mac, Colors.YELLOW)}")
-                        print(f"      IP:  {colored(source_ip or 'DHCP/Unknown', Colors.YELLOW)}")
-                    print(colored("\n   ⚠️  Save this info! You may need to reconfigure network.", Colors.YELLOW))
-        
         # VM Name
-        default_name = self._selected_vm.split(' - ')[0] if self._selected_vm and ' - ' in self._selected_vm else (self._selected_vm or "")
-        vm_name = self.input_prompt(f"VM name [{default_name}]")
-        if not vm_name:
-            vm_name = default_name
+        default_name = self._selected_vm or ""
+        vm_name = self.input_prompt(f"VM name [{default_name}]") or default_name
         if not vm_name:
             print(colored("❌ VM name required", Colors.RED))
             return
+        vm_name = vm_name.lower().replace('_', '-')
         
-        # Get available namespaces
-        namespaces = self.get_harvester_namespaces()
+        # Select PVCs for disks
+        print(colored("\n💾 Select PVCs for VM disks:", Colors.BOLD))
         
-        print("\nAvailable namespaces:")
-        for i, ns in enumerate(namespaces, 1):
-            print(f"  {i}. {ns}")
-        
-        choice = self.input_prompt("Namespace number [1]")
-        try:
-            idx = int(choice) - 1 if choice else 0
-            namespace = namespaces[idx]
-        except:
-            namespace = namespaces[0]
-        
-        # Get available images
-        images = self.harvester.list_all_images()
-        active_images = [img for img in images if img.get('status', {}).get('progress', 0) == 100]
-        
-        if not active_images:
-            print(colored("❌ No active images available. Import images first (Menu 3 → Option 6).", Colors.RED))
-            return
-        
-        # Determine number of disks
-        num_disks = len(source_disks) if source_disks else 1
-        if not source_disks:
-            num_disks_input = self.input_prompt("Number of disks [1]")
-            num_disks = int(num_disks_input) if num_disks_input else 1
-        
-        print(f"\n💾 Configuring {num_disks} disk(s)...")
-        
-        # Auto-detect images matching VM name
-        vm_images = []
-        if vm_name:
-            # Find images matching pattern: vmname-disk0, vmname-disk1, etc.
-            for disk_idx in range(num_disks):
-                expected_name = f"{vm_name.lower()}-disk{disk_idx}"
-                for img in active_images:
-                    img_name = img.get('metadata', {}).get('name', '').lower()
-                    if img_name == expected_name:
-                        vm_images.append(img)
-                        break
-        
-        # Select images for each disk
-        selected_images = []
-        disk_sizes = []
-        
-        for disk_idx in range(num_disks):
-            print(f"\n--- Disk {disk_idx} ---")
+        # Auto-select if we have detected disks for this VM
+        selected_pvcs = []
+        if vm_name in detected_vms or self._selected_vm in detected_vms:
+            key = vm_name if vm_name in detected_vms else self._selected_vm
+            auto_pvcs = sorted(detected_vms[key], key=lambda p: p.get('metadata', {}).get('name', ''))
+            print(f"   Auto-detected {len(auto_pvcs)} disk(s) for {key}:")
+            for i, pvc in enumerate(auto_pvcs):
+                pvc_name = pvc.get('metadata', {}).get('name', '')
+                size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
+                print(f"      Disk {i}: {pvc_name} ({size})")
+                selected_pvcs.append({'name': pvc_name, 'size': size})
             
-            # Check if we have an auto-detected image
-            auto_image = None
-            auto_image_idx = None
-            if disk_idx < len(vm_images):
-                auto_image = vm_images[disk_idx]
-                # Find its index in active_images
-                for i, img in enumerate(active_images):
-                    if img.get('metadata', {}).get('name') == auto_image.get('metadata', {}).get('name'):
-                        auto_image_idx = i + 1
-                        break
+            use_auto = self.input_prompt("\nUse these PVCs? (y/n) [y]") or "y"
+            if use_auto.lower() != 'y':
+                selected_pvcs = []
+        
+        # Manual selection if needed
+        if not selected_pvcs:
+            print("\nAvailable PVCs:")
+            for i, pvc in enumerate(all_pvcs, 1):
+                pvc_name = pvc.get('metadata', {}).get('name', '')
+                size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
+                print(f"  {i}. {pvc_name} ({size})")
             
-            print("Available images:")
-            for i, img in enumerate(active_images, 1):
-                name = img.get('metadata', {}).get('name', 'N/A')
-                ns = img.get('metadata', {}).get('namespace', 'N/A')
-                size = img.get('status', {}).get('size', 0)
-                marker = colored(" ← auto-detected", Colors.GREEN) if auto_image and name == auto_image.get('metadata', {}).get('name') else ""
-                print(f"  {i}. {name} ({ns}) - {format_size(size)}{marker}")
-            
-            default_choice = str(auto_image_idx) if auto_image_idx else ""
-            choice = self.input_prompt(f"Image number for disk {disk_idx} [{default_choice}]")
-            if not choice:
-                choice = default_choice
-            if not choice:
-                print(colored("Cancelled", Colors.YELLOW))
+            pvc_choices = self.input_prompt("PVC numbers (comma-separated, first=boot)")
+            if not pvc_choices:
                 return
+            
             try:
-                idx = int(choice) - 1
-                selected_image = active_images[idx]
-                image_name = selected_image.get('metadata', {}).get('name')
-                image_ns = selected_image.get('metadata', {}).get('namespace')
-                image_size_bytes = selected_image.get('status', {}).get('size', 0)
-                image_size_gb = max(1, image_size_bytes // (1024**3))  # Convert to GB, minimum 1
-                selected_images.append({'name': image_name, 'namespace': image_ns, 'size_gb': image_size_gb})
-                print(colored(f"   ✓ Selected: {image_name}", Colors.GREEN))
+                indices = [int(x.strip()) - 1 for x in pvc_choices.split(',')]
+                for idx in indices:
+                    pvc = all_pvcs[idx]
+                    selected_pvcs.append({
+                        'name': pvc.get('metadata', {}).get('name', ''),
+                        'size': pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
+                    })
             except:
-                print(colored("Invalid choice", Colors.RED))
+                print(colored("Invalid selection", Colors.RED))
                 return
-            
-            # Disk size - priority: source_disks > image size > 50GB default
-            if disk_idx < len(source_disks) and source_disks[disk_idx].get('size_gb', 0) > 0:
-                default_size = source_disks[disk_idx]['size_gb']
-            elif image_size_gb > 0:
-                default_size = image_size_gb
-            else:
-                default_size = 50
-            
-            size_input = self.input_prompt(f"Disk {disk_idx} size in GB [{default_size}]")
-            disk_size = int(size_input) if size_input else default_size
-            disk_sizes.append(disk_size)
         
-        # Get available networks - filter by VM namespace
-        all_networks = self.harvester.list_all_networks()
+        # CPU and RAM
+        default_cpu = str(vm_info['vcpu']) if vm_info else "4"
+        default_ram = str(vm_info['memory_mb'] // 1024) if vm_info else "8"
         
-        # Filter networks: include those in VM's namespace + default namespace (shared)
-        networks = []
-        for net in all_networks:
-            net_ns = net.get('metadata', {}).get('namespace', '')
-            if net_ns == namespace or net_ns == 'default':
-                networks.append(net)
+        cpu = int(self.input_prompt(f"CPU cores [{default_cpu}]") or default_cpu)
+        ram = int(self.input_prompt(f"RAM in GB [{default_ram}]") or default_ram)
         
+        # Boot type
+        default_boot = "2" if (vm_info and vm_info.get('boot_type') == 'UEFI') else "1"
+        print(colored("\n🔧 Boot Type:", Colors.BOLD))
+        print("   1. BIOS (legacy)")
+        print("   2. UEFI (modern, for Windows 10+)")
+        
+        boot_choice = self.input_prompt(f"Boot type [{default_boot}]") or default_boot
+        boot_type = "UEFI" if boot_choice == "2" else "BIOS"
+        
+        # Disk bus
+        print(colored("\n💾 Disk Bus:", Colors.BOLD))
+        print("   1. sata   - Most compatible (recommended for migration)")
+        print("   2. virtio - Best performance (requires VirtIO drivers)")
+        
+        bus_choice = self.input_prompt("Disk bus [1]") or "1"
+        disk_bus = "virtio" if bus_choice == "2" else "sata"
+        
+        # Network
+        print(colored("\n🌐 Network:", Colors.BOLD))
+        networks = self.harvester.list_networks(namespace)
         if not networks:
-            print(colored(f"❌ No networks available in namespace '{namespace}' or 'default'", Colors.RED))
-            print(colored("   Create a network in Harvester first", Colors.YELLOW))
-            return
+            networks = self.harvester.list_networks("default")
         
-        # Build source NICs list from Nutanix VM info or vm-config.json
-        source_nics = []
-        virtio_installed = False  # Will be set to True if VirtIO drivers detected
-        
-        # First try vm-config.json (more detailed with static IPs)
-        if vm_info:
-            staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
-            hostname = vm_info.get('hostname') or vm_name
-            config_path = os.path.join(staging_dir, 'migrations', hostname.lower(), 'vm-config.json')
+        if networks:
+            for i, net in enumerate(networks, 1):
+                net_name = net.get('metadata', {}).get('name', 'N/A')
+                print(f"   {i}. {net_name}")
             
-            if os.path.exists(config_path):
-                try:
-                    with open(config_path) as f:
-                        vm_config = json.load(f)
-                    for iface in vm_config.get('network', {}).get('interfaces', []):
-                        source_nics.append({
-                            'name': iface.get('name', 'Unknown'),
-                            'mac': iface.get('mac', ''),
-                            'ip': iface.get('ip', ''),
-                            'prefix': iface.get('prefix', ''),
-                            'gateway': iface.get('gateway', ''),
-                            'dhcp': iface.get('dhcp', True),
-                            'dns': iface.get('dns', [])
-                        })
-                    print(colored(f"   📋 Loaded network config from: {config_path}", Colors.GREEN))
-                    
-                    # Check if VirtIO drivers are installed
-                    agents = vm_config.get('agents', {})
-                    if agents.get('virtio_fedora') or agents.get('virtio_redhat'):
-                        virtio_installed = True
-                        print(colored("   ✅ VirtIO drivers detected in source VM", Colors.GREEN))
-                    else:
-                        virtio_installed = False
-                except Exception as e:
-                    print(colored(f"   ⚠️  Could not load vm-config.json: {e}", Colors.YELLOW))
-                    virtio_installed = False
-            else:
-                virtio_installed = False
-        
-        # Fallback to Nutanix VM info
-        if not source_nics and vm_info and vm_info.get('nics'):
-            for nic in vm_info['nics']:
-                source_nics.append({
-                    'name': nic.get('subnet', 'Unknown'),
-                    'mac': nic.get('mac', ''),
-                    'ip': nic.get('ip', ''),
-                    'prefix': '',
-                    'gateway': '',
-                    'dhcp': True,
-                    'dns': []
-                })
-        
-        # Default to 1 NIC if no source info
-        if not source_nics:
-            num_nics = self.input_prompt("Number of network interfaces [1]")
-            num_nics = int(num_nics) if num_nics else 1
-            for i in range(num_nics):
-                source_nics.append({
-                    'name': f'NIC-{i}',
-                    'mac': '',
-                    'ip': '',
-                    'prefix': '',
-                    'gateway': '',
-                    'dhcp': True,
-                    'dns': []
-                })
-        
-        # Network mapping: for each source NIC, select target Harvester network
-        print(colored(f"\n🌐 Network Mapping ({len(source_nics)} NIC(s)):", Colors.BOLD))
-        print(colored("   Map each source NIC to a Harvester network", Colors.CYAN))
-        
-        nic_configs = []  # Will store {network_name, mac, source_info}
-        
-        for i, src_nic in enumerate(source_nics):
-            print(colored(f"\n   --- Source NIC {i}: {src_nic['name']} ---", Colors.BOLD))
-            if src_nic['mac']:
-                print(f"      MAC: {colored(src_nic['mac'], Colors.YELLOW)}")
-            if src_nic['ip']:
-                prefix = f"/{src_nic['prefix']}" if src_nic['prefix'] else ""
-                dhcp_status = "(DHCP)" if src_nic['dhcp'] else "(Static)"
-                print(f"      IP:  {colored(src_nic['ip'] + prefix, Colors.YELLOW)} {dhcp_status}")
-            if src_nic['gateway']:
-                print(f"      GW:  {src_nic['gateway']}")
-            if src_nic['dns']:
-                print(f"      DNS: {', '.join(src_nic['dns'])}")
-            
-            # List available Harvester networks
-            print(f"\n   Available Harvester networks:")
-            for j, net in enumerate(networks, 1):
-                name = net.get('metadata', {}).get('name', 'N/A')
-                ns = net.get('metadata', {}).get('namespace', 'N/A')
-                # Try to get VLAN ID from config
-                vlan_id = net.get('spec', {}).get('vlan', '')
-                vlan_str = f" (VLAN {vlan_id})" if vlan_id else ""
-                print(f"     {j}. {name} ({ns}){vlan_str}")
-            
-            choice = self.input_prompt(f"   Network for NIC {i}")
-            if not choice:
-                print(colored("   Cancelled", Colors.YELLOW))
-                return
+            net_choice = self.input_prompt("Network [1]") or "1"
             try:
-                idx = int(choice) - 1
-                selected_net = networks[idx]
-                net_name = f"{selected_net.get('metadata', {}).get('namespace')}/{selected_net.get('metadata', {}).get('name')}"
+                net_idx = int(net_choice) - 1
+                net_ns = networks[net_idx].get('metadata', {}).get('namespace', namespace)
+                network_name = f"{net_ns}/{networks[net_idx].get('metadata', {}).get('name')}"
             except:
-                print(colored("   Invalid choice", Colors.RED))
-                return
-            
-            # MAC address option
-            use_mac = None
-            if src_nic['mac']:
-                keep_mac = self.input_prompt(f"   Keep MAC {src_nic['mac']}? (y/n) [y]")
-                if keep_mac.lower() != 'n':
-                    use_mac = src_nic['mac']
-                    print(colored(f"   ✅ Will use MAC: {use_mac}", Colors.GREEN))
-            
-            if not use_mac:
-                manual_mac = self.input_prompt("   Custom MAC (or Enter for auto)")
-                if manual_mac:
-                    use_mac = manual_mac
-            
-            nic_configs.append({
-                'network_name': net_name,
-                'mac': use_mac,
-                'source': src_nic
-            })
-        
-        # Note: Storage class is determined automatically per image (longhorn-<image-name>)
-        
-        # CPU, RAM, Boot type
-        default_cpu = vm_info['vcpu'] if vm_info else 2
-        default_ram = vm_info['memory_mb'] // 1024 if vm_info else 4
-        
-        # Boot type detection - priority: vm-config.json > disk analysis > BIOS default
-        # IMPORTANT: vm-config.json contains the ACTUAL boot type from the source VM
-        # Disk analysis (GPT=UEFI) is just a heuristic and can be WRONG (GPT+BIOS is valid!)
-        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
-        vm_migration_dir = os.path.join(staging_dir, 'migrations', vm_name.lower())
-        disk0_qcow2 = os.path.join(vm_migration_dir, f"{vm_name.lower()}-disk0.qcow2")
-        
-        # First check vm-config.json (most reliable source)
-        config_boot = None
-        if vm_info and vm_info.get('boot_type'):
-            config_boot = vm_info['boot_type']
-        
-        # Only detect from disk if no config available
-        detected_boot = None
-        if not config_boot and os.path.exists(disk0_qcow2):
-            print(colored("\n🔍 Detecting boot type from disk...", Colors.CYAN))
-            detected_boot = detect_boot_type_from_disk(disk0_qcow2)
-            print(colored(f"   Detected: {detected_boot} (from disk partition table)", Colors.GREEN))
-            print(colored(f"   ⚠️  Warning: GPT doesn't always mean UEFI! Check source VM.", Colors.YELLOW))
-        
-        # Priority: config > detected > BIOS default
-        if config_boot:
-            default_boot = config_boot
-            print(colored(f"\n🔒 Boot Type: {default_boot} (from saved config)", Colors.GREEN))
-        elif detected_boot:
-            default_boot = detected_boot
+                network_name = f"{namespace}/vlan1"
         else:
-            default_boot = 'BIOS'
-        
-        cpu = self.input_prompt(f"CPU cores [{default_cpu}]")
-        cpu = int(cpu) if cpu else default_cpu
-        
-        ram = self.input_prompt(f"RAM in GB [{default_ram}]")
-        ram = int(ram) if ram else default_ram
-        
-        # Boot type - CRITICAL: must match source disk
-        print(colored(f"\n🔒 Boot Type:", Colors.BOLD))
-        if config_boot:
-            print(colored(f"   From saved config: {default_boot}", Colors.CYAN))
-            print(colored(f"   ✅ This is the ACTUAL boot type from the source VM", Colors.GREEN))
-        elif detected_boot:
-            print(colored(f"   Detected from disk: {default_boot}", Colors.CYAN))
-            print(colored(f"   ⚠️  Warning: GPT partition doesn't always mean UEFI!", Colors.YELLOW))
-            print(colored(f"   ⚠️  If source VM was BIOS, change this to BIOS!", Colors.YELLOW))
-        else:
-            print(colored(f"   Default: {default_boot}", Colors.CYAN))
-        
-        print(f"   (BIOS disks cannot boot in UEFI mode and vice versa)")
-        
-        change_boot = self.input_prompt(f"   Keep {default_boot}? (Y/n) [Y]") or "Y"
-        if change_boot.lower() == 'n':
-            new_boot = "UEFI" if default_boot == "BIOS" else "BIOS"
-            print(colored(f"\n   🚨 DANGER: Changing from {default_boot} to {new_boot}!", Colors.RED))
-            print(colored(f"      This will almost certainly cause boot failure!", Colors.RED))
-            confirm = self.input_prompt(f"   Type 'YES' to confirm change to {new_boot}") or ""
-            if confirm == "YES":
-                boot = new_boot
-                print(colored(f"   → Changed to {boot} (at your own risk!)", Colors.YELLOW))
-            else:
-                boot = default_boot
-                print(colored(f"   → Keeping {boot}", Colors.GREEN))
-        else:
-            boot = default_boot
-            print(colored(f"   ✅ Using {boot}", Colors.GREEN))
-        
-        # Storage Class info - determined at image import time
-        print(colored("\n💾 Storage Class:", Colors.BOLD))
-        print("   Storage class is determined by the image's StorageClass template")
-        print("   (set at image import time). Each disk will use:")
-        for i, img in enumerate(selected_images):
-            img_name = img['name']
-            image_sc = f"longhorn-{img_name}"
-            print(f"     Disk {i}: {image_sc}")
-        
-        # Disk bus selection
-        print(colored("\n💾 Disk Bus Selection:", Colors.BOLD))
-        print("   - sata   : Most compatible, recommended for initial migration")
-        print("   - virtio : Best performance, requires Red Hat/Fedora VirtIO drivers")
-        print("   - scsi   : Uses virtio-scsi, also requires VirtIO drivers")
-        
-        # For migrations from Nutanix, ALWAYS recommend SATA first
-        # Nutanix VirtIO drivers are NOT compatible with KVM/QEMU VirtIO!
-        print(colored("\n   ⚠️  IMPORTANT: Nutanix VirtIO drivers are NOT compatible with Harvester!", Colors.YELLOW))
-        print(colored("      Use SATA for initial migration, then switch to VirtIO after installing", Colors.YELLOW))
-        print(colored("      Red Hat VirtIO drivers on the running VM.", Colors.YELLOW))
-        
-        default_bus = "sata"
-        print(colored(f"\n   → Recommending SATA for safe initial boot", Colors.CYAN))
-        
-        disk_bus = self.input_prompt(f"Disk bus (sata/virtio/scsi) [{default_bus}]")
-        disk_bus = disk_bus.lower() if disk_bus else default_bus
-        if disk_bus not in ('sata', 'virtio', 'scsi'):
-            disk_bus = default_bus
-        
-        if disk_bus == "virtio":
-            print(colored("\n   🚨 WARNING: VirtIO selected for initial migration!", Colors.RED))
-            print(colored("      This may fail to boot if Red Hat VirtIO drivers are not installed.", Colors.RED))
-            print(colored("      Nutanix VirtIO drivers will NOT work on Harvester!", Colors.RED))
-            confirm = self.input_prompt("   Type 'YES' to confirm VirtIO") or ""
-            if confirm != "YES":
-                disk_bus = "sata"
-                print(colored("   → Using SATA instead", Colors.GREEN))
+            network_name = self.input_prompt("Network (ns/name)") or f"{namespace}/vlan1"
         
         # Summary
-        print(colored(f"\n📋 VM Configuration:", Colors.BOLD))
-        print(f"   Name: {vm_name}")
+        print(colored("\n📋 Summary:", Colors.BOLD))
+        print(f"   VM: {vm_name}")
         print(f"   Namespace: {namespace}")
-        print(f"   Disks: {num_disks}")
-        for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
-            image_sc = f"longhorn-{img['name']}"
-            print(f"      Disk {i}: {img['name']} - {size} GB - SC: {image_sc}")
-        print(f"   Disk bus: {disk_bus}")
-        print(f"   Network interfaces: {len(nic_configs)}")
-        for i, nic in enumerate(nic_configs):
-            mac_str = nic['mac'] if nic['mac'] else "auto"
-            src_ip = nic['source'].get('ip', '')
-            ip_str = f" (was: {src_ip})" if src_ip else ""
-            print(f"      NIC {i}: {nic['network_name']} - MAC: {mac_str}{ip_str}")
-        print(f"   CPU: {cpu} cores")
-        print(f"   RAM: {ram} GB")
-        print(f"   Boot: {boot}")
+        print(f"   CPU: {cpu}, RAM: {ram} GB, Boot: {boot_type}, Bus: {disk_bus}")
+        print(f"   Network: {network_name}")
+        print(f"   Disks ({len(selected_pvcs)}):")
+        for i, pvc in enumerate(selected_pvcs):
+            boot = " (boot)" if i == 0 else ""
+            print(f"      {pvc['name']}{boot}")
         
         confirm = self.input_prompt("\nCreate VM? (y/n)")
         if confirm.lower() != 'y':
             print("Cancelled")
             return
         
-        # =====================================================
-        # SIMPLIFIED WORKFLOW: 
-        # - StorageClass was already defined at image import time
-        # - Just create VM with volumeClaimTemplates using image's storageClass
-        # - Wait for data copy
-        # - Dissociate from image to allow deletion
-        # =====================================================
+        # Build VM manifest with PVC references (NO images)
+        print(colored("\n🚀 Creating VM...", Colors.CYAN))
         
-        import random
-        import string
-        import time
-        
-        print(colored("\n" + "="*60, Colors.BLUE))
-        print(colored("📦 CREATING VM WITH VOLUMES", Colors.BOLD))
-        print(colored("="*60, Colors.BLUE))
-        
-        # Build disks, volumes, and volumeClaimTemplates
         disks_spec = []
         volumes_spec = []
-        volume_claim_templates = []
-        volume_names = []
         
-        for i, (img, size) in enumerate(zip(selected_images, disk_sizes)):
+        for i, pvc in enumerate(selected_pvcs):
             disk_name = f"disk-{i}"
-            img_name = img['name']
-            img_ns = img['namespace']
-            
-            # Generate random suffix for volume names (like Harvester does)
-            suffix = ''.join(random.choices(string.ascii_lowercase, k=5))
-            volume_name = f"{vm_name}-disk{i}-{suffix}"
-            volume_names.append(volume_name)
-            
-            # The image's auto-created storageClass (inherits params from template selected at import)
-            image_storage_class = f"longhorn-{img_name}"
-            
-            print(f"   Disk {i}: {img_name} → {volume_name}")
-            print(f"      Size: {size} GB, StorageClass: {image_storage_class}")
-            
-            # Disk spec
-            disk_spec = {
-                "name": disk_name,
-                "disk": {
-                    "bus": disk_bus
-                }
-            }
+            disk_spec = {"name": disk_name, "disk": {"bus": disk_bus}}
             if i == 0:
                 disk_spec["bootOrder"] = 1
             disks_spec.append(disk_spec)
             
-            # Volume spec
             volumes_spec.append({
                 "name": disk_name,
-                "persistentVolumeClaim": {
-                    "claimName": volume_name
-                }
+                "persistentVolumeClaim": {"claimName": pvc['name']}
             })
-            
-            # VolumeClaimTemplate - uses the image's auto-created storageClass
-            volume_claim_templates.append({
-                "metadata": {
-                    "name": volume_name,
-                    "annotations": {
-                        "harvesterhci.io/imageId": f"{img_ns}/{img_name}"
+        
+        net_model = "e1000" if disk_bus == "sata" else "virtio"
+        
+        manifest = {
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "metadata": {
+                "name": vm_name,
+                "namespace": namespace,
+                "labels": {"harvesterhci.io/creator": "harvesterhci"},
+                "annotations": {"harvesterhci.io/vmRunStrategy": "RerunOnFailure"}
+            },
+            "spec": {
+                "runStrategy": "RerunOnFailure",
+                "template": {
+                    "metadata": {"labels": {"harvesterhci.io/vmName": vm_name}},
+                    "spec": {
+                        "domain": {
+                            "cpu": {"cores": cpu, "sockets": 1, "threads": 1},
+                            "memory": {"guest": f"{ram}Gi"},
+                            "devices": {
+                                "disks": disks_spec,
+                                "interfaces": [{"name": "nic-0", "model": net_model, "bridge": {}}],
+                                "inputs": [{"bus": "usb", "name": "tablet", "type": "tablet"}]
+                            },
+                            "features": {"acpi": {"enabled": True}},
+                            "machine": {"type": "q35"}
+                        },
+                        "networks": [{"name": "nic-0", "multus": {"networkName": network_name}}],
+                        "volumes": volumes_spec
                     }
-                },
-                "spec": {
-                    "accessModes": ["ReadWriteMany"],
-                    "resources": {
-                        "requests": {
-                            "storage": f"{size}Gi"
-                        }
-                    },
-                    "volumeMode": "Block",
-                    "storageClassName": image_storage_class
                 }
-            })
-        
-        # Build network interfaces and networks arrays
-        interfaces_spec = []
-        networks_spec = []
-        
-        for i, nic in enumerate(nic_configs):
-            nic_name = f"nic-{i}"
-            
-            # Interface spec - use e1000 for SATA (compatibility) or virtio
-            # e1000 works without drivers, virtio requires virtio-net driver
-            net_model = "e1000" if disk_bus == "sata" else "virtio"
-            
-            iface_spec = {
-                "name": nic_name,
-                "model": net_model,
-                "bridge": {}
             }
-            if nic['mac']:
-                iface_spec["macAddress"] = nic['mac']
-            interfaces_spec.append(iface_spec)
-            
-            # Network spec
-            networks_spec.append({
-                "name": nic_name,
-                "multus": {
-                    "networkName": nic['network_name']
-                }
-            })
+        }
         
-        # Build manifest
-        print("\n🚀 Creating VM...")
-        
-        # Debug: show what we're creating
-        print(f"   Disks spec: {len(disks_spec)} disk(s)")
-        print(f"   Volumes spec: {len(volumes_spec)} volume(s)")
-        print(f"   Networks spec: {len(networks_spec)} network(s)")
-        print(f"   VolumeClaimTemplates: {len(volume_claim_templates)}")
-        
-        for i, vct in enumerate(volume_claim_templates):
-            vct_name = vct['metadata']['name']
-            vct_sc = vct['spec']['storageClassName']
-            print(f"      Disk {i}: {vct_name} (SC: {vct_sc})")
-        
-        # Build MAC address annotation
-        mac_annotation = {}
-        for i, nic in enumerate(nic_configs):
-            nic_name = f"nic-{i}"
-            if nic['mac']:
-                mac_annotation[nic_name] = nic['mac']
+        if boot_type == "UEFI":
+            manifest['spec']['template']['spec']['domain']['firmware'] = {
+                "bootloader": {"efi": {"secureBoot": False, "persistent": False}}
+            }
         
         try:
-            manifest = {
-                "apiVersion": "kubevirt.io/v1",
-                "kind": "VirtualMachine",
-                "metadata": {
-                    "name": vm_name,
-                    "namespace": namespace,
-                    "labels": {
-                        "harvesterhci.io/creator": "harvesterhci",
-                        "harvesterhci.io/os": "windows"
-                    },
-                    "annotations": {
-                        "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
-                        "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
-                        "network.harvesterhci.io/ips": "[]"
-                    }
-                },
-                "spec": {
-                    "runStrategy": "RerunOnFailure",
-                    "template": {
-                        "metadata": {
-                            "labels": {
-                                "harvesterhci.io/vmName": vm_name
-                            }
-                        },
-                        "spec": {
-                            "domain": {
-                                "cpu": {
-                                    "cores": cpu,
-                                    "sockets": 1,
-                                    "threads": 1
-                                },
-                                "memory": {
-                                    "guest": f"{ram}Gi"
-                                },
-                                "devices": {
-                                    "disks": disks_spec,
-                                    "interfaces": interfaces_spec,
-                                    "inputs": [
-                                        {"bus": "usb", "name": "tablet", "type": "tablet"}
-                                    ],
-                                    "channels": [
-                                        {
-                                            "name": "qemu-guest-agent",
-                                            "target": {
-                                                "type": "virtio",
-                                                "name": "org.qemu.guest_agent.0"
-                                            }
-                                        }
-                                    ]
-                                },
-                                "features": {
-                                    "acpi": {"enabled": True}
-                                },
-                                "machine": {
-                                    "type": "q35"
-                                },
-                                "resources": {
-                                    "limits": {
-                                        "cpu": str(cpu),
-                                        "memory": f"{ram}Gi"
-                                    }
-                                }
-                            },
-                            "evictionStrategy": "LiveMigrateIfPossible",
-                            "hostname": vm_name,
-                            "networks": networks_spec,
-                            "volumes": volumes_spec,
-                            "terminationGracePeriodSeconds": 120
-                        }
-                    }
-                }
-            }
+            self.harvester.create_vm(manifest)
+            print(colored(f"\n✅ VM created: {vm_name}", Colors.GREEN))
+            print(colored("   This VM has NO image dependencies!", Colors.GREEN))
             
-            # Add MAC address annotation if any
-            if mac_annotation:
-                manifest['metadata']['annotations']['harvesterhci.io/mac-address'] = json.dumps(mac_annotation)
-            
-            # Add UEFI firmware if needed
-            if boot == "UEFI":
-                manifest['spec']['template']['spec']['domain']['firmware'] = {
-                    "bootloader": {
-                        "efi": {
-                            "secureBoot": False,
-                            "persistent": False
-                        }
-                    }
-                }
-            
-            result = self.harvester.create_vm(manifest)
-            print(colored(f"✅ VM created: {vm_name} in {namespace}", Colors.GREEN))
-            
-            # Save manifest for debug
-            staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
-            manifest_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-manifest.json')
-            os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-            with open(manifest_path, 'w') as f:
-                json.dump(manifest, f, indent=2)
-            print(colored(f"   📄 Manifest saved: {manifest_path}", Colors.CYAN))
-            
-            # === WAIT FOR VOLUMES TO BE PROVISIONED ===
-            print(colored("\n⏳ Waiting for volumes to be provisioned and data copied...", Colors.BOLD))
-            
-            max_wait = 600  # 10 minutes total
-            start_time = time.time()
-            
-            while time.time() - start_time < max_wait:
-                all_ready = True
-                for vol_name in volume_names:
-                    try:
-                        pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
-                        phase = pvc.get('status', {}).get('phase', '')
-                        if phase != 'Bound':
-                            all_ready = False
-                            break
-                        
-                        # Check actualSize to ensure data is copied
-                        actual_size = self.harvester.get_pvc_actual_size(vol_name, namespace)
-                        if actual_size == 0:
-                            all_ready = False
-                            break
-                    except:
-                        all_ready = False
-                        break
-                
-                if all_ready:
-                    print(colored("   ✅ All volumes provisioned and data copied!", Colors.GREEN))
-                    break
-                
-                elapsed = int(time.time() - start_time)
-                if elapsed % 15 == 0:
-                    print(f"      Waiting... ({elapsed}s)")
-                time.sleep(5)
-            else:
-                print(colored("   ⚠️  Timeout waiting for volumes - continuing anyway", Colors.YELLOW))
-            
-            # === DISSOCIATE VOLUMES FROM IMAGES ===
-            print(colored("\n🔗 Dissociating volumes from source images...", Colors.BOLD))
-            
-            dissociated_count = 0
-            for vol_name in volume_names:
-                try:
-                    # Get current PVC
-                    pvc = self.harvester._request("GET", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}")
-                    
-                    annotations = pvc.get('metadata', {}).get('annotations', {})
-                    if 'harvesterhci.io/imageId' in annotations:
-                        # Remove the imageId annotation using JSON Patch
-                        patch = [
-                            {"op": "remove", "path": "/metadata/annotations/harvesterhci.io~1imageId"}
-                        ]
-                        
-                        self.harvester._request(
-                            "PATCH",
-                            f"/api/v1/namespaces/{namespace}/persistentvolumeclaims/{vol_name}",
-                            patch,
-                            content_type="application/json-patch+json"
-                        )
-                        dissociated_count += 1
-                        print(colored(f"   ✅ {vol_name} dissociated from image", Colors.GREEN))
-                    else:
-                        print(f"   ℹ️  {vol_name} already independent")
-                        
-                except Exception as e:
-                    print(colored(f"   ⚠️  Failed to dissociate {vol_name}: {e}", Colors.YELLOW))
-            
-            if dissociated_count > 0:
-                print(colored(f"\n✅ {dissociated_count} volume(s) dissociated - source images can now be deleted!", Colors.GREEN))
-            
-            # === DELETE SOURCE IMAGES ===
-            print(colored("\n🗑️  Cleanup: Delete source images from Harvester?", Colors.BOLD))
-            print("   (Volumes are independent - images are no longer needed)")
-            
-            for img in selected_images:
-                img_name = img['name']
-                img_ns = img['namespace']
-                print(f"   • {img_ns}/{img_name}")
-            
-            delete_images = self.input_prompt("\nDelete these images? (y/n) [y]") or "y"
-            if delete_images.lower() == 'y':
-                deleted_count = 0
-                for img in selected_images:
-                    img_name = img['name']
-                    img_ns = img['namespace']
-                    try:
-                        self.harvester.delete_image(img_name, img_ns)
-                        deleted_count += 1
-                        print(colored(f"   ✅ Deleted {img_ns}/{img_name}", Colors.GREEN))
-                    except Exception as e:
-                        print(colored(f"   ⚠️  Failed to delete {img_name}: {e}", Colors.YELLOW))
-                
-                if deleted_count > 0:
-                    print(colored(f"\n✅ {deleted_count} image(s) deleted - storage freed!", Colors.GREEN))
-            else:
-                print("   Images kept. You can delete them manually later.")
-            
-            # === FULL MIGRATION WORKFLOW ===
-            print(colored("\n" + "="*50, Colors.BLUE))
-            print(colored("🚀 COMPLETE MIGRATION WORKFLOW", Colors.BOLD))
-            print(colored("="*50, Colors.BLUE))
-            print("\nNext steps:")
-            print("  1. Start VM")
-            print("  2. Wait for DHCP IP (via QEMU Guest Agent)")
-            print("  3. Connect via WinRM")
-            print("  4. Reconfigure static network")
-            
-            continue_migration = self.input_prompt("\nContinue with full migration? (y/n) [y]")
-            if continue_migration.lower() == 'n':
-                print(colored("\n💡 To complete migration later:", Colors.YELLOW))
-                print("   Use Menu Windows → Post-migration auto-configure")
-                return
-            
-            # Step 1: Wait for VM to boot by pinging FQDN
-            # Build FQDN from vm_name + domain
-            windows_config = self.config.get('windows', {})
-            domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
-            vm_fqdn = f"{vm_name}.{domain}"
-            
-            print(colored("\n▶️  Step 1: Waiting for VM to boot...", Colors.BOLD))
-            print(f"   FQDN: {vm_fqdn}")
-            print("   (Pinging to detect when VM is ready)")
-            
-            import time
-            import subprocess
-            
-            # Wait initial time for VM to start
-            print("   ⏳ Waiting for VM to initialize (20s)...")
-            time.sleep(20)
-            
-            max_wait = 180  # 3 minutes max to wait for ping
-            start_time = time.time()
-            vm_reachable = False
-            
-            while time.time() - start_time < max_wait:
-                elapsed = int(time.time() - start_time) + 20  # Add initial wait
-                
-                # Ping the FQDN
-                try:
-                    result = subprocess.run(
-                        ['ping', '-c', '1', '-W', '2', vm_fqdn],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    
-                    if result.returncode == 0:
-                        vm_reachable = True
-                        print(colored(f"\n   ✅ VM responds to ping! ({elapsed}s)", Colors.GREEN))
-                        break
-                    else:
-                        if elapsed % 15 == 0:  # Print every 15s
-                            print(f"   ⏳ Waiting for VM to respond... ({elapsed}s)")
-                except subprocess.TimeoutExpired:
-                    pass
-                except Exception as e:
-                    if elapsed % 30 == 0:
-                        print(f"   ⏳ Ping error: {e}")
-                
-                time.sleep(5)
-            
-            if not vm_reachable:
-                print(colored(f"\n   ⚠️  VM not responding to ping after {max_wait + 20}s", Colors.YELLOW))
-                print(colored("   Possible causes:", Colors.CYAN))
-                print("      - VM still booting (Windows can take 2-3 minutes)")
-                print("      - DNS not yet updated with DHCP IP")
-                print("      - Network issue")
-                
-                retry = self.input_prompt("\n   Continue anyway? (y/n) [y]") or "y"
-                if retry.lower() != 'y':
-                    print(colored("\n💡 Complete migration later with Menu Windows → Post-migration auto-configure", Colors.YELLOW))
-                    return
-            
-            # Step 2: Load network config and connect via WinRM
-            print(colored("\n▶️  Step 2: Connecting via WinRM...", Colors.BOLD))
-            
-            # Load vm-config.json for network settings
-            config_path = os.path.join(staging_dir, 'migrations', vm_name.lower(), 'vm-config.json')
-            if not os.path.exists(config_path):
-                print(colored(f"   ❌ Config not found: {config_path}", Colors.RED))
-                return
-            
-            with open(config_path) as f:
-                vm_config = json.load(f)
-            
-            # Get static interfaces to configure
-            interfaces = vm_config.get('network', {}).get('interfaces', [])
-            static_interfaces = [i for i in interfaces if not i.get('dhcp', True)]
-            
-            if not static_interfaces:
-                print(colored("   ✅ All interfaces use DHCP - no reconfiguration needed!", Colors.GREEN))
-                print(colored("\n🎉 MIGRATION COMPLETE!", Colors.GREEN))
-                return
-            
-            # Show what we'll configure
-            print("\n   Network configuration to apply:")
-            for iface in static_interfaces:
-                print(f"      {iface.get('name')}: {iface.get('ip')}/{iface.get('prefix')}")
-                print(f"         Gateway: {iface.get('gateway')}")
-                print(f"         DNS: {', '.join(iface.get('dns', []))}")
-            
-            # Get credentials - use same logic as pre-migration check
-            if not WINRM_AVAILABLE:
-                print(colored("\n   ❌ pywinrm not installed - cannot configure network", Colors.RED))
-                print(colored("   Install with: pip install pywinrm --break-system-packages", Colors.YELLOW))
-                return
-            
-            # Use FQDN with Kerberos if available, otherwise NTLM
-            use_kerberos = windows_config.get('use_kerberos', True)
-            
-            username = None
-            password = None
-            transport = "ntlm"  # Default
-            connect_host = vm_fqdn
-            
-            if use_kerberos and get_kerberos_auth():
-                # FQDN with valid Kerberos ticket
-                print(colored("\n   Using Kerberos authentication", Colors.GREEN))
-                print(f"   Host: {vm_fqdn}")
-                transport = "kerberos"
-            else:
-                # No Kerberos - use NTLM
-                print("\n   Using NTLM authentication")
-                print(f"   Host: {vm_fqdn}")
-                transport = "ntlm"
-                try:
-                    username, password = self.vault.get_credential("local-admin")
-                    print(f"   Using credential from vault: {username}")
-                except:
-                    print("   No 'local-admin' credential in vault - enter manually:")
-                    username = self.input_prompt("   Username [Administrator]") or "Administrator"
-                    import getpass
-                    password = getpass.getpass("   Password: ")
-            
-            # Wait a bit more for WinRM to be ready
-            print("\n   Waiting 15s for WinRM service to be ready...")
-            time.sleep(15)
-            
-            # Connect
-            try:
-                client = WinRMClient(
-                    host=connect_host,
-                    username=username,
-                    password=password,
-                    transport=transport
-                )
-                
-                if not client.test_connection():
-                    print(colored("   ❌ WinRM connection failed", Colors.RED))
-                    print(colored("   Try: Menu Windows → Post-migration auto-configure", Colors.YELLOW))
-                    return
-                
-                print(colored("   ✅ Connected!", Colors.GREEN))
-                
-            except Exception as e:
-                print(colored(f"   ❌ Connection error: {e}", Colors.RED))
-                return
-            
-            # Step 3: Uninstall ALL Nutanix software
-            print(colored("\n▶️  Step 3: Uninstalling Nutanix software...", Colors.BOLD))
-            print("   (Guest Tools, VirtIO drivers, VM Mobility, etc.)")
-            
-            try:
-                post_config = WindowsPostConfig(client)
-                
-                print("   🗑️  Removing all Nutanix software...")
-                success, uninstalled, failed = post_config.uninstall_all_nutanix()
-                
-                if success:
-                    if uninstalled > 0:
-                        print(colored(f"   ✅ Removed {uninstalled} Nutanix component(s)", Colors.GREEN))
-                    else:
-                        print(colored("   ✅ No Nutanix software found (already clean)", Colors.GREEN))
-                else:
-                    print(colored(f"   ⚠️  Some components failed to uninstall: {failed}", Colors.YELLOW))
-                    print(colored("   Check log: C:\\temp\\nutanix-uninstall.log", Colors.CYAN))
-                    
-            except Exception as e:
-                print(colored(f"   ⚠️  Nutanix uninstall error: {e}", Colors.YELLOW))
-                print(colored("   You can uninstall manually via Programs & Features", Colors.CYAN))
-            
-            # Step 4: Install Red Hat VirtIO drivers
-            print(colored("\n▶️  Step 4: Installing Red Hat VirtIO drivers...", Colors.BOLD))
-            print("   (Downloading ISO from Fedora and installing drivers)")
-            
-            try:
-                print("   📦 This may take 2-5 minutes (downloading ~500MB ISO)...")
-                success, installed, skipped, failed = post_config.install_virtio_redhat()
-                
-                if success:
-                    print(colored(f"   ✅ VirtIO drivers installed: {installed} new, {skipped} already present", Colors.GREEN))
-                else:
-                    print(colored(f"   ⚠️  Some drivers failed to install: {failed}", Colors.YELLOW))
-                    print(colored("   Check log: C:\\temp\\virtio-install.log", Colors.CYAN))
-                    
-            except Exception as e:
-                print(colored(f"   ⚠️  VirtIO install error: {e}", Colors.YELLOW))
-                print(colored("   You can install manually from: https://fedorapeople.org/groups/virt/virtio-win/", Colors.CYAN))
-            
-            # Step 5: Apply network configuration (LAST - after drivers are installed)
-            print(colored("\n▶️  Step 5: Applying network configuration...", Colors.BOLD))
-            print("   (Now that new VirtIO network drivers are installed)")
-            
-            # Need to reconnect - drivers installation may have changed network
-            print("   🔄 Waiting 10s for new drivers to stabilize...")
-            time.sleep(10)
-            
-            # Try to reconnect
-            reconnected = False
-            for attempt in range(3):
-                try:
-                    client = WinRMClient(
-                        host=connect_host,
-                        username=username,
-                        password=password,
-                        transport=transport
-                    )
-                    if client.test_connection():
-                        reconnected = True
-                        print(colored("   ✅ Reconnected to VM", Colors.GREEN))
-                        break
-                except Exception as e:
-                    print(f"   ⏳ Reconnection attempt {attempt + 1}/3...")
-                    time.sleep(5)
-            
-            if not reconnected:
-                print(colored("   ⚠️  Could not reconnect - network config must be done manually", Colors.YELLOW))
-                print(colored("   The VM should still be accessible via console", Colors.CYAN))
-            else:
-                for iface in static_interfaces:
-                    iface_name = iface.get('name', 'Ethernet')
-                    ip = iface.get('ip')
-                    prefix = iface.get('prefix', 24)
-                    gateway = iface.get('gateway', '')
-                    dns_list = iface.get('dns', [])
-                    
-                    print(f"\n   Configuring {iface_name}...")
-                    
-                    ps_script = f'''
-$ErrorActionPreference = "Continue"
-$logFile = "C:\\temp\\network-reconfig.log"
-
-# Ensure log directory exists
-if (-not (Test-Path "C:\\temp")) {{
-    New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null
-}}
-
-function Log {{
-    param([string]$msg)
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
-}}
-
-Log "=========================================="
-Log "Network reconfiguration started"
-Log "=========================================="
-
-$ifName = "{iface_name}"
-$ip = "{ip}"
-$prefix = {prefix}
-$gateway = "{gateway}"
-$dns = @({','.join([f'"{d}"' for d in dns_list])})
-
-Log "Target interface: $ifName"
-Log "Target IP: $ip/$prefix"
-Log "Target gateway: $gateway"
-Log "Target DNS: $($dns -join ', ')"
-
-try {{
-    # Get adapter - try exact name first, then partial match
-    Log "Looking for adapter '$ifName'..."
-    $adapter = Get-NetAdapter -Name $ifName -ErrorAction SilentlyContinue
-    if (-not $adapter) {{
-        Log "Exact name not found, trying partial match..."
-        $adapter = Get-NetAdapter | Where-Object {{ $_.Name -like "*Ethernet*" -and $_.Status -eq "Up" }} | Select-Object -First 1
-        if (-not $adapter) {{
-            $adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
-        }}
-        if ($adapter) {{
-            $ifName = $adapter.Name
-            Log "Using adapter: $ifName (InterfaceIndex: $($adapter.InterfaceIndex))"
-        }} else {{
-            Log "ERROR: No active adapter found!"
-            throw "No active adapter found"
-        }}
-    }} else {{
-        Log "Found exact adapter: $ifName (InterfaceIndex: $($adapter.InterfaceIndex))"
-    }}
-
-    # Remove existing IP config
-    Log "Removing existing IP configuration..."
-    Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{
-        Log "  Removing IP: $($_.IPAddress)"
-        Remove-NetIPAddress -InterfaceAlias $ifName -IPAddress $_.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    }}
-    
-    Log "Removing existing routes..."
-    Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-
-    # Set new IP
-    Log "Setting new IP: $ip/$prefix gateway $gateway"
-    New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
-    Log "IP configured successfully"
-
-    # Set DNS
-    Log "Setting DNS: $($dns -join ', ')"
-    Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
-    Log "DNS configured successfully"
-
-    Log "=========================================="
-    Log "Network reconfiguration COMPLETED"
-    Log "=========================================="
-    Write-Host "SUCCESS"
-}} catch {{
-    Log "ERROR: $($_.Exception.Message)"
-    Log "Stack: $($_.ScriptStackTrace)"
-    throw
-}}
-'''
-                    try:
-                        stdout, stderr, rc = client.run_powershell(ps_script)
-                        
-                        if rc == 0 and "SUCCESS" in stdout:
-                            print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
-                        elif "SUCCESS" in stdout:
-                            # rc might be -1 due to connection reset when IP changes
-                            print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
-                            print(colored("      (Connection reset expected when IP changes)", Colors.CYAN))
-                        else:
-                            print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
-                            print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-                            if stdout:
-                                print(f"      Output: {stdout[:200]}")
-                    except Exception as e:
-                        # Connection reset is expected when changing network
-                        if "Connection reset" in str(e) or "WinRM" in str(e):
-                            print(colored(f"   ✅ {iface_name} likely configured (connection reset)", Colors.GREEN))
-                            print(colored("      This is normal when changing IP - connection to old IP breaks", Colors.CYAN))
-                        else:
-                            print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
-                            print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-            
-            # Final message
-            original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
-            
-            print(colored("\n" + "="*60, Colors.GREEN))
-            print(colored("🎉 MIGRATION COMPLETE!", Colors.GREEN))
-            print(colored("="*60, Colors.GREEN))
-            print(f"\n   VM: {vm_name}")
-            print(f"   FQDN: {vm_fqdn}")
-            print(f"   Static IP: {original_ip}")
-            print(colored("\n   ✅ Nutanix software removed", Colors.GREEN))
-            print(colored("   ✅ Red Hat VirtIO drivers installed", Colors.GREEN))
-            print(colored("   ✅ Network configured", Colors.GREEN))
-            print(colored("\n   The VM should now be accessible at its original IP address.", Colors.CYAN))
-            print(colored("\n💡 Verify:", Colors.YELLOW))
-            print(f"   ping {original_ip}")
-            print(f"   ping {vm_fqdn}")
-            print(colored("\n💡 Check logs on VM if issues:", Colors.YELLOW))
-            print("   C:\\temp\\nutanix-uninstall.log")
-            print("   C:\\temp\\virtio-install.log")
-            print("   C:\\temp\\network-reconfig.log")
-            print(colored("\n💡 Optional next steps:", Colors.YELLOW))
-            print("   - Switch disk bus from SATA to VirtIO (Menu Harvester → 12)")
-            print("   - Reboot VM to ensure all drivers are active")
-            print(colored("\n💡 Cleanup when confirmed working:", Colors.YELLOW))
-            print("   - Delete Nutanix export images (staging)")
-            print("   - Delete Harvester source images")
-            print("   - Power off source VM on Nutanix")
-            
+            start = self.input_prompt("\nStart VM? (y/n) [y]") or "y"
+            if start.lower() == 'y':
+                self.harvester.start_vm(vm_name, namespace)
+                print(colored(f"✅ VM starting", Colors.GREEN))
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
-            import traceback
-            traceback.print_exc()
-    
-    def _auto_dissociate_volumes(self, vm_name: str, namespace: str, data_volume_templates: list):
-        """
-        Automatically dissociate VM volumes from images after creation.
-        This clones the volumes to remove the backing image dependency.
-        """
-        import time
-        
-        if not data_volume_templates:
-            return
-        
-        print(colored("\n🔗 Auto-dissociating volumes from images...", Colors.BOLD))
-        
-        # Step 1: Wait for DataVolumes to be provisioned (PVCs created and Bound)
-        print("   ⏳ Waiting for volumes to be provisioned...")
-        volume_names = [dvt.get('metadata', {}).get('name') for dvt in data_volume_templates]
-        
-        max_wait = 300  # 5 minutes max
-        wait_interval = 5
-        elapsed = 0
-        
-        while elapsed < max_wait:
-            all_bound = True
-            for vol_name in volume_names:
-                try:
-                    pvc = self.harvester.get_pvc(vol_name, namespace)
-                    phase = pvc.get('status', {}).get('phase', '')
-                    if phase != 'Bound':
-                        all_bound = False
-                        break
-                except Exception:
-                    all_bound = False
-                    break
-            
-            if all_bound:
-                print(colored("   ✅ All volumes provisioned!", Colors.GREEN))
-                break
-            
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-            print(f"   ... waiting ({elapsed}s)", end='\r')
-        else:
-            print(colored(f"\n   ⚠️  Timeout waiting for volumes. Skipping auto-dissociate.", Colors.YELLOW))
-            print(colored("   Use 'Dissociate VM from image' (Menu Harvester → Option 5) manually.", Colors.YELLOW))
-            return
-        
-        # Step 2: Clone each volume to standalone version
-        print("\n   🔄 Cloning volumes to standalone...")
-        cloned_volumes = []
-        
-        for vol_name in volume_names:
-            new_name = f"{vol_name}-standalone"
-            try:
-                self.harvester.clone_pvc(vol_name, new_name, namespace)
-                print(colored(f"      ✅ Cloned: {vol_name} → {new_name}", Colors.GREEN))
-                cloned_volumes.append({
-                    'old': vol_name,
-                    'new': new_name
-                })
-            except Exception as e:
-                print(colored(f"      ❌ Clone failed for {vol_name}: {e}", Colors.RED))
-                print(colored("   Use 'Dissociate VM from image' manually after fixing.", Colors.YELLOW))
-                return
-        
-        # Step 3: Wait for clones to be Bound
-        print("\n   ⏳ Waiting for clones to be ready...")
-        elapsed = 0
-        while elapsed < max_wait:
-            all_ready = True
-            for vol in cloned_volumes:
-                try:
-                    pvc = self.harvester.get_pvc(vol['new'], namespace)
-                    phase = pvc.get('status', {}).get('phase', '')
-                    if phase != 'Bound':
-                        all_ready = False
-                        break
-                except Exception:
-                    all_ready = False
-                    break
-            
-            if all_ready:
-                print(colored("   ✅ All clones ready!", Colors.GREEN))
-                break
-            
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-            print(f"   ... waiting ({elapsed}s)", end='\r')
-        else:
-            print(colored(f"\n   ⚠️  Timeout waiting for clones.", Colors.YELLOW))
-            return
-        
-        # Step 4: Update VM to use cloned volumes
-        print("\n   🔧 Updating VM to use standalone volumes...")
-        try:
-            for vol in cloned_volumes:
-                self.harvester.update_vm_volume(vm_name, vol['old'], vol['new'], namespace)
-            print(colored("   ✅ VM updated to use standalone volumes", Colors.GREEN))
-        except Exception as e:
-            print(colored(f"   ❌ Error updating VM: {e}", Colors.RED))
-            print(colored("   You may need to update the VM manually in Harvester UI", Colors.YELLOW))
-            return
-        
-        # Step 5: Delete old image-linked volumes
-        print("\n   🗑️  Cleaning up old volumes...")
-        for vol in cloned_volumes:
-            try:
-                self.harvester.delete_pvc(vol['old'], namespace)
-                print(colored(f"      ✅ Deleted: {vol['old']}", Colors.GREEN))
-            except Exception as e:
-                print(colored(f"      ⚠️  Could not delete {vol['old']}: {e}", Colors.YELLOW))
-        
-        print(colored("\n✅ VM volumes are now independent from images!", Colors.GREEN))
-        print(colored("   VM is ready to start. Images can be safely deleted.", Colors.CYAN))
     
     # === Menus ===
     
@@ -3233,8 +2089,6 @@ try {{
                 ("10", "List networks"),
                 ("11", "List storage classes"),
                 ("12", "Switch VM disk bus (SATA → VirtIO)"),
-                ("13", "Create independent volume (DataVolume) ★"),
-                ("14", "Create VM from existing PVCs ★"),
                 ("0", "Back")
             ])
             
@@ -3276,526 +2130,8 @@ try {{
             elif choice == "12":
                 self.switch_vm_disk_bus()
                 self.pause()
-            elif choice == "13":
-                self.create_independent_volume()
-                self.pause()
-            elif choice == "14":
-                self.create_vm_from_pvcs()
-                self.pause()
             elif choice == "0":
                 break
-    
-    def create_independent_volume(self):
-        """Create an independent volume using CDI DataVolume - NO backing image dependency."""
-        print(colored("\n📦 Create Independent Volume (DataVolume)", Colors.BOLD))
-        print(colored("=" * 60, Colors.BLUE))
-        print(colored("This creates a PVC with NO dependency on Harvester images.", Colors.GREEN))
-        print(colored("The volume is 100% independent and can exist after image deletion.", Colors.GREEN))
-        print(colored("=" * 60, Colors.BLUE))
-        
-        if not self.harvester and not self.connect_harvester():
-            return
-        
-        # Step 1: List staged QCOW2 files
-        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
-        migrations_dir = os.path.join(staging_dir, 'migrations')
-        
-        print(colored("\n📂 Scanning for QCOW2 files in staging...", Colors.CYAN))
-        
-        qcow2_files = []
-        if os.path.exists(migrations_dir):
-            for root, dirs, files in os.walk(migrations_dir):
-                for f in files:
-                    if f.endswith('.qcow2'):
-                        full_path = os.path.join(root, f)
-                        size = os.path.getsize(full_path)
-                        rel_path = os.path.relpath(full_path, staging_dir)
-                        qcow2_files.append({
-                            'name': f,
-                            'path': full_path,
-                            'rel_path': rel_path,
-                            'size': size
-                        })
-        
-        if not qcow2_files:
-            print(colored("❌ No QCOW2 files found in staging directory", Colors.RED))
-            print(f"   Expected location: {migrations_dir}")
-            return
-        
-        print(f"\nFound {len(qcow2_files)} QCOW2 file(s):")
-        for i, f in enumerate(qcow2_files, 1):
-            size_gb = f['size'] / (1024**3)
-            print(f"  {i}. {f['name']} ({size_gb:.2f} GB)")
-            print(f"      Path: {f['rel_path']}")
-        
-        choice = self.input_prompt("\nSelect file number")
-        if not choice:
-            return
-        
-        try:
-            idx = int(choice) - 1
-            selected_file = qcow2_files[idx]
-        except:
-            print(colored("Invalid choice", Colors.RED))
-            return
-        
-        # Step 2: Volume name
-        default_name = os.path.splitext(selected_file['name'])[0]
-        vol_name = self.input_prompt(f"Volume name [{default_name}]") or default_name
-        vol_name = vol_name.lower().replace('_', '-')
-        
-        # Step 3: Namespace
-        namespace = self.input_prompt("Namespace [default]") or "default"
-        
-        # Step 4: Storage Class selection
-        print(colored("\n💾 Storage Class Selection:", Colors.BOLD))
-        
-        all_scs = self.harvester.list_storage_classes()
-        valid_scs = []
-        default_sc_idx = 0
-        
-        for sc in all_scs:
-            sc_name = sc.get('metadata', {}).get('name', '')
-            # Skip auto-generated storage classes
-            if sc_name.startswith('longhorn-image-') or (sc_name.startswith('longhorn-') and '-disk' in sc_name):
-                continue
-            if 'vmstate' in sc_name:
-                continue
-            
-            valid_scs.append(sc)
-            
-            # Check if this is the dual-node one (preferred)
-            if 'dual-node' in sc_name:
-                default_sc_idx = len(valid_scs)
-            # Or default
-            annotations = sc.get('metadata', {}).get('annotations', {})
-            if annotations.get('storageclass.kubernetes.io/is-default-class') == 'true' and default_sc_idx == 0:
-                default_sc_idx = len(valid_scs)
-        
-        if not valid_scs:
-            print(colored("❌ No storage classes available", Colors.RED))
-            return
-        
-        print("   Available storage classes:")
-        for i, sc in enumerate(valid_scs, 1):
-            sc_name = sc.get('metadata', {}).get('name', 'N/A')
-            params = sc.get('parameters', {})
-            replicas = params.get('numberOfReplicas', '?')
-            marker = " ← recommended" if i == default_sc_idx else ""
-            print(f"     {i}. {sc_name} ({replicas} replicas){marker}")
-        
-        default_choice = str(default_sc_idx) if default_sc_idx else "1"
-        sc_choice = self.input_prompt(f"Storage class [{default_choice}]") or default_choice
-        
-        try:
-            sc_idx = int(sc_choice) - 1
-            selected_sc = valid_scs[sc_idx].get('metadata', {}).get('name')
-        except:
-            selected_sc = valid_scs[0].get('metadata', {}).get('name')
-        
-        print(colored(f"   ✓ Using: {selected_sc}", Colors.GREEN))
-        
-        # Step 5: Volume size
-        # Get qcow2 virtual size
-        import subprocess
-        try:
-            result = subprocess.run(
-                ['qemu-img', 'info', '--output=json', selected_file['path']],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                import json
-                info = json.loads(result.stdout)
-                virtual_size = info.get('virtual-size', 0)
-                virtual_size_gb = virtual_size / (1024**3)
-                min_size_gi = int(virtual_size_gb) + 1  # Round up
-                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB")
-            else:
-                min_size_gi = int(selected_file['size'] / (1024**3)) + 10
-                print(f"\n⚠️  Could not determine virtual size, using file size + buffer")
-        except:
-            min_size_gi = int(selected_file['size'] / (1024**3)) + 10
-        
-        default_size = max(min_size_gi, 10)
-        size_input = self.input_prompt(f"Volume size in GiB (min {min_size_gi}) [{default_size}]")
-        size_gi = int(size_input) if size_input else default_size
-        
-        if size_gi < min_size_gi:
-            print(colored(f"⚠️  Size too small, using minimum: {min_size_gi} GiB", Colors.YELLOW))
-            size_gi = min_size_gi
-        
-        # Step 6: Summary and confirmation
-        print(colored("\n📋 Summary:", Colors.BOLD))
-        print(f"   Source file: {selected_file['name']}")
-        print(f"   Volume name: {vol_name}")
-        print(f"   Namespace: {namespace}")
-        print(f"   Storage class: {selected_sc}")
-        print(f"   Size: {size_gi} GiB")
-        
-        confirm = self.input_prompt("\nCreate volume? (y/n)")
-        if confirm.lower() != 'y':
-            print("Cancelled")
-            return
-        
-        # Step 7: Start HTTP server
-        print(colored("\n🚀 Starting HTTP server...", Colors.CYAN))
-        
-        transfer_config = self.config.get('transfer', {})
-        http_server_ip = transfer_config.get('http_server_ip', None)
-        
-        http_url = self.actions.start_http_server(8080, bind_ip=http_server_ip)
-        print(colored(f"✅ Server running at {http_url}", Colors.GREEN))
-        
-        if "127.0" in http_url:
-            print(colored("⚠️  Warning: URL contains localhost!", Colors.YELLOW))
-            print(colored("   Add http_server_ip to config.yaml", Colors.YELLOW))
-            self.actions.stop_http_server()
-            return
-        
-        # Build full URL to the file
-        file_url = f"{http_url}/{selected_file['rel_path']}"
-        print(f"   File URL: {file_url}")
-        
-        # Step 8: Create DataVolume
-        print(colored("\n📦 Creating DataVolume...", Colors.CYAN))
-        print(f"   CDI will download and convert qcow2 → raw")
-        
-        try:
-            result = self.harvester.create_datavolume(
-                name=vol_name,
-                http_url=file_url,
-                size_gi=size_gi,
-                storage_class=selected_sc,
-                namespace=namespace
-            )
-            print(colored(f"✅ DataVolume created: {vol_name}", Colors.GREEN))
-        except Exception as e:
-            print(colored(f"❌ Failed to create DataVolume: {e}", Colors.RED))
-            self.actions.stop_http_server()
-            return
-        
-        # Step 9: Wait for completion
-        print(colored("\n⏳ Waiting for CDI to download and process image...", Colors.CYAN))
-        print("   (This may take several minutes for large images)")
-        print("   Press Ctrl+C to cancel waiting (DataVolume will continue in background)")
-        
-        import time
-        start_time = time.time()
-        last_progress = ""
-        
-        try:
-            while True:
-                status = self.harvester.get_datavolume_status(vol_name, namespace)
-                phase = status.get('phase', 'Unknown')
-                progress = status.get('progress', '')
-                elapsed = int(time.time() - start_time)
-                
-                # Display progress
-                progress_str = f" ({progress})" if progress and progress != 'N/A' else ""
-                print(f"\r   Status: {phase}{progress_str} - {elapsed}s elapsed     ", end='', flush=True)
-                
-                if phase == 'Succeeded':
-                    print(colored(f"\n\n✅ Volume created successfully!", Colors.GREEN))
-                    print(colored(f"   PVC: {namespace}/{vol_name}", Colors.GREEN))
-                    print(colored(f"   Ready to use in VM creation!", Colors.GREEN))
-                    break
-                elif phase in ('Failed', 'Error'):
-                    print(colored(f"\n\n❌ DataVolume failed: {phase}", Colors.RED))
-                    # Get more details
-                    conditions = status.get('conditions', [])
-                    for cond in conditions:
-                        if cond.get('type') == 'Ready' and cond.get('status') == 'False':
-                            print(f"   Reason: {cond.get('reason')}")
-                            print(f"   Message: {cond.get('message')}")
-                    break
-                
-                time.sleep(5)
-                
-                # Timeout after 30 minutes
-                if elapsed > 1800:
-                    print(colored(f"\n\n⚠️  Timeout! DataVolume still processing in background.", Colors.YELLOW))
-                    print(f"   Check status with: kubectl get dv {vol_name} -n {namespace}")
-                    break
-                    
-        except KeyboardInterrupt:
-            print(colored(f"\n\n⚠️  Interrupted! DataVolume continues in background.", Colors.YELLOW))
-            print(f"   Check status with: kubectl get dv {vol_name} -n {namespace}")
-        
-        # Step 10: Stop HTTP server
-        print("\n🛑 Stopping HTTP server...")
-        self.actions.stop_http_server()
-        print(colored("Done!", Colors.GREEN))
-    
-    def create_vm_from_pvcs(self):
-        """Create a VM using existing PVCs - no image dependency."""
-        print(colored("\n🖥️  Create VM from Existing PVCs", Colors.BOLD))
-        print(colored("=" * 60, Colors.BLUE))
-        print(colored("Create a VM using existing volumes (PVCs).", Colors.GREEN))
-        print(colored("The VM will have NO dependency on Harvester images.", Colors.GREEN))
-        print(colored("=" * 60, Colors.BLUE))
-        
-        if not self.harvester and not self.connect_harvester():
-            return
-        
-        # Step 1: List available PVCs
-        namespace = self.input_prompt("Namespace [default]") or "default"
-        
-        print(colored(f"\n📂 Listing available PVCs in {namespace}...", Colors.CYAN))
-        
-        all_pvcs = self.harvester.list_pvcs(namespace)
-        
-        # Filter to show only relevant PVCs (not bound to running VMs ideally)
-        available_pvcs = []
-        for pvc in all_pvcs:
-            pvc_name = pvc.get('metadata', {}).get('name', '')
-            phase = pvc.get('status', {}).get('phase', '')
-            size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
-            sc = pvc.get('spec', {}).get('storageClassName', 'N/A')
-            
-            # Check if it has imageId annotation (show but mark it)
-            annotations = pvc.get('metadata', {}).get('annotations', {})
-            has_image = 'harvesterhci.io/imageId' in annotations
-            
-            available_pvcs.append({
-                'name': pvc_name,
-                'phase': phase,
-                'size': size,
-                'storage_class': sc,
-                'has_image_dependency': has_image
-            })
-        
-        if not available_pvcs:
-            print(colored("❌ No PVCs found in this namespace", Colors.RED))
-            return
-        
-        print(f"\nAvailable PVCs:")
-        for i, pvc in enumerate(available_pvcs, 1):
-            dep_marker = colored(" [has image dep!]", Colors.YELLOW) if pvc['has_image_dependency'] else colored(" [independent]", Colors.GREEN)
-            print(f"  {i}. {pvc['name']} - {pvc['size']} - {pvc['phase']}{dep_marker}")
-        
-        # Step 2: Select PVCs for disks
-        print(colored("\n💾 Select PVCs for VM disks:", Colors.BOLD))
-        print("   Enter PVC numbers separated by comma (e.g., 1,2)")
-        print("   First PVC will be the boot disk")
-        
-        pvc_choices = self.input_prompt("PVC numbers")
-        if not pvc_choices:
-            return
-        
-        selected_pvcs = []
-        try:
-            indices = [int(x.strip()) - 1 for x in pvc_choices.split(',')]
-            for idx in indices:
-                selected_pvcs.append(available_pvcs[idx])
-        except:
-            print(colored("Invalid selection", Colors.RED))
-            return
-        
-        print(f"\nSelected {len(selected_pvcs)} disk(s):")
-        for i, pvc in enumerate(selected_pvcs):
-            boot = " (boot)" if i == 0 else ""
-            print(f"   Disk {i}: {pvc['name']} - {pvc['size']}{boot}")
-        
-        # Step 3: VM name
-        default_name = selected_pvcs[0]['name'].rsplit('-disk', 1)[0] if '-disk' in selected_pvcs[0]['name'] else selected_pvcs[0]['name']
-        vm_name = self.input_prompt(f"VM name [{default_name}]") or default_name
-        vm_name = vm_name.lower().replace('_', '-')
-        
-        # Step 4: CPU and RAM
-        cpu = self.input_prompt("CPU cores [4]") or "4"
-        cpu = int(cpu)
-        
-        ram = self.input_prompt("RAM in GB [8]") or "8"
-        ram = int(ram)
-        
-        # Step 5: Boot type
-        print(colored("\n🔧 Boot Type:", Colors.BOLD))
-        print("   1. BIOS (legacy)")
-        print("   2. UEFI (modern, required for Windows 11)")
-        
-        boot_choice = self.input_prompt("Boot type [2]") or "2"
-        boot_type = "UEFI" if boot_choice == "2" else "BIOS"
-        
-        # Step 6: Disk bus
-        print(colored("\n💾 Disk Bus:", Colors.BOLD))
-        print("   1. sata   - Most compatible (recommended for migration)")
-        print("   2. virtio - Best performance (requires VirtIO drivers)")
-        print("   3. scsi   - Uses virtio-scsi")
-        
-        bus_choice = self.input_prompt("Disk bus [1]") or "1"
-        disk_bus = {"1": "sata", "2": "virtio", "3": "scsi"}.get(bus_choice, "sata")
-        
-        # Step 7: Network
-        print(colored("\n🌐 Network Configuration:", Colors.BOLD))
-        
-        networks = self.harvester.list_networks(namespace)
-        if not networks:
-            # Try default namespace
-            networks = self.harvester.list_networks("default")
-        
-        if networks:
-            print("   Available networks:")
-            for i, net in enumerate(networks, 1):
-                net_name = net.get('metadata', {}).get('name', 'N/A')
-                print(f"     {i}. {net_name}")
-            
-            net_choice = self.input_prompt("Network number [1]") or "1"
-            try:
-                net_idx = int(net_choice) - 1
-                selected_network = networks[net_idx].get('metadata', {}).get('name')
-                # Build full network name
-                net_ns = networks[net_idx].get('metadata', {}).get('namespace', namespace)
-                network_name = f"{net_ns}/{selected_network}"
-            except:
-                network_name = f"{namespace}/vlan1"
-        else:
-            network_name = self.input_prompt("Network name (namespace/name)") or f"{namespace}/vlan1"
-        
-        print(colored(f"   ✓ Using network: {network_name}", Colors.GREEN))
-        
-        # Step 8: Summary
-        print(colored("\n📋 VM Configuration Summary:", Colors.BOLD))
-        print(f"   Name: {vm_name}")
-        print(f"   Namespace: {namespace}")
-        print(f"   CPU: {cpu} cores")
-        print(f"   RAM: {ram} GB")
-        print(f"   Boot: {boot_type}")
-        print(f"   Disk bus: {disk_bus}")
-        print(f"   Network: {network_name}")
-        print(f"   Disks: {len(selected_pvcs)}")
-        for i, pvc in enumerate(selected_pvcs):
-            boot = " (boot)" if i == 0 else ""
-            print(f"      Disk {i}: {pvc['name']}{boot}")
-        
-        confirm = self.input_prompt("\nCreate VM? (y/n)")
-        if confirm.lower() != 'y':
-            print("Cancelled")
-            return
-        
-        # Step 9: Build and create VM manifest
-        print(colored("\n🚀 Creating VM...", Colors.CYAN))
-        
-        # Build disks and volumes specs
-        disks_spec = []
-        volumes_spec = []
-        
-        for i, pvc in enumerate(selected_pvcs):
-            disk_name = f"disk-{i}"
-            
-            disk_spec = {
-                "name": disk_name,
-                "disk": {
-                    "bus": disk_bus
-                }
-            }
-            if i == 0:
-                disk_spec["bootOrder"] = 1
-            disks_spec.append(disk_spec)
-            
-            volumes_spec.append({
-                "name": disk_name,
-                "persistentVolumeClaim": {
-                    "claimName": pvc['name']
-                }
-            })
-        
-        # Network interfaces
-        net_model = "e1000" if disk_bus == "sata" else "virtio"
-        interfaces_spec = [{
-            "name": "nic-0",
-            "model": net_model,
-            "bridge": {}
-        }]
-        
-        networks_spec = [{
-            "name": "nic-0",
-            "multus": {
-                "networkName": network_name
-            }
-        }]
-        
-        # Build full manifest
-        manifest = {
-            "apiVersion": "kubevirt.io/v1",
-            "kind": "VirtualMachine",
-            "metadata": {
-                "name": vm_name,
-                "namespace": namespace,
-                "labels": {
-                    "harvesterhci.io/creator": "harvesterhci"
-                },
-                "annotations": {
-                    "harvesterhci.io/vmRunStrategy": "RerunOnFailure"
-                }
-            },
-            "spec": {
-                "runStrategy": "RerunOnFailure",
-                "template": {
-                    "metadata": {
-                        "labels": {
-                            "harvesterhci.io/vmName": vm_name
-                        }
-                    },
-                    "spec": {
-                        "domain": {
-                            "cpu": {
-                                "cores": cpu,
-                                "sockets": 1,
-                                "threads": 1
-                            },
-                            "memory": {
-                                "guest": f"{ram}Gi"
-                            },
-                            "devices": {
-                                "disks": disks_spec,
-                                "interfaces": interfaces_spec,
-                                "inputs": [
-                                    {"bus": "usb", "name": "tablet", "type": "tablet"}
-                                ]
-                            },
-                            "features": {
-                                "acpi": {"enabled": True}
-                            },
-                            "machine": {
-                                "type": "q35"
-                            }
-                        },
-                        "networks": networks_spec,
-                        "volumes": volumes_spec
-                    }
-                }
-            }
-        }
-        
-        # Add UEFI firmware if needed
-        if boot_type == "UEFI":
-            manifest['spec']['template']['spec']['domain']['firmware'] = {
-                "bootloader": {
-                    "efi": {
-                        "secureBoot": False,
-                        "persistent": False
-                    }
-                }
-            }
-        
-        try:
-            result = self.harvester.create_vm(manifest)
-            print(colored(f"✅ VM created: {vm_name}", Colors.GREEN))
-            print(colored(f"   The VM is starting...", Colors.GREEN))
-            print(colored(f"\n   This VM has NO image dependencies!", Colors.GREEN))
-            print(colored(f"   You can delete any source images safely.", Colors.GREEN))
-        except Exception as e:
-            print(colored(f"❌ Failed to create VM: {e}", Colors.RED))
-            return
-        
-        # Ask to start
-        start_now = self.input_prompt("\nStart VM now? (y/n) [y]") or "y"
-        if start_now.lower() == 'y':
-            try:
-                self.harvester.start_vm(vm_name, namespace)
-                print(colored(f"✅ VM starting: {vm_name}", Colors.GREEN))
-            except Exception as e:
-                print(colored(f"⚠️  VM created but failed to start: {e}", Colors.YELLOW))
     
     def switch_vm_disk_bus(self):
         """Switch VM disk bus from SATA to VirtIO."""
@@ -3970,8 +2306,8 @@ try {{
                 ("3", "Disk image details"),
                 ("4", "Export VM (Nutanix → Staging)"),
                 ("5", "Convert RAW → QCOW2"),
-                ("6", "Import image to Harvester"),
-                ("7", "Create VM in Harvester"),
+                ("6", "Create volume in Harvester (DataVolume)"),
+                ("7", "Create VM in Harvester (from PVCs)"),
                 ("8", "Delete staging file"),
                 ("9", "Full migration"),
                 ("0", "Back")
