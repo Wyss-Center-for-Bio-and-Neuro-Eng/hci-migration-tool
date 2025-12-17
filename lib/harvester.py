@@ -716,3 +716,142 @@ class HarvesterClient:
             manifest['spec']['template']['spec']['domain']['firmware'] = firmware
         
         return manifest
+    
+    # =========================================================================
+    # CDI DataVolume Methods - For creating independent volumes (no backing image)
+    # =========================================================================
+    
+    def create_datavolume(self, name: str, http_url: str, size_gi: int, 
+                          storage_class: str, namespace: str = None) -> dict:
+        """
+        Create a DataVolume with HTTP source - creates a 100% independent PVC.
+        
+        CDI will:
+        - Download the image from http_url
+        - Convert qcow2 to raw format automatically
+        - Populate the PVC with the data
+        
+        The resulting PVC has NO dependency on any Harvester image or backing image.
+        
+        Args:
+            name: DataVolume/PVC name
+            http_url: URL to download the qcow2/raw image from
+            size_gi: Size in GiB (must be >= image virtual size)
+            storage_class: StorageClass to use (e.g. harvester-longhorn-dual-node)
+            namespace: Target namespace
+            
+        Returns:
+            Created DataVolume object
+        """
+        ns = namespace or self.namespace
+        
+        dv_manifest = {
+            "apiVersion": "cdi.kubevirt.io/v1beta1",
+            "kind": "DataVolume",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "annotations": {
+                    # Force immediate binding (don't wait for consumer)
+                    "cdi.kubevirt.io/storage.bind.immediate.requested": "true"
+                }
+            },
+            "spec": {
+                "source": {
+                    "http": {
+                        "url": http_url
+                    }
+                },
+                "storage": {
+                    "storageClassName": storage_class,
+                    "accessModes": ["ReadWriteMany"],
+                    "volumeMode": "Block",
+                    "resources": {
+                        "requests": {
+                            "storage": f"{size_gi}Gi"
+                        }
+                    }
+                }
+            }
+        }
+        
+        return self._request("POST", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes", dv_manifest)
+    
+    def get_datavolume(self, name: str, namespace: str = None) -> dict:
+        """Get a DataVolume by name."""
+        ns = namespace or self.namespace
+        return self._request("GET", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes/{name}")
+    
+    def list_datavolumes(self, namespace: str = None) -> List[dict]:
+        """List DataVolumes in a namespace."""
+        ns = namespace or self.namespace
+        result = self._request("GET", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes")
+        return result.get('items', [])
+    
+    def delete_datavolume(self, name: str, namespace: str = None) -> dict:
+        """Delete a DataVolume (also deletes the associated PVC)."""
+        ns = namespace or self.namespace
+        return self._request("DELETE", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes/{name}")
+    
+    def get_datavolume_status(self, name: str, namespace: str = None) -> dict:
+        """
+        Get DataVolume status information.
+        
+        Returns dict with:
+            - phase: Pending, ImportScheduled, ImportInProgress, Succeeded, Failed, etc.
+            - progress: e.g. "45.5%" during import
+            - conditions: list of conditions
+        """
+        ns = namespace or self.namespace
+        try:
+            dv = self.get_datavolume(name, ns)
+            status = dv.get('status', {})
+            return {
+                'phase': status.get('phase', 'Unknown'),
+                'progress': status.get('progress', 'N/A'),
+                'conditions': status.get('conditions', [])
+            }
+        except Exception as e:
+            return {
+                'phase': 'Error',
+                'progress': 'N/A',
+                'error': str(e)
+            }
+    
+    def wait_datavolume_ready(self, name: str, namespace: str = None, 
+                               timeout: int = 1800, progress_callback=None) -> bool:
+        """
+        Wait for DataVolume to reach Succeeded state.
+        
+        Args:
+            name: DataVolume name
+            namespace: Namespace
+            timeout: Max wait time in seconds (default 30 min)
+            progress_callback: Optional function(phase, progress) called on updates
+            
+        Returns:
+            True if Succeeded, False if Failed or timeout
+        """
+        import time
+        ns = namespace or self.namespace
+        start_time = time.time()
+        last_progress = ""
+        
+        while time.time() - start_time < timeout:
+            status = self.get_datavolume_status(name, ns)
+            phase = status.get('phase', 'Unknown')
+            progress = status.get('progress', '')
+            
+            # Call progress callback if provided
+            if progress_callback and progress != last_progress:
+                progress_callback(phase, progress)
+                last_progress = progress
+            
+            if phase == 'Succeeded':
+                return True
+            elif phase in ('Failed', 'Error'):
+                return False
+            
+            time.sleep(5)
+        
+        return False  # Timeout
