@@ -318,8 +318,18 @@ class HarvesterClient:
         return self._request("GET", f"/apis/harvesterhci.io/v1beta1/namespaces/{ns}/virtualmachineimages/{name}")
     
     def create_image(self, name: str, url: str, display_name: str = None, 
-                     namespace: str = None) -> dict:
-        """Create image from URL."""
+                     namespace: str = None, storage_class: str = None) -> dict:
+        """Create image from URL.
+        
+        Args:
+            name: Image name
+            url: URL to download image from
+            display_name: Display name for the image
+            namespace: Target namespace
+            storage_class: StorageClass to use as TEMPLATE for the image.
+                          Harvester will create longhorn-<image-name> that inherits
+                          parameters (replicas, node selectors, etc.) from this class.
+        """
         ns = namespace or self.namespace
         image_manifest = {
             "apiVersion": "harvesterhci.io/v1beta1",
@@ -334,6 +344,13 @@ class HarvesterClient:
                 "url": url
             }
         }
+        
+        # Add storageClass template if specified
+        if storage_class:
+            image_manifest["spec"]["storageClassParameters"] = {
+                "storageClassName": storage_class
+            }
+        
         return self._request("POST", f"/apis/harvesterhci.io/v1beta1/namespaces/{ns}/virtualmachineimages", image_manifest)
     
     def delete_image(self, name: str, namespace: str = None) -> dict:

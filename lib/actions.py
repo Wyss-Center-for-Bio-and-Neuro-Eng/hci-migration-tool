@@ -412,7 +412,8 @@ class MigrationActions:
     
     def create_harvester_image(self, name: str, filename: str, 
                                 http_base_url: str = None,
-                                namespace: str = "default") -> dict:
+                                namespace: str = "default",
+                                storage_class: str = None) -> dict:
         """
         Create Harvester image from staged file.
         
@@ -421,6 +422,7 @@ class MigrationActions:
             filename: Filename in staging
             http_base_url: Base URL of HTTP server (starts one if None)
             namespace: Harvester namespace
+            storage_class: StorageClass template for the image
         
         Returns:
             API response dict
@@ -433,7 +435,7 @@ class MigrationActions:
         
         url = f"{http_base_url}/{filename}"
         
-        return self.harvester.create_image(name, url, name, namespace)
+        return self.harvester.create_image(name, url, name, namespace, storage_class)
     
     def create_harvester_vm(self, name: str, vm_info: dict, 
                             image_name: str, network_name: str,
