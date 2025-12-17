@@ -1739,6 +1739,37 @@ class MigrationTool:
             print(colored(f"   ⚠️  Size {size_gi} < minimum {min_size_gi}, forcing {min_size_gi} GiB", Colors.YELLOW))
             size_gi = min_size_gi
         
+        # Check if disk is sparse (file size << virtual size)
+        file_size_gb = selected_file['size'] / (1024**3)
+        is_sparse = file_size_gb < (size_gi * 0.5)  # File is less than 50% of virtual size
+        
+        # Import method selection
+        print(colored("\n📥 Import Method:", Colors.BOLD))
+        transfer_config = self.config.get('transfer', {})
+        nfs_server = transfer_config.get('nfs_server')
+        nfs_path = transfer_config.get('nfs_path')
+        
+        if nfs_server and nfs_path:
+            print("   1. CDI DataVolume (HTTP) - Standard method")
+            print("   2. Sparse Import (NFS)  - Fast for sparse disks")
+            
+            if is_sparse and size_gi >= 100:
+                print(colored(f"\n   💡 Recommended: Sparse Import", Colors.GREEN))
+                print(colored(f"      File: {file_size_gb:.2f} GB, Virtual: {size_gi} GB", Colors.GREEN))
+                print(colored(f"      CDI would write {size_gi} GB, Sparse writes ~{file_size_gb:.1f} GB", Colors.GREEN))
+                default_method = "2"
+            else:
+                default_method = "1"
+            
+            method_choice = self.input_prompt(f"Method [{default_method}]") or default_method
+            use_sparse = (method_choice == "2")
+        else:
+            print(colored("   Using CDI DataVolume (HTTP)", Colors.CYAN))
+            if is_sparse and size_gi >= 100:
+                print(colored(f"\n   💡 TIP: Configure nfs_server/nfs_path in config.yaml", Colors.YELLOW))
+                print(colored(f"      for faster sparse import of large disks", Colors.YELLOW))
+            use_sparse = False
+        
         # Summary
         print(colored("\n📋 Summary:", Colors.BOLD))
         print(f"   Source: {selected_file['name']}")
@@ -1746,16 +1777,69 @@ class MigrationTool:
         print(f"   Namespace: {namespace}")
         print(f"   Storage class: {selected_sc}")
         print(f"   Size: {size_gi} GiB")
+        print(f"   Method: {'Sparse Import (NFS)' if use_sparse else 'CDI DataVolume (HTTP)'}")
         
         confirm = self.input_prompt("\nCreate volume? (y/n)")
         if confirm.lower() != 'y':
             print("Cancelled")
             return
         
+        if use_sparse:
+            # Sparse import via NFS
+            self._import_sparse(vol_name, size_gi, selected_sc, namespace, 
+                               nfs_server, nfs_path, selected_file['name'])
+        else:
+            # Standard CDI DataVolume import
+            self._import_datavolume(vol_name, size_gi, selected_sc, namespace, 
+                                    selected_file, transfer_config)
+    
+    def _import_sparse(self, vol_name, size_gi, storage_class, namespace,
+                       nfs_server, nfs_path, qcow2_file):
+        """Import disk using sparse conversion via NFS mount."""
+        print(colored("\n🚀 Starting Sparse Import...", Colors.CYAN))
+        print(f"   NFS: {nfs_server}:{nfs_path}")
+        print(f"   File: {qcow2_file}")
+        
+        def progress_callback(stage, detail, logs):
+            print(f"\r   [{stage}] {detail}     ", end='', flush=True)
+            if logs and stage in ('Completed', 'Failed', 'Error'):
+                print(f"\n   Logs:\n{logs}")
+        
+        import time
+        start_time = time.time()
+        
+        try:
+            success = self.harvester.import_disk_sparse(
+                pvc_name=vol_name,
+                size_gi=size_gi,
+                storage_class=storage_class,
+                nfs_server=nfs_server,
+                nfs_path=nfs_path,
+                qcow2_file=qcow2_file,
+                namespace=namespace,
+                progress_callback=progress_callback,
+                timeout=7200
+            )
+            
+            elapsed = int(time.time() - start_time)
+            
+            if success:
+                print(colored(f"\n\n✅ Volume created: {namespace}/{vol_name}", Colors.GREEN))
+                print(colored(f"   Completed in {elapsed} seconds", Colors.GREEN))
+                print(colored("   Ready for VM creation!", Colors.GREEN))
+            else:
+                print(colored(f"\n\n❌ Import failed after {elapsed}s", Colors.RED))
+                print(colored("   Check pod logs for details", Colors.RED))
+                
+        except Exception as e:
+            print(colored(f"\n\n❌ Error: {e}", Colors.RED))
+    
+    def _import_datavolume(self, vol_name, size_gi, storage_class, namespace,
+                           selected_file, transfer_config):
+        """Import disk using CDI DataVolume (HTTP)."""
         # Start HTTP server
         print(colored("\n🚀 Starting HTTP server...", Colors.CYAN))
         
-        transfer_config = self.config.get('transfer', {})
         http_server_ip = transfer_config.get('http_server_ip', None)
         
         http_url = self.actions.start_http_server(8080, bind_ip=http_server_ip)
@@ -1780,7 +1864,7 @@ class MigrationTool:
                 name=vol_name,
                 http_url=file_url,
                 size_gi=size_gi,
-                storage_class=selected_sc,
+                storage_class=storage_class,
                 namespace=namespace
             )
             print(colored(f"✅ DataVolume created: {vol_name}", Colors.GREEN))

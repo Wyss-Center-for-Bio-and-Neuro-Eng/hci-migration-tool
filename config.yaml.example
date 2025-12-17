@@ -36,6 +36,11 @@ transfer:
   # HTTP server IP for Harvester image import
   # If not set, auto-detect. Set this if auto-detect fails.
   http_server_ip: "10.16.16.167"
+  
+  # NFS staging settings for sparse import (recommended for large sparse disks)
+  # The staging server must export the migrations directory via NFS
+  # nfs_server: "10.16.22.240"       # IP of NFS server (usually same as this machine)
+  # nfs_path: "/mnt/data/migrations"  # NFS export path
 
 # Windows Remote Management Settings
 windows:

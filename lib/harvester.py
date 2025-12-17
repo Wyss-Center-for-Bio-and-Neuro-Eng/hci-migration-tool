@@ -855,3 +855,283 @@ class HarvesterClient:
             time.sleep(5)
         
         return False  # Timeout
+    
+    # =========================================================================
+    # Sparse Import Methods - For efficient import of large sparse disks
+    # =========================================================================
+    
+    def create_empty_block_pvc(self, name: str, size_gi: int, storage_class: str,
+                                namespace: str = None) -> dict:
+        """
+        Create an empty PVC in Block mode for sparse import.
+        
+        Args:
+            name: PVC name
+            size_gi: Size in GiB
+            storage_class: StorageClass (e.g. harvester-longhorn-dual-node)
+            namespace: Target namespace
+            
+        Returns:
+            Created PVC object
+        """
+        ns = namespace or self.namespace
+        
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": name,
+                "namespace": ns
+            },
+            "spec": {
+                "accessModes": ["ReadWriteMany"],
+                "storageClassName": storage_class,
+                "volumeMode": "Block",
+                "resources": {
+                    "requests": {
+                        "storage": f"{size_gi}Gi"
+                    }
+                }
+            }
+        }
+        
+        return self._request("POST", f"/api/v1/namespaces/{ns}/persistentvolumeclaims", pvc_manifest)
+    
+    def create_importer_pod(self, pod_name: str, pvc_name: str, 
+                            nfs_server: str, nfs_path: str, qcow2_file: str,
+                            namespace: str = None) -> dict:
+        """
+        Create a pod that imports a QCOW2 file to a PVC using sparse conversion.
+        
+        The pod will:
+        1. Mount NFS staging (read-only)
+        2. Mount PVC as block device
+        3. Run qemu-img convert with sparse option
+        4. Exit when done
+        
+        Args:
+            pod_name: Name for the importer pod
+            pvc_name: Target PVC name (must exist)
+            nfs_server: NFS server IP
+            nfs_path: NFS export path (e.g. /mnt/data/migrations)
+            qcow2_file: Path to QCOW2 file relative to NFS root
+            namespace: Target namespace
+            
+        Returns:
+            Created Pod object
+        """
+        ns = namespace or self.namespace
+        
+        # Command: install qemu-utils and run sparse conversion
+        # -S 0 = detect zeros and skip them (sparse write)
+        # -p = show progress
+        convert_cmd = f"""
+            apt-get update && apt-get install -y qemu-utils && \
+            echo "Starting sparse conversion..." && \
+            qemu-img convert -p -f qcow2 -O raw -S 0 /staging/{qcow2_file} /dev/target && \
+            echo "Conversion complete!"
+        """
+        
+        pod_manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": ns
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{
+                    "name": "importer",
+                    "image": "ubuntu:22.04",
+                    "command": ["/bin/bash", "-c", convert_cmd],
+                    "securityContext": {
+                        "privileged": True
+                    },
+                    "volumeMounts": [{
+                        "name": "staging-nfs",
+                        "mountPath": "/staging",
+                        "readOnly": True
+                    }],
+                    "volumeDevices": [{
+                        "name": "target-disk",
+                        "devicePath": "/dev/target"
+                    }]
+                }],
+                "volumes": [
+                    {
+                        "name": "staging-nfs",
+                        "nfs": {
+                            "server": nfs_server,
+                            "path": nfs_path
+                        }
+                    },
+                    {
+                        "name": "target-disk",
+                        "persistentVolumeClaim": {
+                            "claimName": pvc_name
+                        }
+                    }
+                ]
+            }
+        }
+        
+        return self._request("POST", f"/api/v1/namespaces/{ns}/pods", pod_manifest)
+    
+    def get_pod(self, name: str, namespace: str = None) -> dict:
+        """Get a Pod by name."""
+        ns = namespace or self.namespace
+        return self._request("GET", f"/api/v1/namespaces/{ns}/pods/{name}")
+    
+    def get_pod_logs(self, name: str, namespace: str = None, tail_lines: int = 100) -> str:
+        """Get pod logs."""
+        ns = namespace or self.namespace
+        url = f"{self.base_url}/api/v1/namespaces/{ns}/pods/{name}/log?tailLines={tail_lines}"
+        response = requests.get(url, cert=self.cert, verify=self.verify if self.verify else False)
+        if response.ok:
+            return response.text
+        return ""
+    
+    def delete_pod(self, name: str, namespace: str = None) -> dict:
+        """Delete a Pod."""
+        ns = namespace or self.namespace
+        return self._request("DELETE", f"/api/v1/namespaces/{ns}/pods/{name}")
+    
+    def wait_pod_completed(self, name: str, namespace: str = None, 
+                           timeout: int = 7200, progress_callback=None) -> bool:
+        """
+        Wait for a Pod to complete (Succeeded or Failed).
+        
+        Args:
+            name: Pod name
+            namespace: Namespace
+            timeout: Max wait time in seconds (default 2 hours)
+            progress_callback: Optional function(phase, logs_tail) called on updates
+            
+        Returns:
+            True if Succeeded, False if Failed or timeout
+        """
+        import time
+        ns = namespace or self.namespace
+        start_time = time.time()
+        last_phase = ""
+        
+        while time.time() - start_time < timeout:
+            try:
+                pod = self.get_pod(name, ns)
+                phase = pod.get('status', {}).get('phase', 'Unknown')
+                
+                # Get container status for more detail
+                container_statuses = pod.get('status', {}).get('containerStatuses', [])
+                container_state = ""
+                if container_statuses:
+                    state = container_statuses[0].get('state', {})
+                    if 'running' in state:
+                        container_state = "Running"
+                    elif 'waiting' in state:
+                        container_state = f"Waiting: {state['waiting'].get('reason', '')}"
+                    elif 'terminated' in state:
+                        container_state = f"Terminated: {state['terminated'].get('reason', '')}"
+                
+                # Call progress callback
+                if progress_callback and (phase != last_phase or container_state):
+                    logs = self.get_pod_logs(name, ns, tail_lines=5)
+                    progress_callback(phase, container_state, logs)
+                    last_phase = phase
+                
+                if phase == 'Succeeded':
+                    return True
+                elif phase == 'Failed':
+                    return False
+                
+            except Exception as e:
+                if progress_callback:
+                    progress_callback('Error', str(e), '')
+            
+            time.sleep(5)
+        
+        return False  # Timeout
+    
+    def import_disk_sparse(self, pvc_name: str, size_gi: int, storage_class: str,
+                           nfs_server: str, nfs_path: str, qcow2_file: str,
+                           namespace: str = None, progress_callback=None,
+                           timeout: int = 7200) -> bool:
+        """
+        High-level method to import a QCOW2 disk using sparse conversion.
+        
+        This method:
+        1. Creates an empty PVC
+        2. Creates an importer pod
+        3. Waits for conversion to complete
+        4. Cleans up the pod
+        
+        Args:
+            pvc_name: Name for the new PVC
+            size_gi: Size in GiB (virtual size of disk)
+            storage_class: StorageClass to use
+            nfs_server: NFS server IP hosting the QCOW2
+            nfs_path: NFS export path
+            qcow2_file: Path to QCOW2 relative to NFS root
+            namespace: Target namespace
+            progress_callback: Optional function(stage, detail, logs)
+            timeout: Max time for conversion in seconds
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        ns = namespace or self.namespace
+        pod_name = f"importer-{pvc_name}"
+        
+        try:
+            # Step 1: Create empty PVC
+            if progress_callback:
+                progress_callback("Creating", f"Creating empty PVC {pvc_name} ({size_gi} GiB)", "")
+            
+            self.create_empty_block_pvc(pvc_name, size_gi, storage_class, ns)
+            
+            # Wait for PVC to be bound
+            import time
+            for _ in range(60):  # 5 min timeout
+                pvc = self.get_pvc(pvc_name, ns)
+                if pvc.get('status', {}).get('phase') == 'Bound':
+                    break
+                time.sleep(5)
+            else:
+                if progress_callback:
+                    progress_callback("Error", "PVC did not bind within timeout", "")
+                return False
+            
+            # Step 2: Create importer pod
+            if progress_callback:
+                progress_callback("Importing", f"Creating importer pod {pod_name}", "")
+            
+            self.create_importer_pod(pod_name, pvc_name, nfs_server, nfs_path, qcow2_file, ns)
+            
+            # Step 3: Wait for pod to complete
+            success = self.wait_pod_completed(pod_name, ns, timeout, progress_callback)
+            
+            # Step 4: Get final logs
+            if progress_callback:
+                logs = self.get_pod_logs(pod_name, ns, tail_lines=20)
+                if success:
+                    progress_callback("Completed", f"PVC {pvc_name} ready", logs)
+                else:
+                    progress_callback("Failed", "Import failed", logs)
+            
+            # Step 5: Cleanup pod
+            try:
+                self.delete_pod(pod_name, ns)
+            except:
+                pass  # Ignore cleanup errors
+            
+            return success
+            
+        except Exception as e:
+            if progress_callback:
+                progress_callback("Error", str(e), "")
+            # Try to cleanup
+            try:
+                self.delete_pod(pod_name, ns)
+            except:
+                pass
+            return False
