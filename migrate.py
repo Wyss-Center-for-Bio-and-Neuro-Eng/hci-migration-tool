@@ -1723,19 +1723,20 @@ class MigrationTool:
                 info = json.loads(result.stdout)
                 virtual_size = info.get('virtual-size', 0)
                 virtual_size_gb = virtual_size / (1024**3)
-                # Use ceil to ensure we have enough space
-                min_size_gi = math.ceil(virtual_size_gb)
-                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB → minimum {min_size_gi} GiB")
+                # Use ceil + 1 GiB margin for safety (conversion overhead)
+                min_size_gi = math.ceil(virtual_size_gb) + 1
+                print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB")
+                print(f"   Minimum volume: {min_size_gi} GiB (includes 1 GiB safety margin)")
             else:
-                min_size_gi = int(selected_file['size'] / (1024**3)) + 10
+                min_size_gi = int(selected_file['size'] / (1024**3)) + 5
         except:
-            min_size_gi = int(selected_file['size'] / (1024**3)) + 10
+            min_size_gi = int(selected_file['size'] / (1024**3)) + 5
         
-        default_size = max(min_size_gi, 10)
+        default_size = min_size_gi
         size_input = self.input_prompt(f"Volume size in GiB [{default_size}]")
         size_gi = int(size_input) if size_input else default_size
         if size_gi < min_size_gi:
-            print(colored(f"   ⚠️  Size {size_gi} < minimum {min_size_gi}, using {min_size_gi} GiB", Colors.YELLOW))
+            print(colored(f"   ⚠️  Size {size_gi} < minimum {min_size_gi}, forcing {min_size_gi} GiB", Colors.YELLOW))
             size_gi = min_size_gi
         
         # Summary
