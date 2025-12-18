@@ -2197,6 +2197,7 @@ class MigrationTool:
             return
         
         # Parse and display networks with namespace and VLAN info
+        import json
         network_list = []
         for net in all_networks:
             net_name = net.get('metadata', {}).get('name', 'N/A')
@@ -2205,7 +2206,6 @@ class MigrationTool:
             # Parse VLAN from config
             vlan_id = "-"
             try:
-                import json
                 config_str = net.get('spec', {}).get('config', '{}')
                 config = json.loads(config_str)
                 if 'vlan' in config:
