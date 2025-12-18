@@ -2321,6 +2321,7 @@ class MigrationTool:
         
         disks_spec = []
         volumes_spec = []
+        volume_claim_templates = []
         
         for i, pvc in enumerate(selected_pvcs):
             disk_name = f"disk-{i}"
@@ -2333,12 +2334,23 @@ class MigrationTool:
                 "name": disk_name,
                 "persistentVolumeClaim": {"claimName": pvc['name']}
             })
+            
+            # Build volume claim template for UI annotation
+            volume_claim_templates.append({
+                "metadata": {"name": pvc['name'], "annotations": {"harvesterhci.io/imageId": ""}},
+                "spec": {
+                    "accessModes": ["ReadWriteMany"],
+                    "resources": {"requests": {"storage": pvc['size']}},
+                    "volumeMode": "Block"
+                }
+            })
         
         net_model = "e1000" if disk_bus == "sata" else "virtio"
         
         # Build interfaces and networks specs for multi-NIC
         interfaces_spec = []
         networks_spec = []
+        network_ips_annotation = {}
         for i, net in enumerate(selected_networks):
             nic_name = f"nic-{i}"
             interfaces_spec.append({
@@ -2350,6 +2362,7 @@ class MigrationTool:
                 "name": nic_name,
                 "multus": {"networkName": net['full_name']}
             })
+            network_ips_annotation[nic_name] = ""
         
         manifest = {
             "apiVersion": "kubevirt.io/v1",
@@ -2358,16 +2371,39 @@ class MigrationTool:
                 "name": vm_name,
                 "namespace": namespace,
                 "labels": {"harvesterhci.io/creator": "harvesterhci"},
-                "annotations": {"harvesterhci.io/vmRunStrategy": "RerunOnFailure"}
+                "annotations": {
+                    "harvesterhci.io/vmRunStrategy": "RerunOnFailure",
+                    "harvesterhci.io/volumeClaimTemplates": json.dumps(volume_claim_templates),
+                    "harvesterhci.io/networkIps": json.dumps(network_ips_annotation)
+                }
             },
             "spec": {
                 "runStrategy": "RerunOnFailure",
                 "template": {
-                    "metadata": {"labels": {"harvesterhci.io/vmName": vm_name}},
+                    "metadata": {
+                        "annotations": {
+                            "harvesterhci.io/sshNames": "[]"
+                        },
+                        "labels": {
+                            "harvesterhci.io/creator": "harvester",
+                            "harvesterhci.io/vmName": vm_name
+                        }
+                    },
                     "spec": {
+                        "hostname": vm_name,
+                        "evictionStrategy": "LiveMigrateIfPossible",
                         "domain": {
-                            "cpu": {"cores": cpu, "sockets": 1, "threads": 1},
+                            "cpu": {
+                                "cores": cpu,
+                                "sockets": 1,
+                                "maxSockets": 1,
+                                "threads": 1
+                            },
                             "memory": {"guest": f"{ram}Gi"},
+                            "resources": {
+                                "limits": {"cpu": str(cpu), "memory": f"{ram}Gi"},
+                                "requests": {"cpu": "250m", "memory": f"{ram * 682}Mi"}
+                            },
                             "devices": {
                                 "disks": disks_spec,
                                 "interfaces": interfaces_spec,
@@ -2377,7 +2413,8 @@ class MigrationTool:
                             "machine": {"type": "q35"}
                         },
                         "networks": networks_spec,
-                        "volumes": volumes_spec
+                        "volumes": volumes_spec,
+                        "terminationGracePeriodSeconds": 120
                     }
                 }
             }
