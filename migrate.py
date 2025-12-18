@@ -2412,9 +2412,8 @@ class MigrationTool:
                         import time
                         time.sleep(60)
                         
-                        # Set _selected_vm for postmig function
-                        self._selected_vm = vm_name
-                        self.postmig_autoconfigure()
+                        # Call postmig with known vm_name and namespace
+                        self.postmig_autoconfigure(vm_name, namespace)
                     else:
                         print(colored("\n💡 To configure later:", Colors.YELLOW))
                         print("   Menu Windows → Post-migration auto-configure (option 8)")
@@ -4383,7 +4382,7 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
         finally:
             httpd.shutdown()
     
-    def postmig_autoconfigure(self):
+    def postmig_autoconfigure(self, vm_name=None, namespace=None):
         """Auto-configure Windows VM after migration using ping FQDN."""
         print(colored("\n🔧 Post-Migration Auto-Configure", Colors.BOLD))
         print(colored("-" * 50, Colors.BLUE))
@@ -4395,51 +4394,55 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
             print(colored("❌ pywinrm not installed", Colors.RED))
             return
         
-        # List VMs in Harvester
-        vms = self.harvester.list_vms()
-        if not vms:
-            print(colored("❌ No VMs found in Harvester", Colors.RED))
-            return
-        
-        print("\nHarvester VMs:")
-        for i, vm in enumerate(vms, 1):
-            name = vm.get('metadata', {}).get('name', 'N/A')
-            ns = vm.get('metadata', {}).get('namespace', 'N/A')
-            status = vm.get('status', {})
-            running = status.get('ready', False)
-            state = "🟢 Running" if running else "🔴 Stopped"
-            print(f"  {i}. {name} ({ns}) - {state}")
-        
-        choice = self.input_prompt("\nSelect VM number")
-        if not choice:
-            return
-        
-        try:
-            idx = int(choice) - 1
-            selected_vm = vms[idx]
-            vm_name = selected_vm.get('metadata', {}).get('name')
-            namespace = selected_vm.get('metadata', {}).get('namespace')
-        except:
-            print(colored("Invalid choice", Colors.RED))
-            return
-        
-        # Check if VM is running
-        vm_status = selected_vm.get('status', {})
-        if not vm_status.get('ready', False):
-            print(colored(f"\n⚠️  VM {vm_name} is not running", Colors.YELLOW))
-            start = self.input_prompt("Start it now? (y/n)")
-            if start.lower() == 'y':
-                print("   Starting VM...")
-                try:
-                    self.harvester.start_vm(vm_name, namespace)
-                    print(colored("   ✅ Start command sent. Waiting 30s for boot...", Colors.GREEN))
-                    import time
-                    time.sleep(30)
-                except Exception as e:
-                    print(colored(f"   ❌ Error: {e}", Colors.RED))
-                    return
-            else:
+        # If vm_name not provided, list VMs and ask user to select
+        if not vm_name:
+            # List VMs in Harvester
+            vms = self.harvester.list_vms()
+            if not vms:
+                print(colored("❌ No VMs found in Harvester", Colors.RED))
                 return
+            
+            print("\nHarvester VMs:")
+            for i, vm in enumerate(vms, 1):
+                name = vm.get('metadata', {}).get('name', 'N/A')
+                ns = vm.get('metadata', {}).get('namespace', 'N/A')
+                status = vm.get('status', {})
+                running = status.get('ready', False)
+                state = "🟢 Running" if running else "🔴 Stopped"
+                print(f"  {i}. {name} ({ns}) - {state}")
+            
+            choice = self.input_prompt("\nSelect VM number")
+            if not choice:
+                return
+            
+            try:
+                idx = int(choice) - 1
+                selected_vm = vms[idx]
+                vm_name = selected_vm.get('metadata', {}).get('name')
+                namespace = selected_vm.get('metadata', {}).get('namespace')
+            except:
+                print(colored("Invalid choice", Colors.RED))
+                return
+            
+            # Check if VM is running
+            vm_status = selected_vm.get('status', {})
+            if not vm_status.get('ready', False):
+                print(colored(f"\n⚠️  VM {vm_name} is not running", Colors.YELLOW))
+                start = self.input_prompt("Start it now? (y/n)")
+                if start.lower() == 'y':
+                    print("   Starting VM...")
+                    try:
+                        self.harvester.start_vm(vm_name, namespace)
+                        print(colored("   ✅ Start command sent. Waiting 30s for boot...", Colors.GREEN))
+                        import time
+                        time.sleep(30)
+                    except Exception as e:
+                        print(colored(f"   ❌ Error: {e}", Colors.RED))
+                        return
+                else:
+                    return
+        else:
+            print(colored(f"   VM: {vm_name} ({namespace})", Colors.CYAN))
         
         # Build FQDN and ping
         windows_config = self.config.get('windows', {})
