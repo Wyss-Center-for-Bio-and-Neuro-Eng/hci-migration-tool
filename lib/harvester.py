@@ -982,12 +982,13 @@ echo ""
 echo "=== Step 3/4: Copying data segments to block device ==="
 echo "   Using selective copy for $DATA_SEGMENTS segments..."
 
+# Extract data segments to simple text file (avoids subshell issues with pipe)
+jq -r '.[] | select(.data == true and .zero == false) | "\\(.start) \\(.length)"' /tmp/segments.json > /tmp/data_segments.txt
+
 # Process each data segment with dd
 COPIED=0
 SEGMENT_NUM=0
-jq -c '.[] | select(.data == true and .zero == false)' /tmp/segments.json | while read -r segment; do
-    START=$(echo "$segment" | jq -r '.start')
-    LENGTH=$(echo "$segment" | jq -r '.length')
+while read -r START LENGTH; do
     SEGMENT_NUM=$((SEGMENT_NUM + 1))
     
     # Calculate block-aligned parameters (512-byte blocks)
@@ -1000,12 +1001,12 @@ jq -c '.[] | select(.data == true and .zero == false)' /tmp/segments.json | whil
     fi
     
     LENGTH_KB=$((LENGTH / 1024))
-    echo "   Segment $SEGMENT_NUM: offset $START, size ${{LENGTH_KB}}KB"
+    echo "   Segment $SEGMENT_NUM/$DATA_SEGMENTS: offset $START, size ${{LENGTH_KB}}KB"
     
     dd if="$RAW_FILE" of="$BLOCK_DEV" bs=512 skip=$SKIP_BLOCKS seek=$SKIP_BLOCKS count=$COUNT_BLOCKS conv=notrunc status=none
     
     COPIED=$((COPIED + LENGTH))
-done
+done < /tmp/data_segments.txt
 
 sync
 echo "   All segments copied successfully"
@@ -1013,7 +1014,7 @@ echo "   All segments copied successfully"
 echo ""
 echo "=== Step 4/4: Cleanup ==="
 rm -f "$RAW_FILE"
-rm -f /tmp/segments.json
+rm -f /tmp/segments.json /tmp/data_segments.txt
 echo "   Temporary files removed"
 
 echo ""
