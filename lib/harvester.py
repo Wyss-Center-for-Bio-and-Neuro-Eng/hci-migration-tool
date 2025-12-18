@@ -933,11 +933,28 @@ set -e
 apt-get update > /dev/null
 apt-get install -y qemu-utils > /dev/null
 echo "=== Step 1/3: Converting QCOW2 to sparse RAW file ==="
-qemu-img convert -p -f qcow2 -O raw -S 0 /staging/{qcow2_file} /staging/{temp_raw}
+
+# Start qemu-img in background
+qemu-img convert -f qcow2 -O raw -S 0 /staging/{qcow2_file} /staging/{temp_raw} &
+PID=$!
+
+# Monitor progress by checking file size
+while kill -0 $PID 2>/dev/null; do
+    if [ -f /staging/{temp_raw} ]; then
+        SIZE=$(du -h /staging/{temp_raw} 2>/dev/null | cut -f1)
+        echo "   Converting... $SIZE written"
+    fi
+    sleep 5
+done
+wait $PID
+echo "   Step 1 complete"
+
 echo ""
 echo "=== Step 2/3: Copying sparse RAW to block device ==="
-dd if=/staging/{temp_raw} of=/dev/target bs=4M conv=sparse status=progress
+dd if=/staging/{temp_raw} of=/dev/target bs=4M conv=sparse status=progress 2>&1
 sync
+echo "   Step 2 complete"
+
 echo ""
 echo "=== Step 3/3: Cleanup ==="
 rm -f /staging/{temp_raw}
