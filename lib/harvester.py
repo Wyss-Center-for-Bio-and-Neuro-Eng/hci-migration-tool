@@ -960,60 +960,45 @@ START_TIME=$(date +%s)
 qemu-img convert -f qcow2 -O raw -n --target-is-zero "$QCOW2_FILE" "$BLOCK_DEV" &
 PID=$!
 
-# Wait a moment for qemu-img to open files
-sleep 2
+# Wait for process to start
+sleep 1
 
-# Find file descriptor for QCOW2 (input)
-QCOW2_FD=""
-for fd in /proc/$PID/fd/*; do
-    if [ -L "$fd" ]; then
-        target=$(readlink "$fd" 2>/dev/null || true)
-        if echo "$target" | grep -q ".qcow2"; then
-            QCOW2_FD=$(basename "$fd")
-            break
-        fi
-    fi
-done
-
-if [ -z "$QCOW2_FD" ]; then
-    echo "   Note: Fast import - progress monitoring skipped"
-fi
-
-# Monitor progress
+# Monitor progress using /proc/PID/io for actual bytes written
 while kill -0 $PID 2>/dev/null; do
     sleep 3
     
-    # Get read position (QCOW2) - this is the real progress indicator
-    READ_POS=0
-    if [ -n "$QCOW2_FD" ] && [ -f /proc/$PID/fdinfo/$QCOW2_FD ]; then
-        READ_POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$QCOW2_FD 2>/dev/null | awk '{{print $2}}')
-        READ_POS=${{READ_POS:-0}}
-    fi
-    
-    # Calculate metrics based on QCOW2 read progress
-    READ_MB=$((READ_POS / 1024 / 1024))
-    
-    # Progress based on read position vs actual QCOW2 data size
-    if [ "$ACTUAL_SIZE" -gt 0 ]; then
-        READ_PCT=$((READ_POS * 100 / ACTUAL_SIZE))
-    else
-        READ_PCT=0
-    fi
-    if [ $READ_PCT -gt 100 ]; then READ_PCT=100; fi
-    
-    # Speed calculation based on data processed
-    ELAPSED=$(($(date +%s) - START_TIME))
-    if [ $ELAPSED -gt 0 ] && [ $READ_POS -gt 0 ]; then
-        SPEED_MB=$((READ_MB / ELAPSED))
-        if [ $SPEED_MB -gt 0 ] && [ $READ_PCT -lt 100 ]; then
-            REMAINING_MB=$((ACTUAL_SIZE_MB - READ_MB))
-            ETA=$((REMAINING_MB / SPEED_MB))
+    if [ -f /proc/$PID/io ]; then
+        # Get actual bytes written (real I/O, not seek position)
+        WRITE_BYTES=$(grep -E '^write_bytes:' /proc/$PID/io 2>/dev/null | awk '{{print $2}}')
+        WRITE_BYTES=${{WRITE_BYTES:-0}}
+        WRITE_MB=$((WRITE_BYTES / 1024 / 1024))
+        
+        # Progress based on actual data written vs QCOW2 data (decompressed ~2x)
+        # Estimate: written data should be roughly equal to ACTUAL_SIZE when done
+        if [ "$ACTUAL_SIZE" -gt 0 ]; then
+            WRITE_PCT=$((WRITE_BYTES * 100 / ACTUAL_SIZE))
+            if [ $WRITE_PCT -gt 100 ]; then WRITE_PCT=100; fi
         else
-            ETA=0
+            WRITE_PCT=0
         fi
-        echo "   Processing: $READ_MB / $ACTUAL_SIZE_MB MB ($READ_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
-    elif [ $READ_POS -gt 0 ]; then
-        echo "   Processing: $READ_MB / $ACTUAL_SIZE_MB MB ($READ_PCT%)"
+        
+        ELAPSED=$(($(date +%s) - START_TIME))
+        if [ $ELAPSED -gt 0 ] && [ $WRITE_MB -gt 0 ]; then
+            SPEED_MB=$((WRITE_MB / ELAPSED))
+            if [ $SPEED_MB -gt 0 ] && [ $WRITE_PCT -lt 100 ]; then
+                REMAINING_MB=$((ACTUAL_SIZE_MB - WRITE_MB))
+                if [ $REMAINING_MB -gt 0 ]; then
+                    ETA=$((REMAINING_MB / SPEED_MB))
+                else
+                    ETA=0
+                fi
+            else
+                ETA=0
+            fi
+            echo "   Written: $WRITE_MB / ~$ACTUAL_SIZE_MB MB ($WRITE_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
+        elif [ $WRITE_MB -gt 0 ]; then
+            echo "   Written: $WRITE_MB MB..."
+        fi
     fi
 done
 
