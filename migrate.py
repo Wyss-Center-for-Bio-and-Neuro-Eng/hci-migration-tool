@@ -2074,25 +2074,35 @@ class MigrationTool:
         source_nics = []
         vm_info = {}
         
-        if not self._selected_vm:
-            if detected_vms:
-                print(colored("\n🔍 Detected VMs from PVCs:", Colors.BOLD))
-                detected_list = list(detected_vms.keys())
-                for i, vm_base in enumerate(detected_list, 1):
-                    disk_count = len(detected_vms[vm_base])
-                    config_path = os.path.join(migrations_dir, vm_base.lower(), 'vm-config.json')
-                    has_config = os.path.exists(config_path)
-                    status = colored("✓ config", Colors.GREEN) if has_config else colored("○ manual", Colors.YELLOW)
-                    print(f"   {i}. {vm_base} ({disk_count} disk(s)) {status}")
-                print(f"   0. Enter manually")
-                
-                choice = self.input_prompt("\nSelect VM [1]")
-                try:
-                    idx = int(choice) - 1 if choice else 0
-                    if idx >= 0 and idx < len(detected_list):
-                        self._selected_vm = detected_list[idx]
-                except:
-                    pass
+        # Show detected VMs from PVCs
+        if detected_vms:
+            print(colored("\n🔍 Detected VMs from PVCs:", Colors.BOLD))
+            detected_list = list(detected_vms.keys())
+            
+            # Check if current selection matches a detected VM
+            current_match = None
+            for i, vm_base in enumerate(detected_list):
+                if self._selected_vm and vm_base.lower() == self._selected_vm.lower():
+                    current_match = i
+                    break
+            
+            for i, vm_base in enumerate(detected_list, 1):
+                disk_count = len(detected_vms[vm_base])
+                config_path = os.path.join(migrations_dir, vm_base.lower(), 'vm-config.json')
+                has_config = os.path.exists(config_path)
+                status = colored("✓ config", Colors.GREEN) if has_config else colored("○ manual", Colors.YELLOW)
+                selected = " ← current" if current_match == i - 1 else ""
+                print(f"   {i}. {vm_base} ({disk_count} disk(s)) {status}{selected}")
+            print(f"   0. Enter manually")
+            
+            default_choice = str(current_match + 1) if current_match is not None else "1"
+            choice = self.input_prompt(f"\nSelect VM [{default_choice}]") or default_choice
+            try:
+                idx = int(choice) - 1
+                if idx >= 0 and idx < len(detected_list):
+                    self._selected_vm = detected_list[idx]
+            except:
+                pass
         
         # Load vm-config.json if available
         if self._selected_vm:
@@ -2387,6 +2397,27 @@ class MigrationTool:
             if start.lower() == 'y':
                 self.harvester.start_vm(vm_name, namespace)
                 print(colored(f"✅ VM starting", Colors.GREEN))
+                
+                # Offer post-migration configuration
+                if loaded_config and source_nics:
+                    print(colored("\n📋 Post-Migration Configuration Available", Colors.BOLD))
+                    print("   The VM has a saved config with network settings to restore:")
+                    for i, nic in enumerate(source_nics):
+                        ip = nic.get('ip') if not nic.get('dhcp') else 'DHCP'
+                        print(f"      NIC-{i}: {ip}")
+                    
+                    postconfig = self.input_prompt("\n   Run post-migration configuration? (y/n) [y]") or "y"
+                    if postconfig.lower() == 'y':
+                        print(colored("\n   ⏳ Waiting 60s for Windows to boot...", Colors.CYAN))
+                        import time
+                        time.sleep(60)
+                        
+                        # Set _selected_vm for postmig function
+                        self._selected_vm = vm_name
+                        self.postmig_autoconfigure()
+                    else:
+                        print(colored("\n💡 To configure later:", Colors.YELLOW))
+                        print("   Menu Windows → Post-migration auto-configure (option 8)")
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
@@ -4641,6 +4672,84 @@ try {{
                         print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
             
             original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
+            
+            # Reboot after network configuration
+            print(colored("\n🔄 Post-Configuration Reboot", Colors.BOLD))
+            print("   A reboot is recommended to ensure network changes are fully applied.")
+            
+            reboot = self.input_prompt("\n   Reboot VM now? (y/n) [y]") or "y"
+            if reboot.lower() == 'y':
+                print(colored("\n   🔄 Rebooting VM...", Colors.CYAN))
+                try:
+                    # Send reboot command
+                    client.run_powershell("Restart-Computer -Force", timeout=10)
+                except:
+                    pass  # Connection will drop during reboot
+                
+                print("   ⏳ Waiting for VM to reboot...")
+                time.sleep(30)  # Initial wait for shutdown
+                
+                # Wait for VM to come back online via ping
+                print(f"   ⏳ Pinging {original_ip} to verify VM is back online...")
+                
+                max_wait = 180  # 3 minutes max
+                start_time = time.time()
+                vm_back = False
+                
+                while time.time() - start_time < max_wait:
+                    elapsed = int(time.time() - start_time)
+                    
+                    try:
+                        result = subprocess.run(
+                            ['ping', '-c', '1', '-W', '2', original_ip],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        
+                        if result.returncode == 0:
+                            vm_back = True
+                            print(colored(f"\n   ✅ VM is back online! IP: {original_ip} ({elapsed}s)", Colors.GREEN))
+                            break
+                        else:
+                            if elapsed % 15 == 0:
+                                print(f"   ⏳ Waiting for VM... ({elapsed}s)")
+                    except:
+                        pass
+                    
+                    time.sleep(5)
+                
+                if not vm_back:
+                    print(colored(f"\n   ⚠️  VM not responding on {original_ip} after {max_wait}s", Colors.YELLOW))
+                    print(colored("      Check console via Harvester UI", Colors.YELLOW))
+                else:
+                    # Wait for WinRM to be ready
+                    print("   ⏳ Waiting for WinRM service (15s)...")
+                    time.sleep(15)
+                    
+                    # Try to reconnect and verify
+                    print(colored(f"   🔌 Verifying connection to {original_ip}...", Colors.CYAN))
+                    try:
+                        verify_client = WinRMClient(
+                            host=original_ip,
+                            username=username,
+                            password=password,
+                            transport=transport
+                        )
+                        if verify_client.test_connection():
+                            print(colored("   ✅ WinRM connection verified!", Colors.GREEN))
+                            
+                            # Quick verification
+                            stdout, _, _ = verify_client.run_powershell(
+                                "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1'}).IPAddress"
+                            )
+                            current_ip = stdout.strip().split('\n')[0] if stdout else 'unknown'
+                            print(colored(f"   ✅ Current IP: {current_ip}", Colors.GREEN))
+                        else:
+                            print(colored("   ⚠️  WinRM not ready yet, but VM is pingable", Colors.YELLOW))
+                    except Exception as e:
+                        print(colored(f"   ⚠️  Verification failed: {e}", Colors.YELLOW))
+                        print(colored("      VM is pingable, should be operational", Colors.YELLOW))
             
             # Offer to uninstall Nutanix tools
             print(colored("\n🧹 Nutanix Tools Cleanup", Colors.BOLD))
