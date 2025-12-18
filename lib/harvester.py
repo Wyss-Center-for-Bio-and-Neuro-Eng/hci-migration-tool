@@ -945,8 +945,14 @@ ACTUAL_SIZE=$(qemu-img info --output=json "$QCOW2_FILE" | jq -r '."actual-size"'
 VIRT_SIZE_GB=$((VIRT_SIZE / 1024 / 1024 / 1024))
 VIRT_SIZE_MB=$((VIRT_SIZE / 1024 / 1024))
 ACTUAL_SIZE_MB=$((ACTUAL_SIZE / 1024 / 1024))
+
+# Get decompressed data size from qemu-img map (actual data to be written)
+DATA_SIZE=$(qemu-img map --output=json "$QCOW2_FILE" | jq '[.[] | select(.data == true and .zero == false) | .length] | add // 0')
+DATA_SIZE_MB=$((DATA_SIZE / 1024 / 1024))
+
 echo "   Virtual size: $VIRT_SIZE_GB GB"
-echo "   QCOW2 actual data: $ACTUAL_SIZE_MB MB"
+echo "   QCOW2 compressed: $ACTUAL_SIZE_MB MB"
+echo "   Data to write: $DATA_SIZE_MB MB"
 
 echo ""
 echo "=== Step 2/2: Converting QCOW2 to block device ==="
@@ -973,10 +979,9 @@ while kill -0 $PID 2>/dev/null; do
         WRITE_BYTES=${{WRITE_BYTES:-0}}
         WRITE_MB=$((WRITE_BYTES / 1024 / 1024))
         
-        # Progress based on actual data written vs QCOW2 data (decompressed ~2x)
-        # Estimate: written data should be roughly equal to ACTUAL_SIZE when done
-        if [ "$ACTUAL_SIZE" -gt 0 ]; then
-            WRITE_PCT=$((WRITE_BYTES * 100 / ACTUAL_SIZE))
+        # Progress based on actual data written vs decompressed data size
+        if [ "$DATA_SIZE" -gt 0 ]; then
+            WRITE_PCT=$((WRITE_BYTES * 100 / DATA_SIZE))
             if [ $WRITE_PCT -gt 100 ]; then WRITE_PCT=100; fi
         else
             WRITE_PCT=0
@@ -986,7 +991,7 @@ while kill -0 $PID 2>/dev/null; do
         if [ $ELAPSED -gt 0 ] && [ $WRITE_MB -gt 0 ]; then
             SPEED_MB=$((WRITE_MB / ELAPSED))
             if [ $SPEED_MB -gt 0 ] && [ $WRITE_PCT -lt 100 ]; then
-                REMAINING_MB=$((ACTUAL_SIZE_MB - WRITE_MB))
+                REMAINING_MB=$((DATA_SIZE_MB - WRITE_MB))
                 if [ $REMAINING_MB -gt 0 ]; then
                     ETA=$((REMAINING_MB / SPEED_MB))
                 else
@@ -995,7 +1000,7 @@ while kill -0 $PID 2>/dev/null; do
             else
                 ETA=0
             fi
-            echo "   Written: $WRITE_MB / ~$ACTUAL_SIZE_MB MB ($WRITE_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
+            echo "   Written: $WRITE_MB / $DATA_SIZE_MB MB ($WRITE_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
         elif [ $WRITE_MB -gt 0 ]; then
             echo "   Written: $WRITE_MB MB..."
         fi
@@ -1009,16 +1014,16 @@ sync
 
 ELAPSED=$(($(date +%s) - START_TIME))
 if [ $ELAPSED -gt 0 ]; then
-    SPEED=$((ACTUAL_SIZE_MB / ELAPSED))
+    SPEED=$((DATA_SIZE_MB / ELAPSED))
 else
-    SPEED=$ACTUAL_SIZE_MB
+    SPEED=$DATA_SIZE_MB
 fi
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "========================================="
     echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
-    echo "   QCOW2 data: $ACTUAL_SIZE_MB MB"
+    echo "   Data written: $DATA_SIZE_MB MB"
     echo "   Virtual size: $VIRT_SIZE_GB GB"
     echo "   Duration: $ELAPSED seconds"
     echo "   Throughput: $SPEED MB/s"
