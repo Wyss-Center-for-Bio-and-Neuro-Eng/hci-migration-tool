@@ -963,73 +963,58 @@ PID=$!
 # Wait a moment for qemu-img to open files
 sleep 2
 
-# Find file descriptors for QCOW2 (input) and block device (output)
+# Find file descriptor for QCOW2 (input)
 QCOW2_FD=""
-BLOCK_FD=""
 for fd in /proc/$PID/fd/*; do
     if [ -L "$fd" ]; then
         target=$(readlink "$fd" 2>/dev/null || true)
-        fd_num=$(basename "$fd")
         if echo "$target" | grep -q ".qcow2"; then
-            QCOW2_FD=$fd_num
-        elif echo "$target" | grep -q "/dev/"; then
-            BLOCK_FD=$fd_num
+            QCOW2_FD=$(basename "$fd")
+            break
         fi
     fi
 done
 
-if [ -z "$QCOW2_FD" ] || [ -z "$BLOCK_FD" ]; then
+if [ -z "$QCOW2_FD" ]; then
     echo "   Note: Fast import - progress monitoring skipped"
 fi
 
 # Monitor progress
-LAST_WRITE_POS=0
 while kill -0 $PID 2>/dev/null; do
     sleep 3
     
-    # Get read position (QCOW2)
+    # Get read position (QCOW2) - this is the real progress indicator
     READ_POS=0
     if [ -n "$QCOW2_FD" ] && [ -f /proc/$PID/fdinfo/$QCOW2_FD ]; then
         READ_POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$QCOW2_FD 2>/dev/null | awk '{{print $2}}')
         READ_POS=${{READ_POS:-0}}
     fi
     
-    # Get write position (Block device)
-    WRITE_POS=0
-    if [ -n "$BLOCK_FD" ] && [ -f /proc/$PID/fdinfo/$BLOCK_FD ]; then
-        WRITE_POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$BLOCK_FD 2>/dev/null | awk '{{print $2}}')
-        WRITE_POS=${{WRITE_POS:-0}}
-    fi
-    
-    # Calculate metrics
+    # Calculate metrics based on QCOW2 read progress
     READ_MB=$((READ_POS / 1024 / 1024))
-    WRITE_MB=$((WRITE_POS / 1024 / 1024))
-    WRITE_GB=$((WRITE_POS / 1024 / 1024 / 1024))
     
-    # Progress based on write position vs virtual size
-    if [ "$VIRT_SIZE" -gt 0 ]; then
-        WRITE_PCT=$((WRITE_POS * 100 / VIRT_SIZE))
+    # Progress based on read position vs actual QCOW2 data size
+    if [ "$ACTUAL_SIZE" -gt 0 ]; then
+        READ_PCT=$((READ_POS * 100 / ACTUAL_SIZE))
     else
-        WRITE_PCT=0
+        READ_PCT=0
     fi
-    if [ $WRITE_PCT -gt 100 ]; then WRITE_PCT=100; fi
+    if [ $READ_PCT -gt 100 ]; then READ_PCT=100; fi
     
-    # Speed calculation
+    # Speed calculation based on data processed
     ELAPSED=$(($(date +%s) - START_TIME))
-    if [ $ELAPSED -gt 0 ] && [ $WRITE_POS -gt 0 ]; then
-        # Speed based on position change
-        WRITE_SPEED_MB=$((WRITE_MB / ELAPSED))
-        if [ $WRITE_SPEED_MB -gt 0 ]; then
-            ETA=$(( (VIRT_SIZE_MB - WRITE_MB) / WRITE_SPEED_MB ))
+    if [ $ELAPSED -gt 0 ] && [ $READ_POS -gt 0 ]; then
+        SPEED_MB=$((READ_MB / ELAPSED))
+        if [ $SPEED_MB -gt 0 ] && [ $READ_PCT -lt 100 ]; then
+            REMAINING_MB=$((ACTUAL_SIZE_MB - READ_MB))
+            ETA=$((REMAINING_MB / SPEED_MB))
         else
             ETA=0
         fi
-        echo "   Read: $READ_MB MB | Write: $WRITE_GB GB / $VIRT_SIZE_GB GB ($WRITE_PCT%) | ${{WRITE_SPEED_MB}} MB/s | ETA: ${{ETA}}s"
-    else
-        echo "   Read: $READ_MB MB | Write: $WRITE_GB GB / $VIRT_SIZE_GB GB ($WRITE_PCT%)"
+        echo "   Processing: $READ_MB / $ACTUAL_SIZE_MB MB ($READ_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
+    elif [ $READ_POS -gt 0 ]; then
+        echo "   Processing: $READ_MB / $ACTUAL_SIZE_MB MB ($READ_PCT%)"
     fi
-    
-    LAST_WRITE_POS=$WRITE_POS
 done
 
 wait $PID
