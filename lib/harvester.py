@@ -901,13 +901,19 @@ class HarvesterClient:
                             nfs_server: str, nfs_path: str, qcow2_file: str,
                             namespace: str = None) -> dict:
         """
-        Create a pod that imports a QCOW2 file to a PVC using sparse conversion.
+        Create a pod that imports a QCOW2 file to a PVC using sparse-aware segment copy.
+        
+        Uses qemu-img map to identify only data segments, then copies them directly
+        without reading through zero/sparse regions. This is critical for very sparse
+        disks (e.g., 1TB virtual with only 2.5MB data).
         
         The pod will:
         1. Mount NFS staging (read-write for temp file)
         2. Mount PVC as block device
-        3. Convert QCOW2 to RAW sparse file, then dd to block device
-        4. Exit when done
+        3. Use qemu-img map to identify data segments in QCOW2
+        4. Convert QCOW2 to sparse RAW file
+        5. Copy ONLY the data segments to block device (skip zeros entirely)
+        6. Cleanup temp file
         
         Args:
             pod_name: Name for the importer pod
@@ -925,40 +931,97 @@ class HarvesterClient:
         # Derive temp file path from qcow2 path
         temp_raw = qcow2_file.replace('.qcow2', '.tmp.raw')
         
-        # Two-step conversion:
-        # 1. qemu-img convert to sparse RAW FILE (works with -S 0)
-        # 2. dd conv=sparse to block device (skips zero blocks)
+        # Sparse-aware import using qemu-img map:
+        # 1. qemu-img map to identify data segments (JSON output)
+        # 2. qemu-img convert to sparse RAW file
+        # 3. For each data segment: dd with precise skip/seek/count
+        # This avoids reading through TB of zeros for sparse disks
         convert_cmd = f"""
 set -e
-apt-get update > /dev/null
-apt-get install -y qemu-utils > /dev/null
-echo "=== Step 1/3: Converting QCOW2 to sparse RAW file ==="
+apt-get update > /dev/null 2>&1
+apt-get install -y qemu-utils jq > /dev/null 2>&1
 
-# Start qemu-img in background
-qemu-img convert -f qcow2 -O raw -S 0 /staging/{qcow2_file} /staging/{temp_raw} &
+QCOW2_FILE="/staging/{qcow2_file}"
+RAW_FILE="/staging/{temp_raw}"
+BLOCK_DEV="/dev/target"
+
+echo "=== Step 1/4: Analyzing disk structure ==="
+# Get virtual size
+VIRT_SIZE=$(qemu-img info --output=json "$QCOW2_FILE" | jq -r '."virtual-size"')
+VIRT_SIZE_GB=$((VIRT_SIZE / 1024 / 1024 / 1024))
+echo "   Virtual size: $VIRT_SIZE_GB GB"
+
+# Get data segments map
+echo "   Running qemu-img map to identify data segments..."
+qemu-img map --output=json "$QCOW2_FILE" > /tmp/segments.json
+
+# Count and calculate data segments
+DATA_SEGMENTS=$(jq '[.[] | select(.data == true and .zero == false)] | length' /tmp/segments.json)
+TOTAL_DATA=$(jq '[.[] | select(.data == true and .zero == false) | .length] | add // 0' /tmp/segments.json)
+TOTAL_DATA_MB=$((TOTAL_DATA / 1024 / 1024))
+echo "   Found $DATA_SEGMENTS data segments totaling $TOTAL_DATA_MB MB"
+echo "   Efficiency: copying $TOTAL_DATA_MB MB instead of reading $VIRT_SIZE_GB GB"
+
+echo ""
+echo "=== Step 2/4: Converting QCOW2 to sparse RAW ==="
+qemu-img convert -f qcow2 -O raw -S 0 "$QCOW2_FILE" "$RAW_FILE" &
 PID=$!
 
-# Monitor progress by checking file size
 while kill -0 $PID 2>/dev/null; do
-    if [ -f /staging/{temp_raw} ]; then
-        SIZE=$(du -h /staging/{temp_raw} 2>/dev/null | cut -f1)
-        echo "   Converting... $SIZE written"
+    if [ -f "$RAW_FILE" ]; then
+        REAL=$(du -h "$RAW_FILE" 2>/dev/null | cut -f1)
+        echo "   Converting... actual data written: $REAL"
     fi
-    sleep 5
+    sleep 3
 done
 wait $PID
-echo "   Step 1 complete"
+FINAL_REAL=$(du -h "$RAW_FILE" 2>/dev/null | cut -f1)
+echo "   Conversion complete - sparse RAW file: $FINAL_REAL on disk"
 
 echo ""
-echo "=== Step 2/3: Copying sparse RAW to block device ==="
-dd if=/staging/{temp_raw} of=/dev/target bs=4M conv=sparse status=progress 2>&1
+echo "=== Step 3/4: Copying data segments to block device ==="
+echo "   Using selective copy for $DATA_SEGMENTS segments..."
+
+# Process each data segment with dd
+COPIED=0
+SEGMENT_NUM=0
+jq -c '.[] | select(.data == true and .zero == false)' /tmp/segments.json | while read -r segment; do
+    START=$(echo "$segment" | jq -r '.start')
+    LENGTH=$(echo "$segment" | jq -r '.length')
+    SEGMENT_NUM=$((SEGMENT_NUM + 1))
+    
+    # Calculate block-aligned parameters (512-byte blocks)
+    SKIP_BLOCKS=$((START / 512))
+    COUNT_BLOCKS=$((LENGTH / 512))
+    
+    # Handle non-aligned lengths (round up)
+    if [ $((LENGTH % 512)) -ne 0 ]; then
+        COUNT_BLOCKS=$((COUNT_BLOCKS + 1))
+    fi
+    
+    LENGTH_KB=$((LENGTH / 1024))
+    echo "   Segment $SEGMENT_NUM: offset $START, size ${{LENGTH_KB}}KB"
+    
+    dd if="$RAW_FILE" of="$BLOCK_DEV" bs=512 skip=$SKIP_BLOCKS seek=$SKIP_BLOCKS count=$COUNT_BLOCKS conv=notrunc status=none
+    
+    COPIED=$((COPIED + LENGTH))
+done
+
 sync
-echo "   Step 2 complete"
+echo "   All segments copied successfully"
 
 echo ""
-echo "=== Step 3/3: Cleanup ==="
-rm -f /staging/{temp_raw}
-echo "=== DONE ==="
+echo "=== Step 4/4: Cleanup ==="
+rm -f "$RAW_FILE"
+rm -f /tmp/segments.json
+echo "   Temporary files removed"
+
+echo ""
+echo "========================================="
+echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
+echo "   Copied: $TOTAL_DATA_MB MB of actual data"
+echo "   Virtual disk size: $VIRT_SIZE_GB GB"
+echo "========================================="
 """
         
         pod_manifest = {
@@ -1043,7 +1106,7 @@ echo "=== DONE ==="
         import time
         ns = namespace or self.namespace
         start_time = time.time()
-        last_log_len = 0
+        seen_lines = set()
         
         while time.time() - start_time < timeout:
             try:
@@ -1062,14 +1125,16 @@ echo "=== DONE ==="
                     elif 'terminated' in state:
                         container_state = f"Terminated: {state['terminated'].get('reason', '')}"
                 
-                # Get logs and show new lines
-                logs = self.get_pod_logs(name, ns, tail_lines=100)
-                if logs and len(logs) > last_log_len:
-                    # Show only new log content
-                    new_logs = logs[last_log_len:] if last_log_len > 0 else logs
-                    last_log_len = len(logs)
-                    if progress_callback:
-                        progress_callback(phase, container_state, new_logs)
+                # Get logs and show only new lines
+                logs = self.get_pod_logs(name, ns, tail_lines=500)
+                if logs:
+                    new_lines = []
+                    for line in logs.split('\n'):
+                        if line and line not in seen_lines:
+                            seen_lines.add(line)
+                            new_lines.append(line)
+                    if new_lines and progress_callback:
+                        progress_callback(phase, container_state, '\n'.join(new_lines))
                 
                 if phase == 'Succeeded':
                     return True
@@ -1080,7 +1145,7 @@ echo "=== DONE ==="
                 if progress_callback:
                     progress_callback('Error', str(e), '')
             
-            time.sleep(2)  # Check more frequently
+            time.sleep(2)  # Check every 2 seconds
         
         return False  # Timeout
     
