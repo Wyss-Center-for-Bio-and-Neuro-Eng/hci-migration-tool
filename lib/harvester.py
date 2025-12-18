@@ -928,155 +928,100 @@ class HarvesterClient:
         """
         ns = namespace or self.namespace
         
-        # Optimized sparse-aware import using qemu-nbd:
-        # 1. qemu-img map to identify data segments
-        # 2. qemu-nbd to mount QCOW2 as block device (no intermediate RAW file!)
-        # 3. dd directly from NBD to target for each segment
-        # Fallback: if NBD not available, use intermediate RAW file
+        # Derive temp file path from qcow2 path
+        temp_raw = qcow2_file.replace('.qcow2', '.tmp.raw')
+        
+        # Sparse-aware import using qemu-img map:
+        # 1. qemu-img map to identify data segments (JSON output)
+        # 2. qemu-img convert to sparse RAW file
+        # 3. For each data segment: dd with precise skip/seek/count
+        # This avoids reading through TB of zeros for sparse disks
         convert_cmd = f"""
 set -e
 apt-get update > /dev/null 2>&1
 apt-get install -y qemu-utils jq > /dev/null 2>&1
 
 QCOW2_FILE="/staging/{qcow2_file}"
+RAW_FILE="/staging/{temp_raw}"
 BLOCK_DEV="/dev/target"
-NBD_DEV="/dev/nbd0"
 
-echo "=== Step 1/3: Analyzing disk structure ==="
+echo "=== Step 1/4: Analyzing disk structure ==="
+# Get virtual size
 VIRT_SIZE=$(qemu-img info --output=json "$QCOW2_FILE" | jq -r '."virtual-size"')
 VIRT_SIZE_GB=$((VIRT_SIZE / 1024 / 1024 / 1024))
 echo "   Virtual size: $VIRT_SIZE_GB GB"
 
+# Get data segments map
 echo "   Running qemu-img map to identify data segments..."
 qemu-img map --output=json "$QCOW2_FILE" > /tmp/segments.json
 
+# Count and calculate data segments
 DATA_SEGMENTS=$(jq '[.[] | select(.data == true and .zero == false)] | length' /tmp/segments.json)
 TOTAL_DATA=$(jq '[.[] | select(.data == true and .zero == false) | .length] | add // 0' /tmp/segments.json)
 TOTAL_DATA_MB=$((TOTAL_DATA / 1024 / 1024))
 echo "   Found $DATA_SEGMENTS data segments totaling $TOTAL_DATA_MB MB"
-echo "   Efficiency: copying $TOTAL_DATA_MB MB instead of $VIRT_SIZE_GB GB"
+echo "   Efficiency: copying $TOTAL_DATA_MB MB instead of reading $VIRT_SIZE_GB GB"
 
 echo ""
-echo "=== Step 2/3: Preparing source device ==="
+echo "=== Step 2/4: Converting QCOW2 to sparse RAW ==="
+qemu-img convert -f qcow2 -O raw -S 0 "$QCOW2_FILE" "$RAW_FILE" &
+PID=$!
 
-# Try to use NBD for direct QCOW2 access (faster, no temp file)
-USE_NBD=0
-if modprobe nbd max_part=0 2>/dev/null; then
-    if [ -e "$NBD_DEV" ]; then
-        if qemu-nbd -r -c "$NBD_DEV" "$QCOW2_FILE" 2>/dev/null; then
-            USE_NBD=1
-            SOURCE_DEV="$NBD_DEV"
-            echo "   Using NBD: direct QCOW2 access (fast mode)"
-        fi
+while kill -0 $PID 2>/dev/null; do
+    if [ -f "$RAW_FILE" ]; then
+        REAL=$(du -h "$RAW_FILE" 2>/dev/null | cut -f1)
+        echo "   Converting... actual data written: $REAL"
     fi
-fi
-
-# Fallback: convert to sparse RAW file
-if [ $USE_NBD -eq 0 ]; then
-    echo "   NBD not available, using intermediate RAW file..."
-    RAW_FILE="${{QCOW2_FILE%.qcow2}}.tmp.raw"
-    
-    qemu-img convert -f qcow2 -O raw -S 0 "$QCOW2_FILE" "$RAW_FILE" &
-    PID=$!
-    while kill -0 $PID 2>/dev/null; do
-        if [ -f "$RAW_FILE" ]; then
-            REAL=$(du -h "$RAW_FILE" 2>/dev/null | cut -f1)
-            echo "   Converting... $REAL written"
-        fi
-        sleep 5
-    done
-    wait $PID
-    SOURCE_DEV="$RAW_FILE"
-    echo "   RAW file ready: $(du -h "$RAW_FILE" | cut -f1)"
-fi
-
-# Cleanup function
-cleanup() {{
-    if [ $USE_NBD -eq 1 ]; then
-        qemu-nbd -d "$NBD_DEV" 2>/dev/null || true
-    else
-        rm -f "$RAW_FILE" 2>/dev/null || true
-    fi
-    rm -f /tmp/segments.json /tmp/data_segments.txt
-}}
-trap cleanup EXIT
+    sleep 3
+done
+wait $PID
+FINAL_REAL=$(du -h "$RAW_FILE" 2>/dev/null | cut -f1)
+echo "   Conversion complete - sparse RAW file: $FINAL_REAL on disk"
 
 echo ""
-echo "=== Step 3/3: Copying data segments ==="
-echo "   Copying $DATA_SEGMENTS segments ($TOTAL_DATA_MB MB)..."
+echo "=== Step 3/4: Copying data segments to block device ==="
+echo "   Using selective copy for $DATA_SEGMENTS segments..."
 
-# Extract segments
+# Extract data segments to simple text file (avoids subshell issues with pipe)
 jq -r '.[] | select(.data == true and .zero == false) | "\\(.start) \\(.length)"' /tmp/segments.json > /tmp/data_segments.txt
 
-# Copy with progress reporting
-COPIED_BYTES=0
+# Process each data segment with dd
+COPIED=0
 SEGMENT_NUM=0
-LAST_REPORT=0
-REPORT_INTERVAL=$((100 * 1024 * 1024))  # Report every 100MB
-START_TIME=$(date +%s)
-
 while read -r START LENGTH; do
     SEGMENT_NUM=$((SEGMENT_NUM + 1))
     
-    # Use larger block size for better performance on large segments
-    if [ $LENGTH -ge 1048576 ]; then
-        # >= 1MB: use 1MB blocks
-        BS=1048576
-        SKIP=$((START / BS))
-        COUNT=$((LENGTH / BS))
-        REMAINDER=$((LENGTH % BS))
-        
-        if [ $COUNT -gt 0 ]; then
-            dd if="$SOURCE_DEV" of="$BLOCK_DEV" bs=$BS skip=$SKIP seek=$SKIP count=$COUNT conv=notrunc status=none 2>/dev/null
-        fi
-        
-        if [ $REMAINDER -gt 0 ]; then
-            REMAINDER_START=$((START + COUNT * BS))
-            REMAINDER_SKIP=$((REMAINDER_START / 512))
-            REMAINDER_COUNT=$(( (REMAINDER + 511) / 512 ))
-            dd if="$SOURCE_DEV" of="$BLOCK_DEV" bs=512 skip=$REMAINDER_SKIP seek=$REMAINDER_SKIP count=$REMAINDER_COUNT conv=notrunc status=none 2>/dev/null
-        fi
-    else
-        # < 1MB: use 512-byte blocks
-        SKIP_BLOCKS=$((START / 512))
-        COUNT_BLOCKS=$(( (LENGTH + 511) / 512 ))
-        dd if="$SOURCE_DEV" of="$BLOCK_DEV" bs=512 skip=$SKIP_BLOCKS seek=$SKIP_BLOCKS count=$COUNT_BLOCKS conv=notrunc status=none 2>/dev/null
+    # Calculate block-aligned parameters (512-byte blocks)
+    SKIP_BLOCKS=$((START / 512))
+    COUNT_BLOCKS=$((LENGTH / 512))
+    
+    # Handle non-aligned lengths (round up)
+    if [ $((LENGTH % 512)) -ne 0 ]; then
+        COUNT_BLOCKS=$((COUNT_BLOCKS + 1))
     fi
     
-    COPIED_BYTES=$((COPIED_BYTES + LENGTH))
+    LENGTH_KB=$((LENGTH / 1024))
+    echo "   Segment $SEGMENT_NUM/$DATA_SEGMENTS: offset $START, size ${{LENGTH_KB}}KB"
     
-    # Progress report every 100MB or every 1000 segments
-    if [ $((COPIED_BYTES - LAST_REPORT)) -ge $REPORT_INTERVAL ] || [ $((SEGMENT_NUM % 1000)) -eq 0 ]; then
-        COPIED_MB=$((COPIED_BYTES / 1024 / 1024))
-        PCT=$((COPIED_BYTES * 100 / TOTAL_DATA))
-        ELAPSED=$(($(date +%s) - START_TIME))
-        if [ $ELAPSED -gt 0 ]; then
-            SPEED=$((COPIED_MB / ELAPSED))
-            ETA=$(( (TOTAL_DATA_MB - COPIED_MB) / (SPEED + 1) ))
-            echo "   Progress: $COPIED_MB/$TOTAL_DATA_MB MB ($PCT%) - $SPEED MB/s - ETA: ${{ETA}}s"
-        else
-            echo "   Progress: $COPIED_MB/$TOTAL_DATA_MB MB ($PCT%)"
-        fi
-        LAST_REPORT=$COPIED_BYTES
-    fi
+    dd if="$RAW_FILE" of="$BLOCK_DEV" bs=512 skip=$SKIP_BLOCKS seek=$SKIP_BLOCKS count=$COUNT_BLOCKS conv=notrunc status=none
+    
+    COPIED=$((COPIED + LENGTH))
 done < /tmp/data_segments.txt
 
 sync
-ELAPSED=$(($(date +%s) - START_TIME))
-FINAL_MB=$((COPIED_BYTES / 1024 / 1024))
-if [ $ELAPSED -gt 0 ]; then
-    AVG_SPEED=$((FINAL_MB / ELAPSED))
-else
-    AVG_SPEED=0
-fi
+echo "   All segments copied successfully"
+
+echo ""
+echo "=== Step 4/4: Cleanup ==="
+rm -f "$RAW_FILE"
+rm -f /tmp/segments.json /tmp/data_segments.txt
+echo "   Temporary files removed"
 
 echo ""
 echo "========================================="
 echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
-echo "   Data copied: $FINAL_MB MB"
-echo "   Duration: $ELAPSED seconds"
-echo "   Average speed: $AVG_SPEED MB/s"
-echo "   Virtual size: $VIRT_SIZE_GB GB"
+echo "   Copied: $TOTAL_DATA_MB MB of actual data"
+echo "   Virtual disk size: $VIRT_SIZE_GB GB"
 echo "========================================="
 """
         
