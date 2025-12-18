@@ -2069,8 +2069,10 @@ class MigrationTool:
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
         migrations_dir = os.path.join(staging_dir, 'migrations')
         
-        vm_info = None
+        # Initialize variables
         loaded_config = None
+        source_nics = []
+        vm_info = {}
         
         if not self._selected_vm:
             if detected_vms:
@@ -2093,10 +2095,6 @@ class MigrationTool:
                     pass
         
         # Load vm-config.json if available
-        loaded_config = None
-        source_nics = []
-        vm_info = {}
-        
         if self._selected_vm:
             config_path = os.path.join(migrations_dir, self._selected_vm.lower(), 'vm-config.json')
             if os.path.exists(config_path):
@@ -2139,10 +2137,19 @@ class MigrationTool:
         
         # Auto-select if we have detected disks for this VM
         selected_pvcs = []
-        if vm_name in detected_vms or self._selected_vm in detected_vms:
-            key = vm_name if vm_name in detected_vms else self._selected_vm
-            auto_pvcs = sorted(detected_vms[key], key=lambda p: p.get('metadata', {}).get('name', ''))
-            print(f"   Auto-detected {len(auto_pvcs)} disk(s) for {key}:")
+        # Check case-insensitive match
+        detected_key = None
+        for key in detected_vms:
+            if key.lower() == vm_name.lower():
+                detected_key = key
+                break
+            if self._selected_vm and key.lower() == self._selected_vm.lower():
+                detected_key = key
+                break
+        
+        if detected_key:
+            auto_pvcs = sorted(detected_vms[detected_key], key=lambda p: p.get('metadata', {}).get('name', ''))
+            print(f"   Auto-detected {len(auto_pvcs)} disk(s) for {detected_key}:")
             for i, pvc in enumerate(auto_pvcs):
                 pvc_name = pvc.get('metadata', {}).get('name', '')
                 size = pvc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', 'N/A')
