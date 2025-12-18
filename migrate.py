@@ -7,6 +7,7 @@ Interactive menu to migrate VMs from Nutanix to Harvester
 
 import os
 import sys
+import re
 import time
 import yaml
 import argparse
@@ -2092,6 +2093,10 @@ class MigrationTool:
                     pass
         
         # Load vm-config.json if available
+        loaded_config = None
+        source_nics = []
+        vm_info = {}
+        
         if self._selected_vm:
             config_path = os.path.join(migrations_dir, self._selected_vm.lower(), 'vm-config.json')
             if os.path.exists(config_path):
@@ -2107,6 +2112,16 @@ class MigrationTool:
                         'boot_type': nutanix_info.get('boot_type', loaded_config.get('boot_type', 'UEFI')),
                     }
                     print(f"   CPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}")
+                    
+                    # Load NICs info
+                    source_nics = nutanix_info.get('nics', loaded_config.get('nics', []))
+                    if source_nics:
+                        print(colored(f"   NICs ({len(source_nics)}):", Colors.CYAN))
+                        for i, nic in enumerate(source_nics):
+                            subnet = nic.get('subnet', 'unknown')
+                            mac = nic.get('mac', 'N/A')
+                            ip = nic.get('ip') or 'DHCP'
+                            print(f"      NIC-{i}: {subnet} - MAC: {mac}, IP: {ip}")
                 except Exception as e:
                     print(colored(f"   ⚠️  Error loading config: {e}", Colors.YELLOW))
         
@@ -2162,14 +2177,14 @@ class MigrationTool:
                 return
         
         # CPU and RAM
-        default_cpu = str(vm_info['vcpu']) if vm_info else "4"
-        default_ram = str(vm_info['memory_mb'] // 1024) if vm_info else "8"
+        default_cpu = str(vm_info.get('vcpu', 4))
+        default_ram = str(vm_info.get('memory_mb', 8192) // 1024)
         
         cpu = int(self.input_prompt(f"CPU cores [{default_cpu}]") or default_cpu)
         ram = int(self.input_prompt(f"RAM in GB [{default_ram}]") or default_ram)
         
         # Boot type
-        default_boot = "2" if (vm_info and vm_info.get('boot_type') == 'UEFI') else "1"
+        default_boot = "2" if vm_info.get('boot_type') == 'UEFI' else "1"
         print(colored("\n🔧 Boot Type:", Colors.BOLD))
         print("   1. BIOS (legacy)")
         print("   2. UEFI (modern, for Windows 10+)")
@@ -2185,7 +2200,7 @@ class MigrationTool:
         bus_choice = self.input_prompt("Disk bus [1]") or "1"
         disk_bus = "virtio" if bus_choice == "2" else "sata"
         
-        # Network - Support multiple NICs
+        # Network - Map source NICs to Harvester networks
         print(colored("\n🌐 Network Configuration:", Colors.BOLD))
         
         # Get all networks from all namespaces
@@ -2195,7 +2210,7 @@ class MigrationTool:
             print(colored("   No networks found!", Colors.RED))
             return
         
-        # Parse and display networks with namespace and VLAN info
+        # Parse networks with namespace and VLAN info
         network_list = []
         for net in all_networks:
             net_name = net.get('metadata', {}).get('name', 'N/A')
@@ -2221,27 +2236,57 @@ class MigrationTool:
         # Sort by namespace then name
         network_list.sort(key=lambda x: (x['namespace'], x['name']))
         
-        print("   Available networks:")
+        print("   Available Harvester networks:")
         for i, net in enumerate(network_list, 1):
             vlan_info = f" (VLAN {net['vlan']})" if net['vlan'] != "-" else ""
             print(f"      {i}. {net['namespace']}/{net['name']}{vlan_info}")
         
-        # Ask for number of NICs
-        nic_count_input = self.input_prompt("\n   Number of NICs [1]") or "1"
-        try:
-            nic_count = int(nic_count_input)
-        except:
-            nic_count = 1
+        # Determine number of NICs from source config or ask
+        if source_nics:
+            nic_count = len(source_nics)
+            print(colored(f"\n   Mapping {nic_count} NIC(s) from source VM:", Colors.CYAN))
+        else:
+            nic_count_input = self.input_prompt("\n   Number of NICs [1]") or "1"
+            try:
+                nic_count = int(nic_count_input)
+            except:
+                nic_count = 1
         
         # Configure each NIC
         selected_networks = []
         for nic_idx in range(nic_count):
-            if nic_count > 1:
-                prompt = f"   NIC-{nic_idx} network [1]"
+            # Show source NIC info if available
+            if source_nics and nic_idx < len(source_nics):
+                src_nic = source_nics[nic_idx]
+                src_subnet = src_nic.get('subnet', 'unknown')
+                src_ip = src_nic.get('ip') or 'DHCP'
+                src_mac = src_nic.get('mac', 'N/A')
+                print(f"\n   NIC-{nic_idx} source: {src_subnet} (MAC: {src_mac}, IP: {src_ip})")
+                
+                # Try to auto-match by subnet name or VLAN number in name
+                default_idx = 1
+                # Extract numbers from subnet name that might be VLAN
+                vlan_match = re.search(r'(\d+)', src_subnet) if src_subnet else None
+                src_vlan = vlan_match.group(1) if vlan_match else None
+                
+                for i, net in enumerate(network_list, 1):
+                    # Match by VLAN number
+                    if src_vlan and net['vlan'] == src_vlan:
+                        default_idx = i
+                        print(colored(f"      Auto-matched by VLAN {src_vlan}: {net['full_name']}", Colors.GREEN))
+                        break
+                    # Match by subnet name similarity
+                    elif src_subnet and src_subnet.lower() in net['name'].lower():
+                        default_idx = i
+                        print(colored(f"      Auto-matched by name: {net['full_name']}", Colors.GREEN))
+                        break
+                
+                prompt = f"      Select network [{default_idx}]"
             else:
-                prompt = "   Network [1]"
+                default_idx = 1
+                prompt = f"   NIC-{nic_idx} network [1]"
             
-            net_choice = self.input_prompt(prompt) or "1"
+            net_choice = self.input_prompt(prompt) or str(default_idx)
             try:
                 net_idx = int(net_choice) - 1
                 selected_net = network_list[net_idx]
