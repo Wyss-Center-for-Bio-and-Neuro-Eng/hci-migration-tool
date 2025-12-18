@@ -574,7 +574,6 @@ class MigrationTool:
                 
                 try:
                     config_str = net.get('spec', {}).get('config', '{}')
-                    import json
                     config = json.loads(config_str)
                     
                     # Determine type
@@ -2197,7 +2196,6 @@ class MigrationTool:
             return
         
         # Parse and display networks with namespace and VLAN info
-        import json
         network_list = []
         for net in all_networks:
             net_name = net.get('metadata', {}).get('name', 'N/A')
