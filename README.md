@@ -1,94 +1,132 @@
 # HCI Migration Tool
 
-Migration tool for moving Virtual Machines from Nutanix AHV to Harvester HCI.
+VM migration tool from Nutanix AHV to Harvester HCI.
 
-## Overview
+## Features
 
-This tool provides an end-to-end workflow for migrating VMs between hypervisors with minimal downtime. It handles disk export, transfer, format conversion, and VM recreation while preserving network configuration and OS settings.
+- **Windows Pre-Check**: Collect VM config, install VirtIO drivers & QEMU Guest Agent
+- **Fast NFS Export**: Direct NFS copy from Nutanix storage (420-500 MB/s) - **5x faster than API**
+- **Fallback API Export**: aria2c multi-connection download when NFS unavailable
+- **Conversion**: RAW → QCOW2 with compression
+- **Sparse Import**: Intelligent import using `qemu-img map` - copies only data segments
+- **VM Creation**: Automatic configuration from Nutanix specs with multi-NIC mapping
+- **Dissociation**: Clone volumes to remove image dependency
+- **Post-Migration**: Auto-reconfigure network, start services
+- **Vault**: Secure credential storage with `pass` + GPG
+- **CLI Commands**: Direct command-line import for automation
 
-### Supported Guest OS
+## Architecture Overview
 
-| OS Type | Status | Features |
-|---------|--------|----------|
-| Windows Server | ✅ Supported | Pre-migration checks, VirtIO driver injection, post-migration network reconfiguration |
-| Linux | 🚧 Planned | Coming soon |
+```
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│    NUTANIX      │   NFS   │  STAGING NFS    │   NFS   │   HARVESTER     │
+│    CVM          │ ──────► │  SERVER         │ ──────► │   CLUSTER       │
+│                 │  Export │  (Debian)       │  Import │                 │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+        │                          │                           │
+   Raw vDisks               QCOW2 Files                  PVC Volumes
+   /container/              /mnt/data/                   Longhorn
+   .acropolis/vmdisk/       migrations/<vm>/
+```
 
 ## Prerequisites
 
-### Infrastructure Requirements
-
-#### NFS Staging Server
-A dedicated NFS server is required for disk transfer and conversion. This server acts as an intermediary between Nutanix and Harvester.
-
-**Requirements:**
-- Linux server with NFS server installed
-- Sufficient storage for VM disks (virtual size × number of disks being migrated)
-- Network connectivity to both Nutanix cluster and Harvester cluster
-- NFS export accessible from Harvester nodes
-
-**NFS Export Configuration Example:**
-```bash
-# /etc/exports
-/mnt/data    10.0.0.0/8(rw,sync,no_subtree_check,no_root_squash)
-```
-
-**Required packages on NFS server:**
-```bash
-apt install qemu-utils nfs-kernel-server
-```
-
-#### Nutanix Cluster
-- Prism Central or Prism Element API access
-- Credentials with VM read and snapshot permissions
-- Network access from migration server to Nutanix API (port 9440)
-
-#### Harvester Cluster
-- Harvester API access (kubeconfig or direct API)
-- Namespace with appropriate permissions
-- Storage class configured (Longhorn-based)
-- Network access from Harvester pods to NFS server
-
-### Migration Server Requirements
-
-The server running this tool needs:
+### System Packages (Debian/Ubuntu)
 
 ```bash
-# Python 3.8+
-apt install python3 python3-pip
+sudo apt install -y \
+    python3 python3-pip \
+    qemu-utils \
+    sshpass \
+    pass gnupg2 \
+    krb5-user libkrb5-dev \
+    realmd sssd sssd-tools adcli \
+    aria2 \
+    nfs-common \
+    nfs-kernel-server \
+    jq
 
-# Required Python packages
-pip install pyyaml requests urllib3
-
-# QEMU utilities (for disk analysis)
-apt install qemu-utils
-
-# Kerberos (for Windows AD integration - optional)
-apt install krb5-user
-
-# WinRM support (for Windows pre/post migration)
-pip install pywinrm
+# Python packages
+pip install pyyaml requests pywinrm[kerberos] --break-system-packages
 ```
 
-### Network Requirements
+### Required Tools Summary
 
-| Source | Destination | Port | Purpose |
-|--------|-------------|------|---------|
-| Migration server | Nutanix API | 9440 | API calls |
-| Migration server | Harvester API | 6443 | Kubernetes API |
-| Migration server | Windows VMs | 5985/5986 | WinRM |
-| Migration server | NFS server | 2049 | Disk operations |
-| Harvester nodes | NFS server | 2049 | Disk import |
+| Tool | Purpose | Install |
+|------|---------|---------|
+| `python3` | Script runtime | `apt install python3` |
+| `qemu-img` | RAW → QCOW2 conversion, disk analysis | `apt install qemu-utils` |
+| `nfs-common` | NFS client for Nutanix export | `apt install nfs-common` |
+| `nfs-kernel-server` | NFS server for Harvester import | `apt install nfs-kernel-server` |
+| `jq` | JSON parsing for sparse import | `apt install jq` |
+| `aria2c` | Fallback multi-connection download | `apt install aria2` |
+| `pass` | Secure credential vault | `apt install pass gnupg2` |
+| `kinit` | Kerberos authentication | `apt install krb5-user` |
+
+### NFS Configuration
+
+The tool uses NFS at two stages:
+
+#### 1. Export: Nutanix → Staging (Read-Only)
+
+Whitelist migration server IP on Nutanix containers:
+
+1. **Prism Element** → Storage → Table view
+2. Select container (e.g., `container01`)
+3. **Update** → Filesystem Whitelist
+4. Add migration server IP: `10.16.22.x`
+5. Save
+
+This enables: `mount -t nfs <CVM_IP>:/<container> /mnt/nutanix`
+
+#### 2. Import: Staging → Harvester (Read-Write)
+
+The staging NFS server must be accessible from Harvester pods:
+
+1. **NFS Server Setup** (on staging server):
+```bash
+# Install NFS server
+apt install nfs-kernel-server
+
+# Configure exports (adjust IP range for your Harvester cluster)
+echo "/mnt/data 10.16.16.0/24(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+
+# Apply
+exportfs -ra
+systemctl restart nfs-kernel-server
+
+# Verify
+exportfs -v
+```
+
+2. **Firewall Rules** (if ufw enabled):
+```bash
+# Allow NFS from Harvester cluster network
+ufw allow from 10.16.16.0/24 to any port 2049
+ufw allow from 10.16.16.0/24 to any port 111
+```
+
+3. **Test from Harvester node**:
+```bash
+# On any Harvester node
+showmount -e 10.16.22.240
+mount -t nfs 10.16.22.240:/mnt/data /mnt/test
+ls /mnt/test/migrations/
+umount /mnt/test
+```
+
+**⚠️ IMPORTANT**: The `no_root_squash` option is required because the importer pod runs as root.
 
 ## Installation
 
 ```bash
-# Clone or extract the tool
+# Extract the tool
 unzip hci-migration-tool.zip
 cd hci-migration-tool
 
-# Copy and edit configuration
+# Copy and edit config
 cp config.yaml.example config.yaml
-vim config.yaml
+nano config.yaml
 ```
 
 ## Configuration
@@ -96,261 +134,204 @@ vim config.yaml
 ### config.yaml
 
 ```yaml
-# Nutanix connection
 nutanix:
-  host: prism.example.com
-  username: admin
-  # password: from-vault-or-env
-  verify_ssl: false
+  prism_ip: "10.16.22.46"
+  username: "admin"
+  password: "your_password"
+  cvm_ip: "10.16.22.46"           # CVM IP for NFS mount
+  nfs_mount_path: "/mnt/nutanix"  # Local mount point
 
-# Harvester connection  
 harvester:
-  host: harvester.example.com
-  # Uses kubeconfig or token authentication
-  namespace: harvester-public
+  api_url: "https://10.16.16.130:6443"
+  token: "your_bearer_token"
+  namespace: "harvester-public"
   verify_ssl: false
 
-# Transfer/staging configuration
 transfer:
-  nfs_server: 10.0.0.100
-  nfs_path: /mnt/data
-  staging_path: /mnt/data/migrations
+  staging_mount: "/mnt/data"        # Local staging directory
+  nfs_server: "10.16.22.240"        # NFS server IP (must be accessible from Harvester pods)
+  nfs_path: "/mnt/data"             # NFS export path (must match staging_mount)
+  convert_to_qcow2: true
+  compress: true
 
-# Optional: HashiCorp Vault integration
-vault:
-  enabled: false
-  url: https://vault.example.com
-  # Stores credentials securely
+windows:
+  domain: "AD.YOURDOMAIN.COM"
+  use_kerberos: true
+  vault_backend: "pass"
+  vault_path: "migration/windows"
+  winrm_port: 5985
+  winrm_transport: "kerberos"
+```
+
+### Get Harvester Token
+
+```bash
+# Via kubectl on Harvester cluster
+kubectl -n cattle-system get secret \
+  $(kubectl -n cattle-system get sa rancher -o jsonpath='{.secrets[0].name}') \
+  -o jsonpath='{.data.token}' | base64 -d
 ```
 
 ## Usage
 
-### Interactive Menu
+### Interactive Mode
 
 ```bash
 python3 migrate.py
 ```
 
-Provides a guided menu for all operations.
-
 ### CLI Commands
 
-#### List VMs
-
 ```bash
-# List Nutanix VMs
-python3 migrate.py list
-
-# List Harvester VMs
-python3 migrate.py list-harvester
+# List VMs
+python3 migrate.py list                    # Nutanix VMs
+python3 migrate.py list-harvester          # Harvester VMs
+python3 migrate.py list-staging            # Staging files
 
 # Show VM details
 python3 migrate.py show <vmname>
-```
 
-#### List Resources
+# Import disks to Harvester
+python3 migrate.py import <vmname> --disk 0      # Import specific disk
+python3 migrate.py import <vmname> --disk 1      # Import disk 1
+python3 migrate.py import <vmname>               # Import all disks
 
-```bash
-# List Harvester images
-python3 migrate.py list-images
-
-# List Harvester networks
-python3 migrate.py list-networks
-
-# List staged disks (on NFS)
-python3 migrate.py list-staging
-```
-
-#### Import Disks
-
-```bash
-# Import specific disk
-python3 migrate.py import <vmname> --disk <N>
-
-# Import all disks for a VM
-python3 migrate.py import <vmname>
-
-# With custom namespace/storage
+# Import with options
 python3 migrate.py import <vmname> --disk 0 \
-    --namespace my-namespace \
+    --namespace harvester-public \
     --storage-class harvester-longhorn-dual-node
+
+# Test Harvester connection
+python3 migrate.py test-harvester
 ```
 
-## Migration Workflow
+---
 
-### Windows VM Migration
+# Migration Workflow
 
-#### Phase 1: Pre-Migration (Source VM Running)
+## Complete Windows VM Migration
 
-1. **Connectivity Check** - Verify WinRM access to Windows VM
-2. **Compatibility Check** - Validate OS version, disk configuration
-3. **VirtIO Driver Check** - Ensure VirtIO drivers are installed (or inject them)
-4. **Network Documentation** - Capture current IP configuration
-5. **Preparation** - Disable automatic startup services if needed
+### PHASE 1 - PREPARATION (Source VM on Nutanix)
 
-#### Phase 2: Disk Export & Transfer
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 1.1 | Windows (4) | 2 | **Pre-migration check** → Collect config |
+| 1.2 | Windows (4) | 2 | **Install QEMU Guest Agent** → Only QEMU GA! |
+| 1.3 | Windows (4) | 5 | **Stop services** → Optional |
 
-1. **Snapshot Creation** - Create consistent snapshot on Nutanix
-2. **Disk Export** - Export disks as QCOW2 to NFS staging
-3. **Verification** - Validate exported disk integrity
+**⚠️ IMPORTANT:** Do NOT install VirtIO drivers before migration!
 
-#### Phase 3: Import to Harvester
+### PHASE 2 - EXPORT (Nutanix → Staging)
 
-1. **Disk Analysis** - Analyze sparse structure with `qemu-img map`
-2. **PVC Creation** - Create Longhorn volume with appropriate size
-3. **Sparse Import** - Copy only data segments (not zeros)
-4. **Cleanup** - Remove temporary files
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 2.1 | Nutanix (1) | 3 | **Select VM** |
+| 2.2 | Nutanix (1) | 5 | **Power OFF** the VM |
+| 2.3 | Migration (3) | 4 | **Export VM** → NFS or API |
+| 2.4 | Migration (3) | 5 | **Convert RAW → QCOW2** |
 
-#### Phase 4: VM Creation
+### PHASE 3 - IMPORT (Staging → Harvester)
 
-1. **VM Definition** - Create VirtualMachine resource in Harvester
-2. **Network Attachment** - Configure VM networks
-3. **Boot Configuration** - Set UEFI/BIOS mode based on source
-
-#### Phase 5: Post-Migration (Target VM)
-
-1. **First Boot** - Start VM in Harvester
-2. **Network Reconfiguration** - Restore IP settings via WinRM
-3. **Validation** - Verify services and connectivity
-4. **Cleanup** - Remove source VM snapshot (optional)
-
-### Linux VM Migration
-
-🚧 **Coming Soon**
-
-Linux migration will support:
-- Common distributions (Ubuntu, RHEL, Debian, CentOS)
-- SSH-based pre/post migration configuration
-- Cloud-init integration
-- Network configuration preservation (netplan, NetworkManager, legacy)
-
-## Technical Details
-
-### Sparse Disk Import
-
-The tool uses an optimized sparse-aware import process that dramatically reduces transfer time for thin-provisioned disks.
-
-**Traditional approach (slow):**
-```
-QCOW2 → RAW → dd conv=sparse → Block Device
-         ↑
-    Reads entire virtual size
+```bash
+# CLI command (recommended)
+python3 migrate.py import <vmname> --disk 0
 ```
 
-**Optimized approach (fast):**
-```
-QCOW2 → qemu-img map → Identify data segments
-      → RAW sparse file
-      → Copy ONLY data segments → Block Device
-```
-
-**Benefits:**
-- A 1TB disk with 50MB data: copies 50MB instead of reading 1TB
-- Preserves sparseness on target volume
-- Reduces NFS traffic by orders of magnitude
-
-### Volume Creation
-
-Volumes are created as independent Longhorn PVCs with no backing image dependency. This ensures:
-- Full portability
-- No single point of failure
-- Standard Kubernetes volume semantics
-
-### Architecture
+The import uses `qemu-img map` for sparse-aware copying:
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   Nutanix AHV   │     │   NFS Staging   │     │    Harvester    │
-│                 │     │                 │     │                 │
-│  ┌───────────┐  │     │  ┌───────────┐  │     │  ┌───────────┐  │
-│  │    VM     │  │────▶│  │  QCOW2    │  │────▶│  │  Longhorn │  │
-│  │  (disks)  │  │     │  │  files    │  │     │  │    PVC    │  │
-│  └───────────┘  │     │  └───────────┘  │     │  └───────────┘  │
-│                 │     │                 │     │        │        │
-└─────────────────┘     └─────────────────┘     │  ┌─────▼─────┐  │
-                                                │  │    VM     │  │
-        Migration Server                        │  │ (KubeVirt)│  │
-       ┌─────────────┐                          │  └───────────┘  │
-       │ migrate.py  │──────────────────────────│                 │
-       │             │   API calls              └─────────────────┘
-       └─────────────┘
+=== Step 1/4: Analyzing disk structure ===
+   Virtual size: 1000 GB
+   Found 12 data segments totaling 69 MB
+   Efficiency: copying 69 MB instead of reading 1000 GB
+
+=== Step 2/4: Converting QCOW2 to sparse RAW ===
+   Conversion complete - sparse RAW file: 69M on disk
+
+=== Step 3/4: Copying data segments to block device ===
+   Segment 1/12: offset 0, size 64KB
+   ...
+   All segments copied successfully
+
+=== IMPORT COMPLETED SUCCESSFULLY ===
 ```
+
+### PHASE 4 - CREATE VM & POST-MIGRATION
+
+| Step | Menu | Option | Description |
+|------|------|--------|-------------|
+| 4.1 | Migration (3) | 7 | **Create VM** (SATA bus) |
+| 4.2 | Windows (4) | 8 | **Post-migration auto** |
+
+---
+
+## Performance Comparison
+
+### Export Speed
+
+| Method | Speed | Time for 1 TB |
+|--------|-------|---------------|
+| **NFS Direct** | **420-530 MB/s** | **~33 min** |
+| aria2c API | ~100 MB/s | ~2h45 |
+
+### Import Speed
+
+| Method | 1 TB Sparse (69 MB) | 40 GB Normal (11 GB) |
+|--------|---------------------|----------------------|
+| **Sparse Import** | **~10 sec** | **~2-3 min** |
+| dd conv=sparse | ~3+ hours | ~10 min |
+
+---
+
+## Staging Directory Structure
+
+```
+/mnt/data/                              # Staging NFS (exported to Harvester)
+├── tools/                              # VirtIO/QEMU tools
+│   ├── virtio-win.iso
+│   └── qemu-ga-x86_64.msi
+├── migrations/                         # Per-VM data
+│   └── <hostname>/
+│       ├── vm-config.json
+│       ├── <hostname>-disk0.qcow2
+│       └── <hostname>-disk1.qcow2
+```
+
+---
 
 ## Troubleshooting
 
-### Common Issues
-
-#### NFS Mount Failures in Importer Pod
-```bash
-# Check NFS export is accessible from Harvester nodes
-showmount -e <nfs_server>
-
-# Verify no firewall blocking port 2049
-nc -zv <nfs_server> 2049
-```
-
-#### PVC Not Binding
-```bash
-# Check storage class exists
-kubectl get sc
-
-# Check Longhorn health
-kubectl -n longhorn-system get pods
-```
-
-#### Import Pod Stuck
-```bash
-# Check pod logs
-kubectl logs -n <namespace> importer-<vmname>-disk<N>
-
-# Check pod status
-kubectl describe pod -n <namespace> importer-<vmname>-disk<N>
-```
-
-#### Windows WinRM Connection Failed
-```bash
-# Verify WinRM is enabled on Windows
-# On Windows: winrm quickconfig
-
-# Test connectivity
-curl -v http://<windows_ip>:5985/wsman
-```
-
-### Cleanup Commands
+### NFS Import to Harvester Fails
 
 ```bash
-# Delete stuck importer pod
-kubectl delete pod -n <namespace> importer-<name> --force --grace-period=0
+# Check NFS server
+systemctl status nfs-kernel-server
+exportfs -v
 
-# Delete failed PVC
-kubectl delete pvc -n <namespace> <pvc-name>
-
-# Clean staging files
-rm -rf /mnt/data/migrations/<vmname>/
+# Test from Harvester node
+ssh root@harvester-node
+mount -t nfs 10.16.22.240:/mnt/data /mnt/test
 ```
 
-## File Structure
+### Import Pod Fails with "Permission Denied"
 
+```bash
+# Ensure no_root_squash is set
+cat /etc/exports
+# Should show: /mnt/data 10.16.16.0/24(rw,sync,no_subtree_check,no_root_squash)
+exportfs -ra
 ```
-hci-migration-tool/
-├── migrate.py              # Main entry point
-├── config.yaml             # Configuration (create from example)
-├── config.yaml.example     # Configuration template
-├── lib/
-│   ├── __init__.py
-│   ├── nutanix.py          # Nutanix API client
-│   ├── harvester.py        # Harvester/Kubernetes API client
-│   ├── actions.py          # Migration workflow actions
-│   ├── windows.py          # Windows WinRM operations
-│   ├── vault.py            # HashiCorp Vault integration
-│   └── utils.py            # Utilities and formatting
-└── README.md
+
+### Cleanup Failed Import
+
+```bash
+kubectl delete pod importer-<vmname>-disk0 -n harvester-public --force --grace-period=0
+kubectl delete pvc <vmname>-disk0 -n harvester-public
+rm -f /mnt/data/migrations/<vmname>/*.tmp.raw
 ```
+
+---
 
 ## License
 
-Internal tool - Wyss Center for Bio and Neuroengineering
-
-## Contributing
-
-For issues or feature requests, contact the IT Infrastructure team.
+MIT License - Wyss Center for Bio and Neuro Engineering
