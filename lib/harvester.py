@@ -978,8 +978,9 @@ for fd in /proc/$PID/fd/*; do
     fi
 done
 
-echo "   Monitoring: QCOW2 fd=$QCOW2_FD, Block fd=$BLOCK_FD"
-echo ""
+if [ -z "$QCOW2_FD" ] || [ -z "$BLOCK_FD" ]; then
+    echo "   Note: Fast import - progress monitoring skipped"
+fi
 
 # Monitor progress
 LAST_WRITE_POS=0
@@ -1038,9 +1039,9 @@ sync
 
 ELAPSED=$(($(date +%s) - START_TIME))
 if [ $ELAPSED -gt 0 ]; then
-    SPEED=$((VIRT_SIZE_MB / ELAPSED))
+    SPEED=$((ACTUAL_SIZE_MB / ELAPSED))
 else
-    SPEED=0
+    SPEED=$ACTUAL_SIZE_MB
 fi
 
 echo ""
@@ -1120,10 +1121,13 @@ fi
             return response.text
         return ""
     
-    def delete_pod(self, name: str, namespace: str = None) -> dict:
+    def delete_pod(self, name: str, namespace: str = None, force: bool = True) -> dict:
         """Delete a Pod."""
         ns = namespace or self.namespace
-        return self._request("DELETE", f"/api/v1/namespaces/{ns}/pods/{name}")
+        endpoint = f"/api/v1/namespaces/{ns}/pods/{name}"
+        if force:
+            endpoint += "?gracePeriodSeconds=0"
+        return self._request("DELETE", endpoint)
     
     def wait_pod_completed(self, name: str, namespace: str = None, 
                            timeout: int = 7200, progress_callback=None) -> bool:
@@ -1243,19 +1247,14 @@ fi
             # Step 3: Wait for pod to complete
             success = self.wait_pod_completed(pod_name, ns, timeout, progress_callback)
             
-            # Step 4: Get final logs
-            if progress_callback:
-                logs = self.get_pod_logs(pod_name, ns, tail_lines=20)
-                if success:
-                    progress_callback("Completed", f"PVC {pvc_name} ready", logs)
-                else:
-                    progress_callback("Failed", "Import failed", logs)
-            
-            # Step 5: Cleanup pod
+            # Step 4: Cleanup pod
             try:
-                self.delete_pod(pod_name, ns)
-            except:
-                pass  # Ignore cleanup errors
+                self.delete_pod(pod_name, ns, force=True)
+                if progress_callback:
+                    progress_callback("Cleanup", f"Pod {pod_name} deleted", "")
+            except Exception as e:
+                if progress_callback:
+                    progress_callback("Warning", f"Could not delete pod: {e}", "")
             
             return success
             
@@ -1264,7 +1263,7 @@ fi
                 progress_callback("Error", str(e), "")
             # Try to cleanup
             try:
-                self.delete_pod(pod_name, ns)
+                self.delete_pod(pod_name, ns, force=True)
             except:
                 pass
             return False
