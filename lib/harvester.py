@@ -943,6 +943,7 @@ echo "=== Step 1/2: Analyzing disk ==="
 VIRT_SIZE=$(qemu-img info --output=json "$QCOW2_FILE" | jq -r '."virtual-size"')
 ACTUAL_SIZE=$(qemu-img info --output=json "$QCOW2_FILE" | jq -r '."actual-size"')
 VIRT_SIZE_GB=$((VIRT_SIZE / 1024 / 1024 / 1024))
+VIRT_SIZE_MB=$((VIRT_SIZE / 1024 / 1024))
 ACTUAL_SIZE_MB=$((ACTUAL_SIZE / 1024 / 1024))
 echo "   Virtual size: $VIRT_SIZE_GB GB"
 echo "   QCOW2 actual data: $ACTUAL_SIZE_MB MB"
@@ -953,54 +954,81 @@ echo "   Direct conversion (no intermediate file)..."
 
 START_TIME=$(date +%s)
 
-# Run qemu-img in background
-qemu-img convert -f qcow2 -O raw "$QCOW2_FILE" "$BLOCK_DEV" &
+# Run qemu-img in background with --target-is-zero to skip writing zeros
+# -n = don't create target (PVC already exists)
+# --target-is-zero = target is already zeroed (Longhorn does this)
+qemu-img convert -f qcow2 -O raw -n --target-is-zero "$QCOW2_FILE" "$BLOCK_DEV" &
 PID=$!
 
 # Wait a moment for qemu-img to open files
 sleep 2
 
-# Find the file descriptor for the QCOW2 file (look for the .qcow2 in /proc/PID/fd)
+# Find file descriptors for QCOW2 (input) and block device (output)
 QCOW2_FD=""
+BLOCK_FD=""
 for fd in /proc/$PID/fd/*; do
     if [ -L "$fd" ]; then
         target=$(readlink "$fd" 2>/dev/null || true)
+        fd_num=$(basename "$fd")
         if echo "$target" | grep -q ".qcow2"; then
-            QCOW2_FD=$(basename "$fd")
-            break
+            QCOW2_FD=$fd_num
+        elif echo "$target" | grep -q "/dev/"; then
+            BLOCK_FD=$fd_num
         fi
     fi
 done
 
-if [ -z "$QCOW2_FD" ]; then
-    echo "   Warning: Could not find QCOW2 file descriptor, progress will not be shown"
-    QCOW2_FD="0"  # fallback, won't show real progress
-fi
+echo "   Monitoring: QCOW2 fd=$QCOW2_FD, Block fd=$BLOCK_FD"
+echo ""
 
-# Monitor progress by checking /proc/PID/fdinfo for read position on QCOW2 file
+# Monitor progress
+LAST_WRITE_POS=0
 while kill -0 $PID 2>/dev/null; do
     sleep 3
-    if [ -f /proc/$PID/fdinfo/$QCOW2_FD ]; then
-        POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$QCOW2_FD 2>/dev/null | awk '{{print $2}}')
-        if [ -n "$POS" ] && [ "$ACTUAL_SIZE" -gt 0 ] && [ "$POS" -gt 0 ]; then
-            POS_MB=$((POS / 1024 / 1024))
-            PCT=$((POS * 100 / ACTUAL_SIZE))
-            # Cap at 100%
-            if [ $PCT -gt 100 ]; then PCT=100; fi
-            ELAPSED=$(($(date +%s) - START_TIME))
-            if [ $ELAPSED -gt 0 ]; then
-                SPEED=$((POS_MB / ELAPSED))
-                if [ $SPEED -gt 0 ]; then
-                    REMAINING=$(( (ACTUAL_SIZE_MB - POS_MB) / SPEED ))
-                else
-                    REMAINING=0
-                fi
-                echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%) - $SPEED MB/s - ETA: ${{REMAINING}}s"
-            else
-                echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%)"
-            fi
-        fi
+    
+    # Get read position (QCOW2)
+    READ_POS=0
+    if [ -n "$QCOW2_FD" ] && [ -f /proc/$PID/fdinfo/$QCOW2_FD ]; then
+        READ_POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$QCOW2_FD 2>/dev/null | awk '{{print $2}}')
+        READ_POS=${{READ_POS:-0}}
     fi
+    
+    # Get write position (Block device)
+    WRITE_POS=0
+    if [ -n "$BLOCK_FD" ] && [ -f /proc/$PID/fdinfo/$BLOCK_FD ]; then
+        WRITE_POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$BLOCK_FD 2>/dev/null | awk '{{print $2}}')
+        WRITE_POS=${{WRITE_POS:-0}}
+    fi
+    
+    # Calculate metrics
+    READ_MB=$((READ_POS / 1024 / 1024))
+    WRITE_MB=$((WRITE_POS / 1024 / 1024))
+    WRITE_GB=$((WRITE_POS / 1024 / 1024 / 1024))
+    
+    # Progress based on write position vs virtual size
+    if [ "$VIRT_SIZE" -gt 0 ]; then
+        WRITE_PCT=$((WRITE_POS * 100 / VIRT_SIZE))
+    else
+        WRITE_PCT=0
+    fi
+    if [ $WRITE_PCT -gt 100 ]; then WRITE_PCT=100; fi
+    
+    # Speed calculation
+    ELAPSED=$(($(date +%s) - START_TIME))
+    if [ $ELAPSED -gt 0 ] && [ $WRITE_POS -gt 0 ]; then
+        # Speed based on position change
+        WRITE_SPEED_MB=$((WRITE_MB / ELAPSED))
+        if [ $WRITE_SPEED_MB -gt 0 ]; then
+            ETA=$(( (VIRT_SIZE_MB - WRITE_MB) / WRITE_SPEED_MB ))
+        else
+            ETA=0
+        fi
+        echo "   Read: $READ_MB MB | Write: $WRITE_GB GB / $VIRT_SIZE_GB GB ($WRITE_PCT%) | ${{WRITE_SPEED_MB}} MB/s | ETA: ${{ETA}}s"
+    else
+        echo "   Read: $READ_MB MB | Write: $WRITE_GB GB / $VIRT_SIZE_GB GB ($WRITE_PCT%)"
+    fi
+    
+    LAST_WRITE_POS=$WRITE_POS
 done
 
 wait $PID
@@ -1010,7 +1038,7 @@ sync
 
 ELAPSED=$(($(date +%s) - START_TIME))
 if [ $ELAPSED -gt 0 ]; then
-    SPEED=$((ACTUAL_SIZE_MB / ELAPSED))
+    SPEED=$((VIRT_SIZE_MB / ELAPSED))
 else
     SPEED=0
 fi
@@ -1019,10 +1047,10 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "========================================="
     echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
-    echo "   Data processed: $ACTUAL_SIZE_MB MB"
-    echo "   Duration: $ELAPSED seconds"
-    echo "   Speed: $SPEED MB/s"
+    echo "   QCOW2 data: $ACTUAL_SIZE_MB MB"
     echo "   Virtual size: $VIRT_SIZE_GB GB"
+    echo "   Duration: $ELAPSED seconds"
+    echo "   Throughput: $SPEED MB/s"
     echo "========================================="
 else
     echo "========================================="
