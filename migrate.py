@@ -2186,33 +2186,81 @@ class MigrationTool:
         bus_choice = self.input_prompt("Disk bus [1]") or "1"
         disk_bus = "virtio" if bus_choice == "2" else "sata"
         
-        # Network
-        print(colored("\n🌐 Network:", Colors.BOLD))
-        networks = self.harvester.list_networks(namespace)
-        if not networks:
-            networks = self.harvester.list_networks("default")
+        # Network - Support multiple NICs
+        print(colored("\n🌐 Network Configuration:", Colors.BOLD))
         
-        if networks:
-            for i, net in enumerate(networks, 1):
-                net_name = net.get('metadata', {}).get('name', 'N/A')
-                print(f"   {i}. {net_name}")
+        # Get all networks from all namespaces
+        all_networks = self.harvester.list_all_networks()
+        
+        if not all_networks:
+            print(colored("   No networks found!", Colors.RED))
+            return
+        
+        # Parse and display networks with namespace and VLAN info
+        network_list = []
+        for net in all_networks:
+            net_name = net.get('metadata', {}).get('name', 'N/A')
+            net_ns = net.get('metadata', {}).get('namespace', 'N/A')
             
-            net_choice = self.input_prompt("Network [1]") or "1"
+            # Parse VLAN from config
+            vlan_id = "-"
+            try:
+                import json
+                config_str = net.get('spec', {}).get('config', '{}')
+                config = json.loads(config_str)
+                if 'vlan' in config:
+                    vlan_id = str(config.get('vlan', '-'))
+            except:
+                pass
+            
+            network_list.append({
+                'name': net_name,
+                'namespace': net_ns,
+                'vlan': vlan_id,
+                'full_name': f"{net_ns}/{net_name}"
+            })
+        
+        # Sort by namespace then name
+        network_list.sort(key=lambda x: (x['namespace'], x['name']))
+        
+        print("   Available networks:")
+        for i, net in enumerate(network_list, 1):
+            vlan_info = f" (VLAN {net['vlan']})" if net['vlan'] != "-" else ""
+            print(f"      {i}. {net['namespace']}/{net['name']}{vlan_info}")
+        
+        # Ask for number of NICs
+        nic_count_input = self.input_prompt("\n   Number of NICs [1]") or "1"
+        try:
+            nic_count = int(nic_count_input)
+        except:
+            nic_count = 1
+        
+        # Configure each NIC
+        selected_networks = []
+        for nic_idx in range(nic_count):
+            if nic_count > 1:
+                prompt = f"   NIC-{nic_idx} network [1]"
+            else:
+                prompt = "   Network [1]"
+            
+            net_choice = self.input_prompt(prompt) or "1"
             try:
                 net_idx = int(net_choice) - 1
-                net_ns = networks[net_idx].get('metadata', {}).get('namespace', namespace)
-                network_name = f"{net_ns}/{networks[net_idx].get('metadata', {}).get('name')}"
+                selected_net = network_list[net_idx]
             except:
-                network_name = f"{namespace}/vlan1"
-        else:
-            network_name = self.input_prompt("Network (ns/name)") or f"{namespace}/vlan1"
+                selected_net = network_list[0]
+            
+            selected_networks.append(selected_net)
+            print(colored(f"      → NIC-{nic_idx}: {selected_net['full_name']}", Colors.GREEN))
         
         # Summary
         print(colored("\n📋 Summary:", Colors.BOLD))
         print(f"   VM: {vm_name}")
         print(f"   Namespace: {namespace}")
         print(f"   CPU: {cpu}, RAM: {ram} GB, Boot: {boot_type}, Bus: {disk_bus}")
-        print(f"   Network: {network_name}")
+        print(f"   Network ({len(selected_networks)} NIC(s)):")
+        for i, net in enumerate(selected_networks):
+            print(f"      NIC-{i}: {net['full_name']}")
         print(f"   Disks ({len(selected_pvcs)}):")
         for i, pvc in enumerate(selected_pvcs):
             boot = " (boot)" if i == 0 else ""
@@ -2243,6 +2291,21 @@ class MigrationTool:
         
         net_model = "e1000" if disk_bus == "sata" else "virtio"
         
+        # Build interfaces and networks specs for multi-NIC
+        interfaces_spec = []
+        networks_spec = []
+        for i, net in enumerate(selected_networks):
+            nic_name = f"nic-{i}"
+            interfaces_spec.append({
+                "name": nic_name,
+                "model": net_model,
+                "bridge": {}
+            })
+            networks_spec.append({
+                "name": nic_name,
+                "multus": {"networkName": net['full_name']}
+            })
+        
         manifest = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",
@@ -2262,13 +2325,13 @@ class MigrationTool:
                             "memory": {"guest": f"{ram}Gi"},
                             "devices": {
                                 "disks": disks_spec,
-                                "interfaces": [{"name": "nic-0", "model": net_model, "bridge": {}}],
+                                "interfaces": interfaces_spec,
                                 "inputs": [{"bus": "usb", "name": "tablet", "type": "tablet"}]
                             },
                             "features": {"acpi": {"enabled": True}},
                             "machine": {"type": "q35"}
                         },
-                        "networks": [{"name": "nic-0", "multus": {"networkName": network_name}}],
+                        "networks": networks_spec,
                         "volumes": volumes_spec
                     }
                 }
