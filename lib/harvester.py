@@ -906,7 +906,7 @@ class HarvesterClient:
         The pod will:
         1. Mount NFS staging (read-only)
         2. Mount PVC as block device
-        3. Run qemu-img convert with sparse option
+        3. Use qemu-nbd to expose QCOW2, then dd conv=sparse to write
         4. Exit when done
         
         Args:
@@ -922,13 +922,20 @@ class HarvesterClient:
         """
         ns = namespace or self.namespace
         
-        # Command: install qemu-utils and run sparse conversion
-        # -S 0 = detect zeros and skip them (sparse write)
-        # -p = show progress
+        # Command: use qemu-nbd + dd conv=sparse for true sparse writes
+        # qemu-img convert -S 0 does NOT work on block devices, only files
+        # dd conv=sparse skips zero blocks when writing to block device
         convert_cmd = f"""
             apt-get update && apt-get install -y qemu-utils && \
-            echo "Starting sparse conversion..." && \
-            qemu-img convert -p -f qcow2 -O raw -S 0 /staging/{qcow2_file} /dev/target && \
+            echo "Loading NBD module..." && \
+            modprobe nbd max_part=0 && \
+            echo "Connecting QCOW2 via NBD..." && \
+            qemu-nbd -r -c /dev/nbd0 /staging/{qcow2_file} && \
+            echo "Starting sparse copy with dd..." && \
+            dd if=/dev/nbd0 of=/dev/target bs=4M conv=sparse status=progress && \
+            sync && \
+            echo "Disconnecting NBD..." && \
+            qemu-nbd -d /dev/nbd0 && \
             echo "Conversion complete!"
         """
         
