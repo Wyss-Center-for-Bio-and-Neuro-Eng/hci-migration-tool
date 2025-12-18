@@ -66,7 +66,7 @@ class HarvesterClient:
             except:
                 pass
     
-    def _request(self, method: str, endpoint: str, data: dict = None, content_type: str = None) -> dict:
+    def _request(self, method: str, endpoint: str, data: dict = None, content_type: str = None, silent: bool = False) -> dict:
         """Execute API request."""
         url = f"{self.base_url}{endpoint}"
         
@@ -96,7 +96,7 @@ class HarvesterClient:
                 verify=self.verify if self.verify else False
             )
         
-        if not response.ok:
+        if not response.ok and not silent:
             # Try to get detailed error message
             try:
                 error_detail = response.json()
@@ -777,10 +777,10 @@ class HarvesterClient:
         
         return self._request("POST", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes", dv_manifest)
     
-    def get_datavolume(self, name: str, namespace: str = None) -> dict:
+    def get_datavolume(self, name: str, namespace: str = None, silent: bool = False) -> dict:
         """Get a DataVolume by name."""
         ns = namespace or self.namespace
-        return self._request("GET", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes/{name}")
+        return self._request("GET", f"/apis/cdi.kubevirt.io/v1beta1/namespaces/{ns}/datavolumes/{name}", silent=silent)
     
     def list_datavolumes(self, namespace: str = None) -> List[dict]:
         """List DataVolumes in a namespace."""
@@ -904,16 +904,16 @@ class HarvesterClient:
         Create a pod that imports a QCOW2 file to a PVC using sparse conversion.
         
         The pod will:
-        1. Mount NFS staging (read-only)
+        1. Mount NFS staging (read-write for temp file)
         2. Mount PVC as block device
-        3. Use qemu-nbd to expose QCOW2, then dd conv=sparse to write
+        3. Convert QCOW2 to RAW sparse file, then dd to block device
         4. Exit when done
         
         Args:
             pod_name: Name for the importer pod
             pvc_name: Target PVC name (must exist)
             nfs_server: NFS server IP
-            nfs_path: NFS export path (e.g. /mnt/data/migrations)
+            nfs_path: NFS export path (e.g. /mnt/data)
             qcow2_file: Path to QCOW2 file relative to NFS root
             namespace: Target namespace
             
@@ -922,22 +922,27 @@ class HarvesterClient:
         """
         ns = namespace or self.namespace
         
-        # Command: use qemu-nbd + dd conv=sparse for true sparse writes
-        # qemu-img convert -S 0 does NOT work on block devices, only files
-        # dd conv=sparse skips zero blocks when writing to block device
+        # Derive temp file path from qcow2 path
+        temp_raw = qcow2_file.replace('.qcow2', '.tmp.raw')
+        
+        # Two-step conversion:
+        # 1. qemu-img convert to sparse RAW FILE (works with -S 0)
+        # 2. dd conv=sparse to block device (skips zero blocks)
         convert_cmd = f"""
-            apt-get update && apt-get install -y qemu-utils && \
-            echo "Loading NBD module..." && \
-            modprobe nbd max_part=0 && \
-            echo "Connecting QCOW2 via NBD..." && \
-            qemu-nbd -r -c /dev/nbd0 /staging/{qcow2_file} && \
-            echo "Starting sparse copy with dd..." && \
-            dd if=/dev/nbd0 of=/dev/target bs=4M conv=sparse status=progress && \
-            sync && \
-            echo "Disconnecting NBD..." && \
-            qemu-nbd -d /dev/nbd0 && \
-            echo "Conversion complete!"
-        """
+set -e
+apt-get update > /dev/null
+apt-get install -y qemu-utils > /dev/null
+echo "=== Step 1/3: Converting QCOW2 to sparse RAW file ==="
+qemu-img convert -p -f qcow2 -O raw -S 0 /staging/{qcow2_file} /staging/{temp_raw}
+echo ""
+echo "=== Step 2/3: Copying sparse RAW to block device ==="
+dd if=/staging/{temp_raw} of=/dev/target bs=4M conv=sparse status=progress
+sync
+echo ""
+echo "=== Step 3/3: Cleanup ==="
+rm -f /staging/{temp_raw}
+echo "=== DONE ==="
+"""
         
         pod_manifest = {
             "apiVersion": "v1",
@@ -958,7 +963,7 @@ class HarvesterClient:
                     "volumeMounts": [{
                         "name": "staging-nfs",
                         "mountPath": "/staging",
-                        "readOnly": True
+                        "readOnly": False  # Need write for temp file
                     }],
                     "volumeDevices": [{
                         "name": "target-disk",
@@ -1021,7 +1026,7 @@ class HarvesterClient:
         import time
         ns = namespace or self.namespace
         start_time = time.time()
-        last_phase = ""
+        last_log_len = 0
         
         while time.time() - start_time < timeout:
             try:
@@ -1040,11 +1045,14 @@ class HarvesterClient:
                     elif 'terminated' in state:
                         container_state = f"Terminated: {state['terminated'].get('reason', '')}"
                 
-                # Call progress callback
-                if progress_callback and (phase != last_phase or container_state):
-                    logs = self.get_pod_logs(name, ns, tail_lines=5)
-                    progress_callback(phase, container_state, logs)
-                    last_phase = phase
+                # Get logs and show new lines
+                logs = self.get_pod_logs(name, ns, tail_lines=100)
+                if logs and len(logs) > last_log_len:
+                    # Show only new log content
+                    new_logs = logs[last_log_len:] if last_log_len > 0 else logs
+                    last_log_len = len(logs)
+                    if progress_callback:
+                        progress_callback(phase, container_state, new_logs)
                 
                 if phase == 'Succeeded':
                     return True
@@ -1055,7 +1063,7 @@ class HarvesterClient:
                 if progress_callback:
                     progress_callback('Error', str(e), '')
             
-            time.sleep(5)
+            time.sleep(2)  # Check more frequently
         
         return False  # Timeout
     

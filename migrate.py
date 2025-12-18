@@ -726,7 +726,7 @@ class MigrationTool:
         
         # Check if there's also a DataVolume with this name
         try:
-            dv = self.harvester.get_datavolume(vol_name, vol_ns)
+            dv = self.harvester.get_datavolume(vol_name, vol_ns, silent=True)
             has_dv = True
         except:
             has_dv = False
@@ -1723,10 +1723,9 @@ class MigrationTool:
                 info = json.loads(result.stdout)
                 virtual_size = info.get('virtual-size', 0)
                 virtual_size_gb = virtual_size / (1024**3)
-                # Use ceil + 1 GiB margin for safety (conversion overhead)
-                min_size_gi = math.ceil(virtual_size_gb) + 1
+                min_size_gi = math.ceil(virtual_size_gb)
                 print(f"\n📏 Image virtual size: {virtual_size_gb:.2f} GB")
-                print(f"   Minimum volume: {min_size_gi} GiB (includes 1 GiB safety margin)")
+                print(f"   Volume size: {min_size_gi} GiB")
             else:
                 min_size_gi = int(selected_file['size'] / (1024**3)) + 5
         except:
@@ -1735,40 +1734,15 @@ class MigrationTool:
         default_size = min_size_gi
         size_input = self.input_prompt(f"Volume size in GiB [{default_size}]")
         size_gi = int(size_input) if size_input else default_size
-        if size_gi < min_size_gi:
-            print(colored(f"   ⚠️  Size {size_gi} < minimum {min_size_gi}, forcing {min_size_gi} GiB", Colors.YELLOW))
-            size_gi = min_size_gi
         
-        # Check if disk is sparse (file size << virtual size)
-        file_size_gb = selected_file['size'] / (1024**3)
-        is_sparse = file_size_gb < (size_gi * 0.5)  # File is less than 50% of virtual size
-        
-        # Import method selection
-        print(colored("\n📥 Import Method:", Colors.BOLD))
+        # Check NFS config for sparse import
         transfer_config = self.config.get('transfer', {})
         nfs_server = transfer_config.get('nfs_server')
         nfs_path = transfer_config.get('nfs_path')
         
-        if nfs_server and nfs_path:
-            print("   1. CDI DataVolume (HTTP) - Standard method")
-            print("   2. Sparse Import (NFS)  - Fast for sparse disks")
-            
-            if is_sparse and size_gi >= 100:
-                print(colored(f"\n   💡 Recommended: Sparse Import", Colors.GREEN))
-                print(colored(f"      File: {file_size_gb:.2f} GB, Virtual: {size_gi} GB", Colors.GREEN))
-                print(colored(f"      CDI would write {size_gi} GB, Sparse writes ~{file_size_gb:.1f} GB", Colors.GREEN))
-                default_method = "2"
-            else:
-                default_method = "1"
-            
-            method_choice = self.input_prompt(f"Method [{default_method}]") or default_method
-            use_sparse = (method_choice == "2")
-        else:
-            print(colored("   Using CDI DataVolume (HTTP)", Colors.CYAN))
-            if is_sparse and size_gi >= 100:
-                print(colored(f"\n   💡 TIP: Configure nfs_server/nfs_path in config.yaml", Colors.YELLOW))
-                print(colored(f"      for faster sparse import of large disks", Colors.YELLOW))
-            use_sparse = False
+        if not nfs_server or not nfs_path:
+            print(colored("❌ NFS not configured. Add nfs_server and nfs_path to config.yaml", Colors.RED))
+            return
         
         # Summary
         print(colored("\n📋 Summary:", Colors.BOLD))
@@ -1777,21 +1751,16 @@ class MigrationTool:
         print(f"   Namespace: {namespace}")
         print(f"   Storage class: {selected_sc}")
         print(f"   Size: {size_gi} GiB")
-        print(f"   Method: {'Sparse Import (NFS)' if use_sparse else 'CDI DataVolume (HTTP)'}")
+        print(f"   Method: Sparse Import (NFS)")
         
         confirm = self.input_prompt("\nCreate volume? (y/n)")
         if confirm.lower() != 'y':
             print("Cancelled")
             return
         
-        if use_sparse:
-            # Sparse import via NFS
-            self._import_sparse(vol_name, size_gi, selected_sc, namespace, 
-                               nfs_server, nfs_path, selected_file['name'])
-        else:
-            # Standard CDI DataVolume import
-            self._import_datavolume(vol_name, size_gi, selected_sc, namespace, 
-                                    selected_file, transfer_config)
+        # Sparse import via NFS
+        self._import_sparse(vol_name, size_gi, selected_sc, namespace, 
+                           nfs_server, nfs_path, selected_file['name'])
     
     def _import_sparse(self, vol_name, size_gi, storage_class, namespace,
                        nfs_server, nfs_path, qcow2_file):
@@ -1799,11 +1768,14 @@ class MigrationTool:
         print(colored("\n🚀 Starting Sparse Import...", Colors.CYAN))
         print(f"   NFS: {nfs_server}:{nfs_path}")
         print(f"   File: {qcow2_file}")
+        print(colored("\n--- Pod Logs ---", Colors.BOLD))
         
         def progress_callback(stage, detail, logs):
-            print(f"\r   [{stage}] {detail}     ", end='', flush=True)
-            if logs and stage in ('Completed', 'Failed', 'Error'):
-                print(f"\n   Logs:\n{logs}")
+            if logs:
+                # Print new log lines
+                for line in logs.strip().split('\n'):
+                    if line.strip():
+                        print(f"   {line}")
         
         import time
         start_time = time.time()
