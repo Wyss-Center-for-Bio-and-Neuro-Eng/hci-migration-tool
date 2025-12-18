@@ -950,14 +950,36 @@ echo "   QCOW2 actual data: $ACTUAL_SIZE_MB MB"
 echo ""
 echo "=== Step 2/2: Converting QCOW2 to block device ==="
 echo "   Direct conversion (no intermediate file)..."
-echo "   Longhorn handles thin provisioning for zeros"
-echo ""
 
 START_TIME=$(date +%s)
 
-# qemu-img convert with progress, writing directly to block device
-# -p = progress, -f = input format, -O = output format
-qemu-img convert -p -f qcow2 -O raw "$QCOW2_FILE" "$BLOCK_DEV"
+# Run qemu-img in background
+qemu-img convert -f qcow2 -O raw "$QCOW2_FILE" "$BLOCK_DEV" &
+PID=$!
+
+# Monitor progress by checking /proc/PID/fdinfo for read position
+while kill -0 $PID 2>/dev/null; do
+    sleep 3
+    if [ -f /proc/$PID/fdinfo/0 ]; then
+        # Get read position from input file descriptor
+        POS=$(grep -E '^pos:' /proc/$PID/fdinfo/0 2>/dev/null | awk '{{print $2}}')
+        if [ -n "$POS" ] && [ "$ACTUAL_SIZE" -gt 0 ]; then
+            POS_MB=$((POS / 1024 / 1024))
+            PCT=$((POS * 100 / ACTUAL_SIZE))
+            ELAPSED=$(($(date +%s) - START_TIME))
+            if [ $ELAPSED -gt 0 ] && [ $POS_MB -gt 0 ]; then
+                SPEED=$((POS_MB / ELAPSED))
+                REMAINING=$(( (ACTUAL_SIZE_MB - POS_MB) / (SPEED + 1) ))
+                echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%) - $SPEED MB/s - ETA: ${{REMAINING}}s"
+            else
+                echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%)"
+            fi
+        fi
+    fi
+done
+
+wait $PID
+EXIT_CODE=$?
 
 sync
 
@@ -969,13 +991,20 @@ else
 fi
 
 echo ""
-echo "========================================="
-echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
-echo "   Data processed: $ACTUAL_SIZE_MB MB"
-echo "   Duration: $ELAPSED seconds"
-echo "   Speed: $SPEED MB/s"
-echo "   Virtual size: $VIRT_SIZE_GB GB"
-echo "========================================="
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "========================================="
+    echo "=== IMPORT COMPLETED SUCCESSFULLY ==="
+    echo "   Data processed: $ACTUAL_SIZE_MB MB"
+    echo "   Duration: $ELAPSED seconds"
+    echo "   Speed: $SPEED MB/s"
+    echo "   Virtual size: $VIRT_SIZE_GB GB"
+    echo "========================================="
+else
+    echo "========================================="
+    echo "=== IMPORT FAILED (exit code: $EXIT_CODE) ==="
+    echo "========================================="
+    exit $EXIT_CODE
+fi
 """
         
         pod_manifest = {
