@@ -2113,15 +2113,16 @@ class MigrationTool:
                     }
                     print(f"   CPU: {vm_info['vcpu']}, RAM: {vm_info['memory_mb']//1024} GB, Boot: {vm_info['boot_type']}")
                     
-                    # Load NICs info
-                    source_nics = nutanix_info.get('nics', loaded_config.get('nics', []))
+                    # Load NICs info - they are in network.interfaces
+                    network_info = loaded_config.get('network', {})
+                    source_nics = network_info.get('interfaces', [])
                     if source_nics:
                         print(colored(f"   NICs ({len(source_nics)}):", Colors.CYAN))
                         for i, nic in enumerate(source_nics):
-                            subnet = nic.get('subnet', 'unknown')
+                            nic_name = nic.get('name', 'unknown')
                             mac = nic.get('mac', 'N/A')
-                            ip = nic.get('ip') or 'DHCP'
-                            print(f"      NIC-{i}: {subnet} - MAC: {mac}, IP: {ip}")
+                            ip = nic.get('ip') if not nic.get('dhcp') else 'DHCP'
+                            print(f"      NIC-{i}: {nic_name} - MAC: {mac}, IP: {ip}")
                 except Exception as e:
                     print(colored(f"   ⚠️  Error loading config: {e}", Colors.YELLOW))
         
@@ -2258,33 +2259,17 @@ class MigrationTool:
             # Show source NIC info if available
             if source_nics and nic_idx < len(source_nics):
                 src_nic = source_nics[nic_idx]
-                src_subnet = src_nic.get('subnet', 'unknown')
-                src_ip = src_nic.get('ip') or 'DHCP'
+                src_name = src_nic.get('name', 'unknown')
                 src_mac = src_nic.get('mac', 'N/A')
-                print(f"\n   NIC-{nic_idx} source: {src_subnet} (MAC: {src_mac}, IP: {src_ip})")
+                src_ip = src_nic.get('ip') if not src_nic.get('dhcp') else 'DHCP'
+                print(f"\n   NIC-{nic_idx} source: {src_name}")
+                print(f"      MAC: {src_mac}, IP: {src_ip}")
                 
-                # Try to auto-match by subnet name or VLAN number in name
+                prompt = f"      Select Harvester network [1]"
                 default_idx = 1
-                # Extract numbers from subnet name that might be VLAN
-                vlan_match = re.search(r'(\d+)', src_subnet) if src_subnet else None
-                src_vlan = vlan_match.group(1) if vlan_match else None
-                
-                for i, net in enumerate(network_list, 1):
-                    # Match by VLAN number
-                    if src_vlan and net['vlan'] == src_vlan:
-                        default_idx = i
-                        print(colored(f"      Auto-matched by VLAN {src_vlan}: {net['full_name']}", Colors.GREEN))
-                        break
-                    # Match by subnet name similarity
-                    elif src_subnet and src_subnet.lower() in net['name'].lower():
-                        default_idx = i
-                        print(colored(f"      Auto-matched by name: {net['full_name']}", Colors.GREEN))
-                        break
-                
-                prompt = f"      Select network [{default_idx}]"
             else:
-                default_idx = 1
                 prompt = f"   NIC-{nic_idx} network [1]"
+                default_idx = 1
             
             net_choice = self.input_prompt(prompt) or str(default_idx)
             try:
