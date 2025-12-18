@@ -957,19 +957,44 @@ START_TIME=$(date +%s)
 qemu-img convert -f qcow2 -O raw "$QCOW2_FILE" "$BLOCK_DEV" &
 PID=$!
 
-# Monitor progress by checking /proc/PID/fdinfo for read position
+# Wait a moment for qemu-img to open files
+sleep 2
+
+# Find the file descriptor for the QCOW2 file (look for the .qcow2 in /proc/PID/fd)
+QCOW2_FD=""
+for fd in /proc/$PID/fd/*; do
+    if [ -L "$fd" ]; then
+        target=$(readlink "$fd" 2>/dev/null || true)
+        if echo "$target" | grep -q ".qcow2"; then
+            QCOW2_FD=$(basename "$fd")
+            break
+        fi
+    fi
+done
+
+if [ -z "$QCOW2_FD" ]; then
+    echo "   Warning: Could not find QCOW2 file descriptor, progress will not be shown"
+    QCOW2_FD="0"  # fallback, won't show real progress
+fi
+
+# Monitor progress by checking /proc/PID/fdinfo for read position on QCOW2 file
 while kill -0 $PID 2>/dev/null; do
     sleep 3
-    if [ -f /proc/$PID/fdinfo/0 ]; then
-        # Get read position from input file descriptor
-        POS=$(grep -E '^pos:' /proc/$PID/fdinfo/0 2>/dev/null | awk '{{print $2}}')
-        if [ -n "$POS" ] && [ "$ACTUAL_SIZE" -gt 0 ]; then
+    if [ -f /proc/$PID/fdinfo/$QCOW2_FD ]; then
+        POS=$(grep -E '^pos:' /proc/$PID/fdinfo/$QCOW2_FD 2>/dev/null | awk '{{print $2}}')
+        if [ -n "$POS" ] && [ "$ACTUAL_SIZE" -gt 0 ] && [ "$POS" -gt 0 ]; then
             POS_MB=$((POS / 1024 / 1024))
             PCT=$((POS * 100 / ACTUAL_SIZE))
+            # Cap at 100%
+            if [ $PCT -gt 100 ]; then PCT=100; fi
             ELAPSED=$(($(date +%s) - START_TIME))
-            if [ $ELAPSED -gt 0 ] && [ $POS_MB -gt 0 ]; then
+            if [ $ELAPSED -gt 0 ]; then
                 SPEED=$((POS_MB / ELAPSED))
-                REMAINING=$(( (ACTUAL_SIZE_MB - POS_MB) / (SPEED + 1) ))
+                if [ $SPEED -gt 0 ]; then
+                    REMAINING=$(( (ACTUAL_SIZE_MB - POS_MB) / SPEED ))
+                else
+                    REMAINING=0
+                fi
                 echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%) - $SPEED MB/s - ETA: ${{REMAINING}}s"
             else
                 echo "   Progress: $POS_MB / $ACTUAL_SIZE_MB MB ($PCT%)"
