@@ -1806,6 +1806,110 @@ class MigrationTool:
         except Exception as e:
             print(colored(f"\n\n❌ Error: {e}", Colors.RED))
     
+    def import_vm_disk(self, vm_name: str, disk_idx: int = None, 
+                       namespace: str = "harvester-public",
+                       storage_class: str = "harvester-longhorn-dual-node"):
+        """
+        Import VM disk(s) from staging to Harvester.
+        
+        CLI command: migrate.py import <vmname> --disk <N>
+        
+        Args:
+            vm_name: VM name (e.g., wlchgvaopefs1)
+            disk_idx: Specific disk index (0, 1, ...) or None for all
+            namespace: Target Harvester namespace
+            storage_class: Storage class to use
+        """
+        print(colored("\n📦 Import VM Disk to Harvester", Colors.BOLD))
+        print(colored("=" * 60, Colors.BLUE))
+        
+        self.init_actions()
+        
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        # Get transfer config
+        transfer_config = self.config.get('transfer', {})
+        nfs_server = transfer_config.get('nfs_server')
+        nfs_path = transfer_config.get('nfs_path')
+        
+        if not nfs_server or not nfs_path:
+            print(colored("❌ NFS not configured in config.yaml", Colors.RED))
+            return
+        
+        # Find QCOW2 files for this VM
+        qcow2_files = self.actions.list_qcow2_files()
+        vm_files = [f for f in qcow2_files if f['name'].startswith(f"migrations/{vm_name}/")]
+        
+        if not vm_files:
+            print(colored(f"❌ No QCOW2 files found for VM: {vm_name}", Colors.RED))
+            print(f"   Looking in: {nfs_path}/migrations/{vm_name}/")
+            return
+        
+        # Sort by disk number
+        vm_files.sort(key=lambda f: f['name'])
+        
+        print(f"\n📁 Found {len(vm_files)} disk(s) for {vm_name}:")
+        for i, f in enumerate(vm_files):
+            size_info = format_size(f['size'])
+            print(f"   [{i}] {os.path.basename(f['name'])} ({size_info})")
+        
+        # Filter to specific disk if requested
+        if disk_idx is not None:
+            if disk_idx < 0 or disk_idx >= len(vm_files):
+                print(colored(f"❌ Invalid disk index: {disk_idx} (valid: 0-{len(vm_files)-1})", Colors.RED))
+                return
+            vm_files = [vm_files[disk_idx]]
+            print(colored(f"\n→ Importing disk {disk_idx} only", Colors.CYAN))
+        else:
+            print(colored(f"\n→ Importing all {len(vm_files)} disk(s)", Colors.CYAN))
+        
+        # Import each disk
+        import subprocess
+        import math
+        
+        for i, qcow2_info in enumerate(vm_files):
+            qcow2_file = qcow2_info['name']
+            qcow2_path = qcow2_info['path']
+            
+            # Derive volume name from file
+            base_name = os.path.basename(qcow2_file).replace('.qcow2', '')
+            vol_name = base_name.lower().replace('_', '-')
+            
+            print(colored(f"\n{'='*60}", Colors.BLUE))
+            print(colored(f"📀 Disk {i+1}/{len(vm_files)}: {base_name}", Colors.BOLD))
+            print(colored(f"{'='*60}", Colors.BLUE))
+            
+            # Get virtual size
+            try:
+                result = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', qcow2_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    info = json.loads(result.stdout)
+                    virtual_size = info.get('virtual-size', 0)
+                    actual_size = info.get('actual-size', qcow2_info['size'])
+                    virtual_size_gb = virtual_size / (1024**3)
+                    actual_size_gb = actual_size / (1024**3)
+                    size_gi = math.ceil(virtual_size_gb)
+                    print(f"   Virtual size: {virtual_size_gb:.2f} GB")
+                    print(f"   Actual data:  {actual_size_gb:.2f} GB")
+                    print(f"   PVC size:     {size_gi} GiB")
+                else:
+                    size_gi = int(qcow2_info['size'] / (1024**3)) + 5
+            except Exception as e:
+                print(colored(f"   ⚠️  Could not get size: {e}", Colors.YELLOW))
+                size_gi = int(qcow2_info['size'] / (1024**3)) + 5
+            
+            print(f"   Volume name:  {vol_name}")
+            print(f"   Namespace:    {namespace}")
+            print(f"   Storage:      {storage_class}")
+            
+            # Run the import
+            self._import_sparse(vol_name, size_gi, storage_class, namespace,
+                               nfs_server, nfs_path, qcow2_file)
+    
     def _import_datavolume(self, vol_name, size_gi, storage_class, namespace,
                            selected_file, transfer_config):
         """Import disk using CDI DataVolume (HTTP)."""
@@ -4834,6 +4938,9 @@ def main():
     parser.add_argument("-c", "--config", default="config.yaml", help="Configuration file")
     parser.add_argument("command", nargs="?", help="Direct command (optional)")
     parser.add_argument("args", nargs="*", help="Arguments")
+    parser.add_argument("--disk", type=int, help="Disk index for import command")
+    parser.add_argument("--namespace", "-n", default="harvester-public", help="Target namespace")
+    parser.add_argument("--storage-class", "-s", default="harvester-longhorn-dual-node", help="Storage class")
     
     args = parser.parse_args()
     
@@ -4858,6 +4965,15 @@ def main():
             tool.show_vm_details(vm_name)
         elif args.command == "test-harvester":
             tool.connect_harvester()
+        elif args.command == "import":
+            # Import command: python3 migrate.py import vmname --disk N
+            if not args.args:
+                print(colored("Usage: migrate.py import <vmname> --disk <N>", Colors.RED))
+                print(colored("   or: migrate.py import <vmname> (imports all disks)", Colors.RED))
+                sys.exit(1)
+            vm_name = args.args[0]
+            disk_idx = args.disk
+            tool.import_vm_disk(vm_name, disk_idx, args.namespace, args.storage_class)
         else:
             print(f"Unknown command: {args.command}")
 
