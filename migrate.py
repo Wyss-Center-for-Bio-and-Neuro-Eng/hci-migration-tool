@@ -4189,22 +4189,27 @@ Log "=========================================="
             print(colored("❌ pywinrm not installed. Run: pip install pywinrm[kerberos]", Colors.RED))
             return
         
-        # Check if step already done
-        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'precheck'):
+        # Require a selected VM
+        if not self._selected_vm:
+            print(colored("❌ No VM selected.", Colors.RED))
+            print(colored("   Use 'Migration Tracker → Add VM' then 'Migration → Select VM' first.", Colors.YELLOW))
             return
         
-        # Get target host
-        if self._selected_vm:
-            print(f"   Selected VM: {self._selected_vm}")
+        # Check if step already done
+        if not self.check_step_and_confirm(self._selected_vm, 'precheck'):
+            return
         
+        # Build default FQDN from selected VM
         windows_config = self.config.get('windows', {})
         domain = windows_config.get('domain', 'AD.WYSSCENTER.CH').lower()
         use_kerberos = windows_config.get('use_kerberos', True)
         
-        print(colored("   ℹ️  Use FQDN for Kerberos (e.g., servername.ad.wysscenter.ch)", Colors.CYAN))
-        host = self.input_prompt("Windows hostname (FQDN)")
-        if not host:
-            return
+        default_fqdn = f"{self._selected_vm}.{domain}"
+        
+        print(f"   Selected VM: {self._selected_vm}")
+        print(colored("   ℹ️  Using Kerberos authentication (FQDN required)", Colors.CYAN))
+        
+        host = self.input_prompt(f"Windows hostname (FQDN) [{default_fqdn}]") or default_fqdn
         
         # Check if IP address was provided
         import re
