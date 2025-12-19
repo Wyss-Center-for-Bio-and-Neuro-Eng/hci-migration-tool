@@ -1922,21 +1922,66 @@ class MigrationTool:
         if not disk_info:
             return
         
-        # Get namespace
+        # Get namespace - numbered list selection
         namespaces = self.harvester.list_namespaces()
-        ns_names = [ns.get('metadata', {}).get('name', '') for ns in namespaces 
+        ns_names = sorted([ns.get('metadata', {}).get('name', '') for ns in namespaces 
                    if not ns.get('metadata', {}).get('name', '').startswith('kube-')
-                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')]
+                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('harvester-')])
         
-        print(f"\n   Available namespaces: {', '.join(ns_names[:5])}")
-        namespace = self.input_prompt("   Namespace [harvester-public]") or "harvester-public"
+        print(colored("\n   Available namespaces:", Colors.BOLD))
+        default_ns_idx = 0
+        for i, ns in enumerate(ns_names, 1):
+            if ns == "default":
+                default_ns_idx = i
+                print(f"     {i}. {ns}                    ← default")
+            else:
+                print(f"     {i}. {ns}")
         
-        # Get storage class
+        ns_choice = self.input_prompt(f"   Select namespace [{default_ns_idx}]") or str(default_ns_idx)
+        try:
+            ns_idx = int(ns_choice) - 1
+            if 0 <= ns_idx < len(ns_names):
+                namespace = ns_names[ns_idx]
+            else:
+                namespace = "default"
+        except ValueError:
+            namespace = "default"
+        print(colored(f"   → Using: {namespace}", Colors.CYAN))
+        
+        # Get storage classes - numbered list
         scs = self.harvester.list_storage_classes()
-        sc_names = [sc.get('metadata', {}).get('name', '') for sc in scs]
-        default_sc = "harvester-longhorn-dual-node" if "harvester-longhorn-dual-node" in sc_names else sc_names[0] if sc_names else ""
-        print(f"   Available storage classes: {', '.join(sc_names[:3])}")
-        storage_class = self.input_prompt(f"   Storage class [{default_sc}]") or default_sc
+        sc_names = sorted([sc.get('metadata', {}).get('name', '') for sc in scs])
+        
+        print(colored("\n   Available storage classes:", Colors.BOLD))
+        default_sc_idx = 0
+        for i, sc in enumerate(sc_names, 1):
+            if sc == "harvester-longhorn-dual-node":
+                default_sc_idx = i
+                print(f"     {i}. {sc}    ← default")
+            else:
+                print(f"     {i}. {sc}")
+        
+        if default_sc_idx == 0 and sc_names:
+            default_sc_idx = 1
+        
+        # Storage class selection per disk
+        print()
+        for disk in disk_info:
+            sc_choice = self.input_prompt(f"   Storage class for {disk['name']} ({disk['size_gi']} GiB) [{default_sc_idx}]") or str(default_sc_idx)
+            try:
+                sc_idx = int(sc_choice) - 1
+                if 0 <= sc_idx < len(sc_names):
+                    disk['storage_class'] = sc_names[sc_idx]
+                else:
+                    disk['storage_class'] = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
+            except ValueError:
+                disk['storage_class'] = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
+        
+        # Summary before creation
+        print(colored("\n   Summary:", Colors.BOLD))
+        for disk in disk_info:
+            print(f"     {disk['name']} ({disk['size_gi']} GiB) → {disk['storage_class']}")
         
         # Create PVCs
         confirm = self.input_prompt(f"\n   Create {len(disk_info)} PVC(s)? (y/n) [y]") or "y"
@@ -1944,12 +1989,12 @@ class MigrationTool:
             return
         
         for disk in disk_info:
-            print(colored(f"\n   Creating PVC: {disk['name']} ({disk['size_gi']} GiB)...", Colors.CYAN))
+            print(colored(f"\n   Creating PVC: {disk['name']} ({disk['size_gi']} GiB) on {disk['storage_class']}...", Colors.CYAN))
             try:
                 self.harvester.create_empty_block_pvc(
                     name=disk['name'],
                     size_gi=disk['size_gi'],
-                    storage_class=storage_class,
+                    storage_class=disk['storage_class'],
                     namespace=namespace
                 )
                 print(colored(f"   ✅ PVC created: {disk['name']}", Colors.GREEN))
@@ -1972,6 +2017,9 @@ class MigrationTool:
         
         # Check if step already done
         if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'import_disks'):
+            return
+        
+        if not self.harvester and not self.connect_harvester():
             return
         
         vm_name = self._selected_vm.lower().replace(' ', '-')
@@ -2006,9 +2054,59 @@ class MigrationTool:
                 print(colored("❌ Invalid choice", Colors.RED))
                 return
         
-        # Get namespace and storage class
-        namespace = self.input_prompt("   Namespace [harvester-public]") or "harvester-public"
-        storage_class = self.input_prompt("   Storage class [harvester-longhorn-dual-node]") or "harvester-longhorn-dual-node"
+        # Get namespace - numbered list selection
+        namespaces = self.harvester.list_namespaces()
+        ns_names = sorted([ns.get('metadata', {}).get('name', '') for ns in namespaces 
+                   if not ns.get('metadata', {}).get('name', '').startswith('kube-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('harvester-')])
+        
+        print(colored("\n   Available namespaces:", Colors.BOLD))
+        default_ns_idx = 0
+        for i, ns in enumerate(ns_names, 1):
+            if ns == "default":
+                default_ns_idx = i
+                print(f"     {i}. {ns}                    ← default")
+            else:
+                print(f"     {i}. {ns}")
+        
+        ns_choice = self.input_prompt(f"   Select namespace [{default_ns_idx}]") or str(default_ns_idx)
+        try:
+            ns_idx = int(ns_choice) - 1
+            if 0 <= ns_idx < len(ns_names):
+                namespace = ns_names[ns_idx]
+            else:
+                namespace = "default"
+        except ValueError:
+            namespace = "default"
+        print(colored(f"   → Using: {namespace}", Colors.CYAN))
+        
+        # Get storage class - numbered list
+        scs = self.harvester.list_storage_classes()
+        sc_names = sorted([sc.get('metadata', {}).get('name', '') for sc in scs])
+        
+        print(colored("\n   Available storage classes:", Colors.BOLD))
+        default_sc_idx = 0
+        for i, sc in enumerate(sc_names, 1):
+            if sc == "harvester-longhorn-dual-node":
+                default_sc_idx = i
+                print(f"     {i}. {sc}    ← default")
+            else:
+                print(f"     {i}. {sc}")
+        
+        if default_sc_idx == 0 and sc_names:
+            default_sc_idx = 1
+        
+        sc_choice = self.input_prompt(f"   Select storage class [{default_sc_idx}]") or str(default_sc_idx)
+        try:
+            sc_idx = int(sc_choice) - 1
+            if 0 <= sc_idx < len(sc_names):
+                storage_class = sc_names[sc_idx]
+            else:
+                storage_class = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
+        except ValueError:
+            storage_class = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
+        print(colored(f"   → Using: {storage_class}", Colors.CYAN))
         
         # Call import_vm_disk
         self.import_vm_disk(
