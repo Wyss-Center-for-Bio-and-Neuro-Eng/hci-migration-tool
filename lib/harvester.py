@@ -964,6 +964,7 @@ echo "=== Step 2/2: Converting QCOW2 to block device ==="
 echo "   Direct conversion (no intermediate file)..."
 
 START_TIME=$(date +%s)
+SMOOTH_ETA=0
 
 # Run qemu-img in background with --target-is-zero to skip writing zeros
 # -n = don't create target (PVC already exists)
@@ -998,14 +999,20 @@ while kill -0 $PID 2>/dev/null; do
             if [ $SPEED_MB -gt 0 ] && [ $WRITE_PCT -lt 100 ]; then
                 REMAINING_MB=$((DATA_SIZE_MB - WRITE_MB))
                 if [ $REMAINING_MB -gt 0 ]; then
-                    ETA=$((REMAINING_MB / SPEED_MB))
+                    RAW_ETA=$((REMAINING_MB / SPEED_MB))
+                    # Smooth ETA with exponential moving average (30% new, 70% old)
+                    if [ $SMOOTH_ETA -eq 0 ]; then
+                        SMOOTH_ETA=$RAW_ETA
+                    else
+                        SMOOTH_ETA=$(( (RAW_ETA * 30 + SMOOTH_ETA * 70) / 100 ))
+                    fi
                 else
-                    ETA=0
+                    SMOOTH_ETA=0
                 fi
             else
-                ETA=0
+                SMOOTH_ETA=0
             fi
-            echo "   Written: $WRITE_MB / $DATA_SIZE_MB MB ($WRITE_PCT%) | $SPEED_MB MB/s | ETA: ${{ETA}}s"
+            echo "   Written: $WRITE_MB / $DATA_SIZE_MB MB ($WRITE_PCT%) | $SPEED_MB MB/s | ETA: ${{SMOOTH_ETA}}s"
         elif [ $WRITE_MB -gt 0 ]; then
             echo "   Written: $WRITE_MB MB..."
         fi
