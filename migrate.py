@@ -5598,8 +5598,16 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
             
             print(colored("   ✅ Connected!", Colors.GREEN))
             
-            # Clean up ghost NICs (from Nutanix VirtIO)
-            print(colored("\n   🧹 Cleaning up ghost network adapters...", Colors.CYAN))
+            # Store original IP for later verification
+            original_ip = static_interfaces[0].get('ip') if static_interfaces else None
+            
+            # ============================================================
+            # STEP 1: Ghost NICs cleanup
+            # ============================================================
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("STEP 1/5: Ghost NICs Cleanup", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
+            
             ghost_cleanup_script = '''
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -5623,256 +5631,24 @@ Write-Host "GHOST_CLEANUP_RESULT:$removedCount"
 '''
             try:
                 result = client.run_powershell(ghost_cleanup_script)
-                output = result[0]  # stdout is first element of tuple
+                output = result[0]
                 if 'GHOST_CLEANUP_RESULT:' in output:
                     count = output.split('GHOST_CLEANUP_RESULT:')[1].strip().split()[0]
                     if int(count) > 0:
-                        print(colored(f"   ✅ Cleaned {count} ghost adapter(s)/config(s)", Colors.GREEN))
+                        print(colored(f"   ✅ Cleaned {count} ghost adapter(s)", Colors.GREEN))
                     else:
                         print(colored("   ✅ No ghost adapters found", Colors.GREEN))
                 else:
                     print(colored("   ✅ Ghost cleanup completed", Colors.GREEN))
             except Exception as e:
                 print(colored(f"   ⚠️  Ghost cleanup warning: {e}", Colors.YELLOW))
-                # Continue anyway - this is not critical
             
-            # Check and apply each static interface config
-            for iface in static_interfaces:
-                iface_name = iface.get('name', 'Ethernet')
-                iface_mac = iface.get('mac', '').upper().replace(':', '-')  # Windows format
-                ip = iface.get('ip')
-                prefix = iface.get('prefix', 24)
-                gateway = iface.get('gateway', '')
-                dns_list = iface.get('dns', [])
-                
-                # First, check if network config is already correct (by MAC)
-                print(colored(f"\n   🔍 Checking {iface_name} (MAC: {iface_mac})...", Colors.CYAN))
-                
-                check_script = f'''
-$targetMAC = "{iface_mac}"
-$targetIP = "{ip}"
-$targetPrefix = {prefix}
-$targetGateway = "{gateway}"
-$targetDNS = @({','.join([f'"{d}"' for d in dns_list])})
-
-# Find adapter by MAC address
-$adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
-if (-not $adapter) {{
-    Write-Host "CONFIG_CHECK:NO_ADAPTER"
-    Write-Host "TARGET_MAC:$targetMAC"
-    # List available adapters for debugging
-    Write-Host "AVAILABLE_ADAPTERS:"
-    Get-NetAdapter | ForEach-Object {{ Write-Host "  $($_.Name) - $($_.MacAddress) - $($_.Status)" }}
-    exit
-}}
-
-$ifName = $adapter.Name
-Write-Host "FOUND_ADAPTER:$ifName"
-
-# Get current config
-$currentIP = Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
-$currentRoute = Get-NetRoute -InterfaceAlias $ifName -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -First 1
-$currentDNS = (Get-DnsClientServerAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
-
-$ipMatch = $currentIP -and ($currentIP.IPAddress -eq $targetIP) -and ($currentIP.PrefixLength -eq $targetPrefix)
-$gwMatch = (-not $targetGateway) -or ($currentRoute -and ($currentRoute.NextHop -eq $targetGateway))
-$dnsMatch = ($targetDNS.Count -eq 0) -or (($currentDNS -join ",") -eq ($targetDNS -join ","))
-
-if ($ipMatch -and $gwMatch -and $dnsMatch) {{
-    Write-Host "CONFIG_CHECK:OK"
-    Write-Host "CURRENT_IP:$($currentIP.IPAddress)/$($currentIP.PrefixLength)"
-    Write-Host "CURRENT_GW:$($currentRoute.NextHop)"
-    Write-Host "CURRENT_DNS:$($currentDNS -join ',')"
-}} else {{
-    Write-Host "CONFIG_CHECK:MISMATCH"
-    Write-Host "CURRENT_IP:$($currentIP.IPAddress)/$($currentIP.PrefixLength)"
-    Write-Host "EXPECTED_IP:$targetIP/$targetPrefix"
-    Write-Host "CURRENT_GW:$($currentRoute.NextHop)"
-    Write-Host "EXPECTED_GW:$targetGateway"
-    Write-Host "CURRENT_DNS:$($currentDNS -join ',')"
-    Write-Host "EXPECTED_DNS:$($targetDNS -join ',')"
-}}
-'''
-                try:
-                    check_result = client.run_powershell(check_script)
-                    check_output = check_result[0]  # stdout is first element of tuple
-                    
-                    if 'CONFIG_CHECK:OK' in check_output:
-                        print(colored(f"   ✅ Network already configured correctly ({ip}/{prefix})", Colors.GREEN))
-                        continue  # Skip to next interface
-                    elif 'CONFIG_CHECK:NO_ADAPTER' in check_output:
-                        print(colored(f"   ⚠️  No adapter found with MAC: {iface_mac}", Colors.YELLOW))
-                        # Show available adapters
-                        for line in check_output.split('\n'):
-                            if line.strip().startswith('AVAILABLE_ADAPTERS:') or line.strip().startswith('  '):
-                                print(f"      {line.strip()}")
-                        continue  # Skip this interface
-                    else:
-                        # Show mismatch details
-                        print(colored(f"   ℹ️  Network config needs update", Colors.YELLOW))
-                        for line in check_output.split('\n'):
-                            if line.startswith('CURRENT_') or line.startswith('EXPECTED_') or line.startswith('FOUND_ADAPTER'):
-                                print(f"      {line}")
-                except Exception as e:
-                    print(colored(f"   ⚠️  Could not check config: {e}", Colors.YELLOW))
-                
-                print(colored(f"\n   🔧 Configuring by MAC {iface_mac}...", Colors.CYAN))
-                
-                # PowerShell with logging - find adapter by MAC
-                ps_script = f'''
-$ErrorActionPreference = "Continue"
-$logFile = "C:\\temp\\network-reconfig.log"
-
-if (-not (Test-Path "C:\\temp")) {{
-    New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null
-}}
-
-function Log {{
-    param([string]$msg)
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$ts - $msg" | Tee-Object -FilePath $logFile -Append
-}}
-
-Log "=========================================="
-Log "Network reconfiguration started"
-Log "=========================================="
-
-$targetMAC = "{iface_mac}"
-$ip = "{ip}"
-$prefix = {prefix}
-$gateway = "{gateway}"
-$dns = @({','.join([f'"{d}"' for d in dns_list])})
-
-Log "Target MAC: $targetMAC -> $ip/$prefix via $gateway"
-
-try {{
-    # Find adapter by MAC address
-    $adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
-    if (-not $adapter) {{
-        throw "No adapter found with MAC: $targetMAC"
-    }}
-    
-    $ifName = $adapter.Name
-    Log "Found adapter: $ifName (MAC: $targetMAC)"
-
-    Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{
-        Log "Removing: $($_.IPAddress)"
-        Remove-NetIPAddress -InterfaceAlias $ifName -IPAddress $_.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    }}
-    Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
-
-    New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -ErrorAction Stop
-    Log "IP configured: $ip/$prefix"
-
-    Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -ErrorAction Stop
-    Log "DNS configured: $($dns -join ', ')"
-
-    Log "SUCCESS"
-    Write-Host "SUCCESS"
-}} catch {{
-    Log "ERROR: $($_.Exception.Message)"
-    throw
-}}
-'''
-                try:
-                    stdout, stderr, rc = client.run_powershell(ps_script)
-                    
-                    if "SUCCESS" in stdout:
-                        print(colored(f"   ✅ Configured: {ip}/{prefix}", Colors.GREEN))
-                    else:
-                        print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
-                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-                except Exception as e:
-                    if "Connection reset" in str(e) or "WinRM" in str(e):
-                        print(colored(f"   ✅ Likely configured (connection reset)", Colors.GREEN))
-                        print(colored("      This is normal when changing IP", Colors.CYAN))
-                    else:
-                        print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
-                        print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
-            
-            original_ip = static_interfaces[0].get('ip') if static_interfaces else 'N/A'
-            
-            # Reboot after network configuration
-            print(colored("\n🔄 Post-Configuration Reboot", Colors.BOLD))
-            print("   A reboot is recommended to ensure network changes are fully applied.")
-            
-            reboot = self.input_prompt("\n   Reboot VM now? (y/n) [y]") or "y"
-            if reboot.lower() == 'y':
-                print(colored("\n   🔄 Rebooting VM...", Colors.CYAN))
-                try:
-                    # Send reboot command
-                    client.run_powershell("Restart-Computer -Force", timeout=10)
-                except:
-                    pass  # Connection will drop during reboot
-                
-                print("   ⏳ Waiting for VM to reboot...")
-                time.sleep(30)  # Initial wait for shutdown
-                
-                # Wait for VM to come back online via ping
-                print(f"   ⏳ Pinging {original_ip} to verify VM is back online...")
-                
-                max_wait = 180  # 3 minutes max
-                start_time = time.time()
-                vm_back = False
-                
-                while time.time() - start_time < max_wait:
-                    elapsed = int(time.time() - start_time)
-                    
-                    try:
-                        result = subprocess.run(
-                            ['ping', '-c', '1', '-W', '2', original_ip],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
-                        )
-                        
-                        if result.returncode == 0:
-                            vm_back = True
-                            print(colored(f"\n   ✅ VM is back online! IP: {original_ip} ({elapsed}s)", Colors.GREEN))
-                            break
-                        else:
-                            if elapsed % 15 == 0:
-                                print(f"   ⏳ Waiting for VM... ({elapsed}s)")
-                    except:
-                        pass
-                    
-                    time.sleep(5)
-                
-                if not vm_back:
-                    print(colored(f"\n   ⚠️  VM not responding on {original_ip} after {max_wait}s", Colors.YELLOW))
-                    print(colored("      Check console via Harvester UI", Colors.YELLOW))
-                else:
-                    # Wait for WinRM to be ready
-                    print("   ⏳ Waiting for WinRM service (15s)...")
-                    time.sleep(15)
-                    
-                    # Try to reconnect and verify
-                    print(colored(f"   🔌 Verifying connection to {original_ip}...", Colors.CYAN))
-                    try:
-                        verify_client = WinRMClient(
-                            host=original_ip,
-                            username=username,
-                            password=password,
-                            transport=transport
-                        )
-                        if verify_client.test_connection():
-                            print(colored("   ✅ WinRM connection verified!", Colors.GREEN))
-                            
-                            # Quick verification
-                            stdout, _, _ = verify_client.run_powershell(
-                                "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1'}).IPAddress"
-                            )
-                            current_ip = stdout.strip().split('\n')[0] if stdout else 'unknown'
-                            print(colored(f"   ✅ Current IP: {current_ip}", Colors.GREEN))
-                        else:
-                            print(colored("   ⚠️  WinRM not ready yet, but VM is pingable", Colors.YELLOW))
-                    except Exception as e:
-                        print(colored(f"   ⚠️  Verification failed: {e}", Colors.YELLOW))
-                        print(colored("      VM is pingable, should be operational", Colors.YELLOW))
-            
-            # Offer to uninstall Nutanix tools
-            print(colored("\n🧹 Nutanix Tools Cleanup", Colors.BOLD))
-            print("   The following Nutanix tools should be removed after migration:")
+            # ============================================================
+            # STEP 2: Uninstall Nutanix Tools
+            # ============================================================
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("STEP 2/5: Uninstall Nutanix Tools", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
             print("   - Nutanix Guest Tools")
             print("   - Nutanix VirtIO")
             print("   - Nutanix VM Mobility")
@@ -5891,56 +5667,62 @@ function Log {
     "$ts - $msg" | Tee-Object -FilePath $logFile -Append
 }
 
+if (-not (Test-Path "C:\\temp")) {
+    New-Item -ItemType Directory -Path "C:\\temp" -Force | Out-Null
+}
+
 Log "=========================================="
 Log "Nutanix tools cleanup started"
 Log "=========================================="
 
-# Find and uninstall Nutanix products
-$nutanixApps = Get-WmiObject -Class Win32_Product | Where-Object { $_.Name -like "*Nutanix*" }
-
-if ($nutanixApps) {
-    foreach ($app in $nutanixApps) {
-        Log "Uninstalling: $($app.Name)"
-        try {
-            $result = $app.Uninstall()
-            if ($result.ReturnValue -eq 0) {
-                Log "SUCCESS: $($app.Name) uninstalled"
-            } else {
-                Log "WARNING: $($app.Name) returned code $($result.ReturnValue)"
-            }
-        } catch {
-            Log "ERROR: $($_.Exception.Message)"
-        }
-    }
-} else {
-    Log "No Nutanix applications found via WMI"
-}
-
-# Also try uninstall strings from registry
+# Find Nutanix apps from registry (fast method)
 $uninstallKeys = @(
     "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*",
     "HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
 )
 
+$nutanixApps = @()
 foreach ($key in $uninstallKeys) {
     $apps = Get-ItemProperty $key -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*Nutanix*" }
-    foreach ($app in $apps) {
-        if ($app.UninstallString) {
-            Log "Found: $($app.DisplayName)"
-            $uninstall = $app.UninstallString
-            # Handle different uninstall string formats
-            if ($uninstall -match "msiexec") {
-                $uninstall = $uninstall -replace "/I", "/X"
-                $uninstall = "$uninstall /qn /norestart"
-            }
-            Log "Running: $uninstall"
-            try {
-                Start-Process cmd.exe -ArgumentList "/c $uninstall" -Wait -NoNewWindow
-                Log "Completed uninstall command"
-            } catch {
-                Log "ERROR: $($_.Exception.Message)"
-            }
+    if ($apps) {
+        $nutanixApps += $apps
+    }
+}
+
+Log "Found $($nutanixApps.Count) Nutanix application(s)"
+Write-Host "FOUND:$($nutanixApps.Count)"
+
+foreach ($app in $nutanixApps) {
+    $name = $app.DisplayName
+    $guid = $app.PSChildName
+    
+    Log "Processing: $name"
+    Write-Host "   Uninstalling: $name"
+    
+    # Method 1: If it's an MSI (GUID format)
+    if ($guid -match "^\\{[A-F0-9-]+\\}$") {
+        Log "Uninstalling MSI: $guid"
+        $proc = Start-Process "msiexec.exe" -ArgumentList "/x $guid /qn /norestart" -Wait -PassThru -NoNewWindow
+        Log "msiexec exit code: $($proc.ExitCode)"
+    }
+    # Method 2: Use QuietUninstallString if available
+    elseif ($app.QuietUninstallString) {
+        Log "Using QuietUninstallString: $($app.QuietUninstallString)"
+        $proc = Start-Process "cmd.exe" -ArgumentList "/c `"$($app.QuietUninstallString)`"" -Wait -PassThru -NoNewWindow
+        Log "Exit code: $($proc.ExitCode)"
+    }
+    # Method 3: Use UninstallString with silent flags
+    elseif ($app.UninstallString) {
+        $uninstall = $app.UninstallString
+        if ($uninstall -match "msiexec") {
+            $uninstall = $uninstall -replace "/I", "/X"
+            $uninstall = "$uninstall /qn /norestart"
+        } else {
+            $uninstall = "$uninstall /S /silent /quiet"
         }
+        Log "Using UninstallString: $uninstall"
+        $proc = Start-Process "cmd.exe" -ArgumentList "/c `"$uninstall`"" -Wait -PassThru -NoNewWindow
+        Log "Exit code: $($proc.ExitCode)"
     }
 }
 
@@ -5981,109 +5763,225 @@ Write-Host "CLEANUP_DONE"
                 except Exception as e:
                     print(colored(f"   ⚠️  Cleanup error: {e}", Colors.YELLOW))
                     print(colored("      You may need to uninstall manually", Colors.YELLOW))
+            else:
+                print(colored("   ⏭️  Skipped Nutanix tools removal", Colors.YELLOW))
             
-            # Offer to install Red Hat VirtIO drivers
-            print(colored("\n📦 Red Hat VirtIO Drivers", Colors.BOLD))
-            print("   Required for switching from SATA to VirtIO disk bus (better performance)")
+            # ============================================================
+            # STEP 3: Install Red Hat VirtIO Drivers
+            # ============================================================
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("STEP 3/5: Install Red Hat VirtIO Drivers", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
+            print("   Required for optimal performance with VirtIO disk bus")
             
-            install_virtio = self.input_prompt("\n   Install Red Hat VirtIO drivers now? (y/n) [y]") or "y"
+            install_virtio = self.input_prompt("\n   Install Red Hat VirtIO drivers? (y/n) [y]") or "y"
             virtio_installed = False
             if install_virtio.lower() == 'y':
                 virtio_installed = self._install_virtio_drivers_postmig(client, vm_fqdn)
+            else:
+                print(colored("   ⏭️  Skipped VirtIO drivers installation", Colors.YELLOW))
             
-            # Summary and next steps
+            # ============================================================
+            # STEP 4: Network Configuration Check
+            # ============================================================
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("STEP 4/5: Network Configuration", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
+            
+            network_needs_config = False
+            for iface in static_interfaces:
+                iface_name = iface.get('name', 'Ethernet')
+                iface_mac = iface.get('mac', '').upper().replace(':', '-')
+                ip = iface.get('ip')
+                prefix = iface.get('prefix', 24)
+                gateway = iface.get('gateway', '')
+                dns_list = iface.get('dns', [])
+                
+                print(colored(f"\n   🔍 Checking {iface_name} (MAC: {iface_mac})...", Colors.CYAN))
+                
+                check_script = f'''
+$targetMAC = "{iface_mac}"
+$targetIP = "{ip}"
+$targetPrefix = {prefix}
+$targetGateway = "{gateway}"
+$targetDNS = @({','.join([f'"{d}"' for d in dns_list])})
+
+# Find adapter by MAC address
+$adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
+if (-not $adapter) {{
+    Write-Host "CONFIG_CHECK:NO_ADAPTER"
+    Write-Host "TARGET_MAC:$targetMAC"
+    Write-Host "AVAILABLE_ADAPTERS:"
+    Get-NetAdapter | ForEach-Object {{ Write-Host "  $($_.Name) - $($_.MacAddress) - $($_.Status)" }}
+    exit
+}}
+
+$ifName = $adapter.Name
+Write-Host "FOUND_ADAPTER:$ifName"
+
+$currentIP = Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+$currentRoute = Get-NetRoute -InterfaceAlias $ifName -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -First 1
+$currentDNS = (Get-DnsClientServerAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+
+$ipMatch = $currentIP -and ($currentIP.IPAddress -eq $targetIP) -and ($currentIP.PrefixLength -eq $targetPrefix)
+$gwMatch = (-not $targetGateway) -or ($currentRoute -and ($currentRoute.NextHop -eq $targetGateway))
+$dnsMatch = ($targetDNS.Count -eq 0) -or (($currentDNS -join ",") -eq ($targetDNS -join ","))
+
+if ($ipMatch -and $gwMatch -and $dnsMatch) {{
+    Write-Host "CONFIG_CHECK:OK"
+}} else {{
+    Write-Host "CONFIG_CHECK:MISMATCH"
+    Write-Host "CURRENT_IP:$($currentIP.IPAddress)/$($currentIP.PrefixLength)"
+    Write-Host "EXPECTED_IP:$targetIP/$targetPrefix"
+    Write-Host "CURRENT_GW:$($currentRoute.NextHop)"
+    Write-Host "EXPECTED_GW:$targetGateway"
+}}
+'''
+                try:
+                    check_result = client.run_powershell(check_script)
+                    check_output = check_result[0]
+                    
+                    if 'CONFIG_CHECK:OK' in check_output:
+                        print(colored(f"   ✅ Network already configured correctly ({ip}/{prefix})", Colors.GREEN))
+                    elif 'CONFIG_CHECK:NO_ADAPTER' in check_output:
+                        print(colored(f"   ⚠️  No adapter found with MAC: {iface_mac}", Colors.YELLOW))
+                        for line in check_output.split('\n'):
+                            if 'AVAILABLE_ADAPTERS:' in line or line.strip().startswith('  '):
+                                print(f"      {line.strip()}")
+                    else:
+                        print(colored(f"   ℹ️  Network config needs update", Colors.YELLOW))
+                        for line in check_output.split('\n'):
+                            if line.startswith('CURRENT_') or line.startswith('EXPECTED_'):
+                                print(f"      {line}")
+                        network_needs_config = True
+                        
+                        # Apply network config
+                        apply = self.input_prompt(f"\n   Apply network config for {iface_mac}? (y/n) [y]") or "y"
+                        if apply.lower() == 'y':
+                            print(colored(f"   🔧 Configuring...", Colors.CYAN))
+                            
+                            ps_config = f'''
+$targetMAC = "{iface_mac}"
+$ip = "{ip}"
+$prefix = {prefix}
+$gateway = "{gateway}"
+$dns = @({','.join([f'"{d}"' for d in dns_list])})
+
+$adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
+if (-not $adapter) {{ throw "Adapter not found" }}
+
+$ifName = $adapter.Name
+
+Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -EA SilentlyContinue | ForEach-Object {{
+    Remove-NetIPAddress -InterfaceAlias $ifName -IPAddress $_.IPAddress -Confirm:$false -EA SilentlyContinue
+}}
+Remove-NetRoute -InterfaceAlias $ifName -AddressFamily IPv4 -Confirm:$false -EA SilentlyContinue
+
+New-NetIPAddress -InterfaceAlias $ifName -IPAddress $ip -PrefixLength $prefix -DefaultGateway $gateway -EA Stop
+Set-DnsClientServerAddress -InterfaceAlias $ifName -ServerAddresses $dns -EA Stop
+Write-Host "SUCCESS"
+'''
+                            try:
+                                stdout, stderr, rc = client.run_powershell(ps_config)
+                                if "SUCCESS" in stdout:
+                                    print(colored(f"   ✅ Configured: {ip}/{prefix}", Colors.GREEN))
+                                else:
+                                    print(colored(f"   ⚠️  May need manual config", Colors.YELLOW))
+                            except Exception as e:
+                                if "Connection reset" in str(e) or "WinRM" in str(e):
+                                    print(colored(f"   ✅ Likely configured (connection reset is normal)", Colors.GREEN))
+                                else:
+                                    print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not check config: {e}", Colors.YELLOW))
+            
+            # ============================================================
+            # STEP 5: Final Reboot
+            # ============================================================
+            print(colored("\n" + "="*50, Colors.BLUE))
+            print(colored("STEP 5/5: Final Reboot", Colors.BOLD))
+            print(colored("="*50, Colors.BLUE))
+            print("   A reboot is required to apply all driver changes.")
+            
+            reboot = self.input_prompt("\n   Reboot VM now? (y/n) [y]") or "y"
+            if reboot.lower() == 'y':
+                print(colored("\n   🔄 Rebooting VM...", Colors.CYAN))
+                try:
+                    client.run_powershell("Restart-Computer -Force", timeout=10)
+                except:
+                    pass  # Connection will drop during reboot
+                
+                print("   ⏳ Waiting for VM to shutdown...")
+                time.sleep(30)
+                
+                # Wait for VM to come back online
+                if original_ip:
+                    print(f"   ⏳ Pinging {original_ip} to verify VM is back online...")
+                    
+                    max_wait = 180
+                    start_time = time.time()
+                    vm_back = False
+                    
+                    while time.time() - start_time < max_wait:
+                        elapsed = int(time.time() - start_time)
+                        
+                        try:
+                            result = subprocess.run(
+                                ['ping', '-c', '1', '-W', '2', original_ip],
+                                capture_output=True,
+                                text=True,
+                                timeout=5
+                            )
+                            
+                            if result.returncode == 0:
+                                vm_back = True
+                                print(colored(f"\n   ✅ VM is back online! ({elapsed}s)", Colors.GREEN))
+                                break
+                            else:
+                                if elapsed % 15 == 0:
+                                    print(f"   ⏳ Waiting... ({elapsed}s)")
+                        except:
+                            pass
+                        
+                        time.sleep(5)
+                    
+                    if not vm_back:
+                        print(colored(f"\n   ⚠️  VM not responding after {max_wait}s", Colors.YELLOW))
+                        print(colored("      Check console via Harvester UI", Colors.YELLOW))
+                    else:
+                        # Verify WinRM
+                        print("   ⏳ Waiting for WinRM service (15s)...")
+                        time.sleep(15)
+                        
+                        try:
+                            verify_client = WinRMClient(
+                                host=original_ip,
+                                username=username,
+                                password=password,
+                                transport=transport
+                            )
+                            if verify_client.test_connection():
+                                print(colored("   ✅ WinRM connection verified!", Colors.GREEN))
+                        except:
+                            print(colored("   ⚠️  WinRM not ready, but VM is pingable", Colors.YELLOW))
+            else:
+                print(colored("   ⏭️  Skipped reboot - remember to reboot manually!", Colors.YELLOW))
+            
+            # ============================================================
+            # Summary
+            # ============================================================
             print(colored("\n" + "="*50, Colors.GREEN))
-            print(colored("✅ Post-migration configuration complete!", Colors.GREEN))
+            print(colored("✅ Post-migration complete!", Colors.GREEN + Colors.BOLD))
             print(colored("="*50, Colors.GREEN))
             print(f"\n   VM: {vm_name}")
             print(f"   FQDN: {vm_fqdn}")
-            print(f"   Static IP: {original_ip}")
+            if original_ip:
+                print(f"   IP: {original_ip}")
             
             if virtio_installed:
-                # Offer to switch disk bus
-                print(colored("\n🔄 Disk Bus Optimization", Colors.BOLD))
-                print("   VirtIO drivers are installed. You can now switch from SATA to VirtIO for better performance.")
-                print(colored("   ⚠️  This requires stopping the VM, changing config, and restarting.", Colors.YELLOW))
-                
-                switch_bus = self.input_prompt("\n   Switch to VirtIO disk bus now? (y/n) [y]") or "y"
-                if switch_bus.lower() == 'y':
-                    print(colored("\n   🔄 Switching disk bus to VirtIO...", Colors.CYAN))
-                    
-                    # Stop VM
-                    print("   Stopping VM...")
-                    try:
-                        self.harvester.stop_vm(vm_name, namespace)
-                        
-                        # Wait for VM to stop
-                        max_wait = 120
-                        elapsed = 0
-                        while elapsed < max_wait:
-                            time.sleep(5)
-                            elapsed += 5
-                            vm_data = self.harvester.get_vm(vm_name, namespace)
-                            if not vm_data.get('status', {}).get('ready', False):
-                                print(colored("   ✅ VM stopped", Colors.GREEN))
-                                break
-                            print(f"   Waiting... ({elapsed}s)")
-                        
-                        # Get current VM config
-                        vm_data = self.harvester.get_vm(vm_name, namespace)
-                        template_spec = vm_data.get('spec', {}).get('template', {}).get('spec', {})
-                        
-                        # Update disk bus
-                        new_disks = []
-                        for disk in template_spec.get('domain', {}).get('devices', {}).get('disks', []):
-                            new_disk = disk.copy()
-                            if 'disk' in new_disk:
-                                new_disk['disk'] = new_disk['disk'].copy()
-                                old_bus = new_disk['disk'].get('bus', 'sata')
-                                if old_bus in ('sata', 'ide', 'scsi'):
-                                    new_disk['disk']['bus'] = 'virtio'
-                                    print(f"   {new_disk.get('name')}: {old_bus} → virtio")
-                            new_disks.append(new_disk)
-                        
-                        # Apply patch
-                        patch = {
-                            "spec": {
-                                "template": {
-                                    "spec": {
-                                        "domain": {
-                                            "devices": {
-                                                "disks": new_disks
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                        self.harvester._request(
-                            "PATCH",
-                            f"/apis/kubevirt.io/v1/namespaces/{namespace}/virtualmachines/{vm_name}",
-                            json=patch,
-                            headers={"Content-Type": "application/merge-patch+json"}
-                        )
-                        
-                        print(colored("   ✅ Disk bus switched to VirtIO!", Colors.GREEN))
-                        
-                        # Start VM
-                        print("   Starting VM with VirtIO...")
-                        self.harvester.start_vm(vm_name, namespace)
-                        print(colored("   ✅ VM starting with VirtIO disk bus", Colors.GREEN))
-                        
-                        print(colored("\n🎉 Migration complete with VirtIO optimization!", Colors.GREEN))
-                        
-                    except Exception as e:
-                        print(colored(f"   ❌ Error switching disk bus: {e}", Colors.RED))
-                        print(colored("   You can do this manually: Menu Harvester → Switch VM disk bus", Colors.YELLOW))
-                else:
-                    print(colored("\n💡 To optimize later:", Colors.YELLOW))
-                    print("   Menu Harvester → Switch VM disk bus (option 12)")
-            else:
-                print(colored("\n💡 Next steps for VirtIO optimization:", Colors.YELLOW))
-                print("   1. Install Red Hat VirtIO drivers (Menu Windows → Install VirtIO)")
-                print("   2. Switch VM to VirtIO bus (Menu Harvester → Switch VM disk bus)")
-                print("   3. Reboot and verify performance")
+                print(colored("\n💡 VirtIO Optimization Available:", Colors.YELLOW))
+                print("   You can switch from SATA to VirtIO disk bus for better performance.")
+                print("   Menu Harvester → Switch VM disk bus")
             
             # Update tracker
             track_vm = vm_name or self._selected_vm
