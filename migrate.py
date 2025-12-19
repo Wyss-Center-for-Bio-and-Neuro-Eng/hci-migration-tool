@@ -1408,10 +1408,9 @@ class MigrationTool:
         if result['success']:
             print(colored(f"   ✅ Done: {format_size(result['size_before'])} → {format_size(result['size_after'])} ({result['reduction_pct']:.1f}% reduction)", Colors.GREEN))
             
-            delete = self.input_prompt("   Delete RAW file? (y/n) [y]")
-            if delete.lower() != 'n':
-                if self.actions.delete_file(raw_path):
-                    print(colored("   ✅ RAW file deleted", Colors.GREEN))
+            # Auto-delete RAW file
+            if self.actions.delete_file(raw_path):
+                print(colored("   ✅ RAW file deleted", Colors.GREEN))
             return True
         else:
             print(colored(f"   ❌ Error: {result['error']}", Colors.RED))
@@ -1458,10 +1457,9 @@ class MigrationTool:
             if result['success']:
                 print(colored(f"✅ Done: {format_size(result['size_before'])} → {format_size(result['size_after'])} ({result['reduction_pct']:.1f}% reduction)", Colors.GREEN))
                 
-                delete = self.input_prompt("Delete RAW file? (y/n)")
-                if delete.lower() == 'y':
-                    if self.actions.delete_file(f['path']):
-                        print(colored("✅ RAW file deleted", Colors.GREEN))
+                # Auto-delete RAW file
+                if self.actions.delete_file(f['path']):
+                    print(colored("✅ RAW file deleted", Colors.GREEN))
             else:
                 print(colored(f"❌ Error: {result['error']}", Colors.RED))
     
@@ -3035,6 +3033,41 @@ class MigrationTool:
                 
                 confirm = self.input_prompt(f"   Remove '{display_name}'? (y/n) [n]") or "n"
                 if confirm.lower() == 'y':
+                    # Check for staging files to cleanup
+                    staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+                    vm_staging_dir = os.path.join(staging_dir, 'migrations', vm_key)
+                    
+                    files_to_delete = []
+                    total_size = 0
+                    
+                    if os.path.exists(vm_staging_dir):
+                        for f in os.listdir(vm_staging_dir):
+                            f_path = os.path.join(vm_staging_dir, f)
+                            if os.path.isfile(f_path):
+                                f_size = os.path.getsize(f_path)
+                                files_to_delete.append({'name': f, 'path': f_path, 'size': f_size})
+                                total_size += f_size
+                    
+                    # Ask to cleanup staging files
+                    if files_to_delete:
+                        print(colored(f"\n   🗑️  Staging files found:", Colors.YELLOW))
+                        print(f"      {vm_staging_dir}/")
+                        for f in files_to_delete:
+                            size_str = format_size(f['size'])
+                            print(f"      - {f['name']} ({size_str})")
+                        
+                        print(f"\n      Total: {format_size(total_size)}")
+                        
+                        cleanup = self.input_prompt("   Delete staging files? (y/n) [y]") or "y"
+                        if cleanup.lower() == 'y':
+                            import shutil
+                            try:
+                                shutil.rmtree(vm_staging_dir)
+                                print(colored(f"   ✅ Staging files deleted ({format_size(total_size)} freed)", Colors.GREEN))
+                            except Exception as e:
+                                print(colored(f"   ⚠️  Could not delete staging files: {e}", Colors.YELLOW))
+                    
+                    # Remove from tracker
                     if self.remove_vm_from_tracker(vm_key):
                         print(colored(f"✅ VM '{display_name}' removed from tracker", Colors.GREEN))
                         if self._selected_vm and self._selected_vm.lower() == vm_key:
