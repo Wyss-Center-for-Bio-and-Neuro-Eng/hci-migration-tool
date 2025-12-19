@@ -1644,12 +1644,11 @@ class MigrationTool:
             size = os.path.getsize(f) if os.path.exists(f) else 0
             print(f"      {f} ({size // (1024**3)} GB)")
         
-        # Offer to convert to QCOW2
+        # Auto-convert to QCOW2
         if downloaded_files:
-            convert = self.input_prompt("\nConvert to QCOW2 now? (y/n) [y]")
-            if convert.lower() != 'n':
-                for raw_file in downloaded_files:
-                    self._convert_single_file(raw_file)
+            print(colored("\n🔄 Converting to QCOW2...", Colors.CYAN))
+            for raw_file in downloaded_files:
+                self._convert_single_file(raw_file)
         
         # Update tracker
         self.update_step(self._selected_vm, 'export')
@@ -1849,12 +1848,11 @@ class MigrationTool:
             size = os.path.getsize(f) if os.path.exists(f) else 0
             print(f"      {f} ({size // (1024**3)} GB)")
         
-        # Offer to convert to QCOW2
+        # Auto-convert to QCOW2
         if downloaded_files:
-            convert = self.input_prompt("\nConvert to QCOW2 now? (y/n) [y]")
-            if convert.lower() != 'n':
-                for raw_file in downloaded_files:
-                    self._convert_single_file(raw_file)
+            print(colored("\n🔄 Converting to QCOW2...", Colors.CYAN))
+            for raw_file in downloaded_files:
+                self._convert_single_file(raw_file)
         
         # Cleanup reminder
         print(colored("\n💡 TIP: After successful migration, delete the Nutanix export images:", Colors.YELLOW))
