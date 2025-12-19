@@ -2006,12 +2006,8 @@ class MigrationTool:
     
     def import_disks_to_pvcs(self):
         """Import disk data from staging to Harvester PVCs."""
-        print(colored("\n📥 Import Disks to PVCs", Colors.BOLD))
+        print(colored("\n📥 Import Disks to Harvester", Colors.BOLD))
         print(colored("=" * 60, Colors.BLUE))
-        
-        # Check if step already done
-        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'import_disks'):
-            return
         
         if not self.harvester and not self.connect_harvester():
             return
@@ -2031,21 +2027,54 @@ class MigrationTool:
             print(colored(f"❌ No QCOW2 files found in {vm_dir}", Colors.RED))
             return
         
+        # Get disk sizes
+        import subprocess
+        import math
+        disk_info = []
         print(f"\n📁 Found {len(qcow2_files)} disk(s) for {self._selected_vm}:")
         for i, f in enumerate(qcow2_files):
-            print(f"   [{i}] {f}")
+            qcow2_path = os.path.join(vm_dir, f)
+            size_gi = 0
+            try:
+                result = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', qcow2_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    info = json.loads(result.stdout)
+                    virtual_size = info.get('virtual-size', 0)
+                    size_gi = math.ceil(virtual_size / (1024**3))
+            except:
+                pass
+            disk_info.append({'index': i, 'file': f, 'size_gi': size_gi})
+            print(f"   [{i}] {f} ({size_gi} GiB)")
         
         # Ask which disk(s) to import
         print(f"\n   Options: 'all' or disk number (0-{len(qcow2_files)-1})")
         choice = self.input_prompt("   Import which disk(s)? [all]") or "all"
         
-        if choice.lower() == 'all':
-            disk_idx = None  # Import all
+        import_all = choice.lower() == 'all'
+        
+        if import_all:
+            disks_to_import = disk_info
         else:
             try:
                 disk_idx = int(choice)
+                if disk_idx < 0 or disk_idx >= len(disk_info):
+                    print(colored("❌ Invalid disk number", Colors.RED))
+                    return
+                disks_to_import = [disk_info[disk_idx]]
             except:
                 print(colored("❌ Invalid choice", Colors.RED))
+                return
+        
+        # Check if step already done (only if importing all)
+        if import_all and self.is_step_done(self._selected_vm, 'import_disks'):
+            date = self.get_step_date(self._selected_vm, 'import_disks')
+            date_str = date[:10] if date else "unknown"
+            print(colored(f"\n⚠️  Step 'Import disks to Harvester' already completed ({date_str})", Colors.YELLOW))
+            confirm = self.input_prompt("   Re-run this step? (y/n) [n]") or "n"
+            if confirm.lower() != 'y':
                 return
         
         # Get namespace - numbered list selection
@@ -2078,7 +2107,7 @@ class MigrationTool:
             namespace = "default"
         print(colored(f"   → Using: {namespace}", Colors.CYAN))
         
-        # Get storage class - numbered list
+        # Get storage classes - numbered list
         scs = self.harvester.list_storage_classes()
         sc_names = sorted([sc.get('metadata', {}).get('name', '') for sc in scs])
         
@@ -2094,28 +2123,50 @@ class MigrationTool:
         if default_sc_idx == 0 and sc_names:
             default_sc_idx = 1
         
-        sc_choice = self.input_prompt(f"   Select storage class [{default_sc_idx}]") or str(default_sc_idx)
-        try:
-            sc_idx = int(sc_choice) - 1
-            if 0 <= sc_idx < len(sc_names):
-                storage_class = sc_names[sc_idx]
-            else:
-                storage_class = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
-        except ValueError:
-            storage_class = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
-        print(colored(f"   → Using: {storage_class}", Colors.CYAN))
+        # Storage class selection per disk
+        print()
+        for disk in disks_to_import:
+            sc_choice = self.input_prompt(f"   Storage class for disk{disk['index']} ({disk['size_gi']} GiB) [{default_sc_idx}]") or str(default_sc_idx)
+            try:
+                sc_idx = int(sc_choice) - 1
+                if 0 <= sc_idx < len(sc_names):
+                    disk['storage_class'] = sc_names[sc_idx]
+                else:
+                    disk['storage_class'] = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
+            except ValueError:
+                disk['storage_class'] = sc_names[default_sc_idx - 1] if default_sc_idx > 0 else sc_names[0]
         
-        # Call import_vm_disk
-        self.import_vm_disk(
-            vm_name=vm_name,
-            disk_idx=disk_idx,
-            namespace=namespace,
-            storage_class=storage_class
-        )
+        # Summary
+        print(colored("\n   Summary:", Colors.BOLD))
+        print(f"     Namespace: {namespace}")
+        for disk in disks_to_import:
+            print(f"     disk{disk['index']} ({disk['size_gi']} GiB) → {disk['storage_class']}")
         
-        # Update tracker
-        self.update_step(self._selected_vm, 'import_disks')
-        print(colored(f"\n   ✅ Step 'import_disks' marked complete in tracker", Colors.GREEN))
+        confirm = self.input_prompt(f"\n   Start import of {len(disks_to_import)} disk(s)? (y/n) [y]") or "y"
+        if confirm.lower() != 'y':
+            return
+        
+        # Import each disk
+        success_count = 0
+        for disk in disks_to_import:
+            print(colored(f"\n{'='*60}", Colors.BLUE))
+            print(colored(f"   Importing disk{disk['index']}: {disk['file']}", Colors.BOLD))
+            print(colored(f"{'='*60}", Colors.BLUE))
+            
+            self.import_vm_disk(
+                vm_name=vm_name,
+                disk_idx=disk['index'],
+                namespace=namespace,
+                storage_class=disk['storage_class']
+            )
+            success_count += 1
+        
+        # Update tracker only if ALL disks imported
+        if import_all and success_count == len(disk_info):
+            self.update_step(self._selected_vm, 'import_disks')
+            print(colored(f"\n   ✅ Step 'import_disks' marked complete in tracker", Colors.GREEN))
+        elif not import_all:
+            print(colored(f"\n   ℹ️  Single disk imported. Run 'all' to mark step complete.", Colors.YELLOW))
 
     def import_to_harvester(self):
         """Create independent volume in Harvester using CDI DataVolume."""
