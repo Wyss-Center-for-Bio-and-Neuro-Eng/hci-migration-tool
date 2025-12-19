@@ -178,12 +178,11 @@ class MigrationTool:
     
     # === Migration Tracker Methods ===
     
-    MIGRATION_STEPS = ['precheck', 'export', 'create_pvcs', 'import_disks', 'create_vm', 'postmig']
+    MIGRATION_STEPS = ['precheck', 'export', 'import_disks', 'create_vm', 'postmig']
     STEP_LABELS = {
         'precheck': 'Pre-check (collect config)',
         'export': 'Export/Download disks',
-        'create_pvcs': 'Create PVCs',
-        'import_disks': 'Import disks to PVCs',
+        'import_disks': 'Import disks to Harvester',
         'create_vm': 'Create VM in Harvester',
         'postmig': 'Post-migration config'
     }
@@ -1867,13 +1866,9 @@ class MigrationTool:
         self.export_vm()
     
     def create_pvcs_for_vm(self):
-        """Create PVCs in Harvester for the selected VM's disks."""
+        """Create PVCs in Harvester for the selected VM's disks (legacy - use import_disks_to_pvcs instead)."""
         print(colored("\n📦 Create PVCs for VM Disks", Colors.BOLD))
         print(colored("=" * 60, Colors.BLUE))
-        
-        # Check if step already done
-        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'create_pvcs'):
-            return
         
         if not self.harvester and not self.connect_harvester():
             return
@@ -1924,10 +1919,13 @@ class MigrationTool:
         
         # Get namespace - numbered list selection
         namespaces = self.harvester.list_namespaces()
+        excluded_ns = ['kube-system', 'kube-public', 'kube-node-lease', 
+                       'cattle-system', 'cattle-fleet-system', 'cattle-impersonation-system',
+                       'harvester-system', 'longhorn-system', 'fleet-local']
         ns_names = sorted([ns.get('metadata', {}).get('name', '') for ns in namespaces 
-                   if not ns.get('metadata', {}).get('name', '').startswith('kube-')
-                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')
-                   and not ns.get('metadata', {}).get('name', '').startswith('harvester-')])
+                   if ns.get('metadata', {}).get('name', '') not in excluded_ns
+                   and not ns.get('metadata', {}).get('name', '').startswith('kube-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')])
         
         print(colored("\n   Available namespaces:", Colors.BOLD))
         default_ns_idx = 0
@@ -2004,11 +2002,7 @@ class MigrationTool:
                 else:
                     print(colored(f"   ❌ Error: {e}", Colors.RED))
         
-        print(colored(f"\n✅ PVCs ready. Use 'Import disks to PVCs' (option 5) to populate them.", Colors.GREEN))
-        
-        # Update tracker
-        self.update_step(self._selected_vm, 'create_pvcs')
-        print(colored(f"   ✅ Step 'create_pvcs' marked complete in tracker", Colors.GREEN))
+        print(colored(f"\n✅ PVCs created.", Colors.GREEN))
     
     def import_disks_to_pvcs(self):
         """Import disk data from staging to Harvester PVCs."""
@@ -2056,10 +2050,13 @@ class MigrationTool:
         
         # Get namespace - numbered list selection
         namespaces = self.harvester.list_namespaces()
+        excluded_ns = ['kube-system', 'kube-public', 'kube-node-lease', 
+                       'cattle-system', 'cattle-fleet-system', 'cattle-impersonation-system',
+                       'harvester-system', 'longhorn-system', 'fleet-local']
         ns_names = sorted([ns.get('metadata', {}).get('name', '') for ns in namespaces 
-                   if not ns.get('metadata', {}).get('name', '').startswith('kube-')
-                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')
-                   and not ns.get('metadata', {}).get('name', '').startswith('harvester-')])
+                   if ns.get('metadata', {}).get('name', '') not in excluded_ns
+                   and not ns.get('metadata', {}).get('name', '').startswith('kube-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')])
         
         print(colored("\n   Available namespaces:", Colors.BOLD))
         default_ns_idx = 0
@@ -3580,15 +3577,14 @@ class MigrationTool:
                 ("1", "Select source VM"),
                 ("2", "Export VM config (pre-check)"),
                 ("3", "Download VM disks (QCOW2)"),
-                ("4", "Create PVCs in Harvester"),
-                ("5", "Import disks to PVCs"),
-                ("6", "Create VM in Harvester"),
-                ("7", "Post-migration Windows"),
-                ("8", "Post-migration Linux"),
+                ("4", "Import disks to Harvester"),
+                ("5", "Create VM in Harvester"),
+                ("6", "Post-migration Windows"),
+                ("7", "Post-migration Linux"),
                 ("─", "─" * 30),
-                ("9", "Check staging"),
-                ("10", "List staging disks"),
-                ("11", "Disk image details"),
+                ("8", "Check staging"),
+                ("9", "List staging disks"),
+                ("10", "Disk image details"),
                 ("0", "Back")
             ])
             
@@ -3613,30 +3609,24 @@ class MigrationTool:
                 if not self._selected_vm:
                     print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
                 else:
-                    self.create_pvcs_for_vm()
-                self.pause()
-            elif choice == "5":
-                if not self._selected_vm:
-                    print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
-                else:
                     self.import_disks_to_pvcs()
                 self.pause()
-            elif choice == "6":
+            elif choice == "5":
                 self.create_harvester_vm()
                 self.pause()
-            elif choice == "7":
+            elif choice == "6":
                 self.postmig_autoconfigure()
                 self.pause()
-            elif choice == "8":
+            elif choice == "7":
                 print(colored("\n🚧 Post-migration Linux - Coming soon", Colors.YELLOW))
                 self.pause()
-            elif choice == "9":
+            elif choice == "8":
                 self.check_staging()
                 self.pause()
-            elif choice == "10":
+            elif choice == "9":
                 self.list_staging_disks()
                 self.pause()
-            elif choice == "11":
+            elif choice == "10":
                 self.show_disk_info()
                 self.pause()
             elif choice == "0":
