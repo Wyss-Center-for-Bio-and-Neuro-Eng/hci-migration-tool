@@ -5362,10 +5362,42 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
             print(colored("❌ pywinrm not installed", Colors.RED))
             return
         
-        # If vm_name not provided, list VMs and ask user to select
+        # Use selected VM if available
+        if not vm_name and self._selected_vm:
+            vm_name = self._selected_vm.lower().replace(' ', '-')
+            # Try to find the VM in Harvester to get namespace
+            vms = self.harvester.list_all_vms()
+            for vm in vms:
+                if vm.get('metadata', {}).get('name', '').lower() == vm_name:
+                    namespace = vm.get('metadata', {}).get('namespace', 'default')
+                    # Check if VM is running
+                    vm_status = vm.get('status', {})
+                    if not vm_status.get('ready', False):
+                        print(colored(f"\n⚠️  VM {vm_name} is not running", Colors.YELLOW))
+                        start = self.input_prompt("Start it now? (y/n)")
+                        if start.lower() == 'y':
+                            print("   Starting VM...")
+                            try:
+                                self.harvester.start_vm(vm_name, namespace)
+                                print(colored("   ✅ Start command sent. Waiting 30s for boot...", Colors.GREEN))
+                                import time
+                                time.sleep(30)
+                            except Exception as e:
+                                print(colored(f"   ❌ Error: {e}", Colors.RED))
+                                return
+                        else:
+                            return
+                    break
+            else:
+                print(colored(f"⚠️  VM {vm_name} not found in Harvester, continuing anyway...", Colors.YELLOW))
+                namespace = namespace or "harvester-public"
+            
+            print(colored(f"   VM: {vm_name} ({namespace})", Colors.CYAN))
+        
+        # If still no vm_name, list VMs and ask user to select
         if not vm_name:
-            # List VMs in Harvester
-            vms = self.harvester.list_vms()
+            # List ALL VMs in Harvester (across all namespaces)
+            vms = self.harvester.list_all_vms()
             if not vms:
                 print(colored("❌ No VMs found in Harvester", Colors.RED))
                 return
@@ -5409,7 +5441,7 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
                         return
                 else:
                     return
-        else:
+        elif not namespace:
             print(colored(f"   VM: {vm_name} ({namespace})", Colors.CYAN))
         
         # Build FQDN and ping
@@ -5555,13 +5587,132 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
             
             print(colored("   ✅ Connected!", Colors.GREEN))
             
-            # Apply each static interface config with logging
+            # Clean up ghost NICs (from Nutanix VirtIO)
+            print(colored("\n   🧹 Cleaning up ghost network adapters...", Colors.CYAN))
+            ghost_cleanup_script = '''
+$ErrorActionPreference = "SilentlyContinue"
+
+# Method 1: Remove ghost devices via devcon/pnputil
+$ghostNics = Get-PnpDevice -Class Net | Where-Object { $_.Status -eq "Unknown" -or $_.Status -eq "Error" }
+$removedCount = 0
+
+foreach ($nic in $ghostNics) {
+    $name = $nic.FriendlyName
+    $instanceId = $nic.InstanceId
+    Write-Host "   Removing ghost NIC: $name"
+    
+    # Try pnputil first (Windows 10/Server 2016+)
+    $result = pnputil /remove-device $instanceId 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $removedCount++
+    }
+}
+
+# Method 2: Clean up orphaned IP configurations from registry
+# This fixes the "IP already assigned to another adapter" error
+$netConfigs = Get-ChildItem "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces" -ErrorAction SilentlyContinue
+foreach ($config in $netConfigs) {
+    $guid = $config.PSChildName
+    # Check if this GUID corresponds to an existing adapter
+    $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid -eq "{$guid}" }
+    if (-not $adapter) {
+        # Orphaned config - check if it has a static IP
+        $ipAddress = (Get-ItemProperty $config.PSPath -ErrorAction SilentlyContinue).IPAddress
+        if ($ipAddress -and $ipAddress -ne "0.0.0.0") {
+            Write-Host "   Cleaning orphaned IP config: $ipAddress"
+            # Remove the static IP configuration
+            Remove-ItemProperty -Path $config.PSPath -Name "IPAddress" -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $config.PSPath -Name "SubnetMask" -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $config.PSPath -Name "DefaultGateway" -ErrorAction SilentlyContinue
+            $removedCount++
+        }
+    }
+}
+
+Write-Host "GHOST_CLEANUP_RESULT:$removedCount"
+'''
+            try:
+                result = client.run_powershell(ghost_cleanup_script)
+                output = result.get('stdout', '')
+                if 'GHOST_CLEANUP_RESULT:' in output:
+                    count = output.split('GHOST_CLEANUP_RESULT:')[1].strip().split()[0]
+                    if int(count) > 0:
+                        print(colored(f"   ✅ Cleaned {count} ghost adapter(s)/config(s)", Colors.GREEN))
+                    else:
+                        print(colored("   ✅ No ghost adapters found", Colors.GREEN))
+                else:
+                    print(colored("   ✅ Ghost cleanup completed", Colors.GREEN))
+            except Exception as e:
+                print(colored(f"   ⚠️  Ghost cleanup warning: {e}", Colors.YELLOW))
+                # Continue anyway - this is not critical
+            
+            # Check and apply each static interface config
             for iface in static_interfaces:
                 iface_name = iface.get('name', 'Ethernet')
                 ip = iface.get('ip')
                 prefix = iface.get('prefix', 24)
                 gateway = iface.get('gateway', '')
                 dns_list = iface.get('dns', [])
+                
+                # First, check if network config is already correct
+                print(colored(f"\n   🔍 Checking {iface_name} configuration...", Colors.CYAN))
+                
+                check_script = f'''
+$targetIP = "{ip}"
+$targetPrefix = {prefix}
+$targetGateway = "{gateway}"
+$targetDNS = @({','.join([f'"{d}"' for d in dns_list])})
+
+# Find active adapter
+$adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
+if (-not $adapter) {{
+    Write-Host "CONFIG_CHECK:NO_ADAPTER"
+    exit
+}}
+
+$ifName = $adapter.Name
+
+# Get current config
+$currentIP = Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
+$currentRoute = Get-NetRoute -InterfaceAlias $ifName -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -First 1
+$currentDNS = (Get-DnsClientServerAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+
+$ipMatch = $currentIP -and ($currentIP.IPAddress -eq $targetIP) -and ($currentIP.PrefixLength -eq $targetPrefix)
+$gwMatch = (-not $targetGateway) -or ($currentRoute -and ($currentRoute.NextHop -eq $targetGateway))
+$dnsMatch = ($targetDNS.Count -eq 0) -or (($currentDNS -join ",") -eq ($targetDNS -join ","))
+
+if ($ipMatch -and $gwMatch -and $dnsMatch) {{
+    Write-Host "CONFIG_CHECK:OK"
+    Write-Host "CURRENT_IP:$($currentIP.IPAddress)/$($currentIP.PrefixLength)"
+    Write-Host "CURRENT_GW:$($currentRoute.NextHop)"
+    Write-Host "CURRENT_DNS:$($currentDNS -join ',')"
+}} else {{
+    Write-Host "CONFIG_CHECK:MISMATCH"
+    Write-Host "CURRENT_IP:$($currentIP.IPAddress)/$($currentIP.PrefixLength)"
+    Write-Host "EXPECTED_IP:$targetIP/$targetPrefix"
+    Write-Host "CURRENT_GW:$($currentRoute.NextHop)"
+    Write-Host "EXPECTED_GW:$targetGateway"
+    Write-Host "CURRENT_DNS:$($currentDNS -join ',')"
+    Write-Host "EXPECTED_DNS:$($targetDNS -join ',')"
+}}
+'''
+                try:
+                    check_result = client.run_powershell(check_script)
+                    check_output = check_result.get('stdout', '')
+                    
+                    if 'CONFIG_CHECK:OK' in check_output:
+                        print(colored(f"   ✅ Network already configured correctly ({ip}/{prefix})", Colors.GREEN))
+                        continue  # Skip to next interface
+                    elif 'CONFIG_CHECK:NO_ADAPTER' in check_output:
+                        print(colored(f"   ⚠️  No active network adapter found", Colors.YELLOW))
+                    else:
+                        # Show mismatch details
+                        print(colored(f"   ℹ️  Network config needs update", Colors.YELLOW))
+                        for line in check_output.split('\n'):
+                            if line.startswith('CURRENT_') or line.startswith('EXPECTED_'):
+                                print(f"      {line}")
+                except Exception as e:
+                    print(colored(f"   ⚠️  Could not check config: {e}", Colors.YELLOW))
                 
                 print(colored(f"\n   🔧 Configuring {iface_name}...", Colors.CYAN))
                 
