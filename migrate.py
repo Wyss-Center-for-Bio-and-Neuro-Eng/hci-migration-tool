@@ -5633,7 +5633,7 @@ Write-Host "GHOST_CLEANUP_RESULT:$removedCount"
 '''
             try:
                 result = client.run_powershell(ghost_cleanup_script)
-                output = result.get('stdout', '')
+                output = result[0]  # stdout is first element of tuple
                 if 'GHOST_CLEANUP_RESULT:' in output:
                     count = output.split('GHOST_CLEANUP_RESULT:')[1].strip().split()[0]
                     if int(count) > 0:
@@ -5698,7 +5698,7 @@ if ($ipMatch -and $gwMatch -and $dnsMatch) {{
 '''
                 try:
                     check_result = client.run_powershell(check_script)
-                    check_output = check_result.get('stdout', '')
+                    check_output = check_result[0]  # stdout is first element of tuple
                     
                     if 'CONFIG_CHECK:OK' in check_output:
                         print(colored(f"   ✅ Network already configured correctly ({ip}/{prefix})", Colors.GREEN))
