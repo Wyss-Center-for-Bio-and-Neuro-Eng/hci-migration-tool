@@ -2842,9 +2842,15 @@ class MigrationTool:
             net_choice = self.input_prompt(prompt) or str(default_idx)
             try:
                 net_idx = int(net_choice) - 1
-                selected_net = network_list[net_idx]
+                selected_net = network_list[net_idx].copy()  # Copy to avoid modifying original
             except:
-                selected_net = network_list[0]
+                selected_net = network_list[0].copy()
+            
+            # Store source MAC if available
+            if source_nics and nic_idx < len(source_nics):
+                src_mac = source_nics[nic_idx].get('mac', '')
+                if src_mac:
+                    selected_net['source_mac'] = src_mac.lower().replace(':', '-')  # Convert to Windows format
             
             selected_networks.append(selected_net)
             print(colored(f"      → NIC-{nic_idx}: {selected_net['full_name']}", Colors.GREEN))
@@ -2904,11 +2910,16 @@ class MigrationTool:
         network_ips_annotation = {}
         for i, net in enumerate(selected_networks):
             nic_name = f"nic-{i}"
-            interfaces_spec.append({
+            nic_spec = {
                 "name": nic_name,
                 "model": net_model,
                 "bridge": {}
-            })
+            }
+            # Add MAC address if available from source
+            if net.get('source_mac'):
+                nic_spec["macAddress"] = net['source_mac']
+            
+            interfaces_spec.append(nic_spec)
             networks_spec.append({
                 "name": nic_name,
                 "multus": {"networkName": net['full_name']}
@@ -5592,7 +5603,7 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
             ghost_cleanup_script = '''
 $ErrorActionPreference = "SilentlyContinue"
 
-# Method 1: Remove ghost devices via devcon/pnputil
+# Remove ghost devices via pnputil (safe method)
 $ghostNics = Get-PnpDevice -Class Net | Where-Object { $_.Status -eq "Unknown" -or $_.Status -eq "Error" }
 $removedCount = 0
 
@@ -5601,31 +5612,10 @@ foreach ($nic in $ghostNics) {
     $instanceId = $nic.InstanceId
     Write-Host "   Removing ghost NIC: $name"
     
-    # Try pnputil first (Windows 10/Server 2016+)
+    # Try pnputil (Windows 10/Server 2016+)
     $result = pnputil /remove-device $instanceId 2>&1
     if ($LASTEXITCODE -eq 0) {
         $removedCount++
-    }
-}
-
-# Method 2: Clean up orphaned IP configurations from registry
-# This fixes the "IP already assigned to another adapter" error
-$netConfigs = Get-ChildItem "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces" -ErrorAction SilentlyContinue
-foreach ($config in $netConfigs) {
-    $guid = $config.PSChildName
-    # Check if this GUID corresponds to an existing adapter
-    $adapter = Get-NetAdapter | Where-Object { $_.InterfaceGuid -eq "{$guid}" }
-    if (-not $adapter) {
-        # Orphaned config - check if it has a static IP
-        $ipAddress = (Get-ItemProperty $config.PSPath -ErrorAction SilentlyContinue).IPAddress
-        if ($ipAddress -and $ipAddress -ne "0.0.0.0") {
-            Write-Host "   Cleaning orphaned IP config: $ipAddress"
-            # Remove the static IP configuration
-            Remove-ItemProperty -Path $config.PSPath -Name "IPAddress" -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $config.PSPath -Name "SubnetMask" -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $config.PSPath -Name "DefaultGateway" -ErrorAction SilentlyContinue
-            $removedCount++
-        }
     }
 }
 
@@ -5649,28 +5639,35 @@ Write-Host "GHOST_CLEANUP_RESULT:$removedCount"
             # Check and apply each static interface config
             for iface in static_interfaces:
                 iface_name = iface.get('name', 'Ethernet')
+                iface_mac = iface.get('mac', '').upper().replace(':', '-')  # Windows format
                 ip = iface.get('ip')
                 prefix = iface.get('prefix', 24)
                 gateway = iface.get('gateway', '')
                 dns_list = iface.get('dns', [])
                 
-                # First, check if network config is already correct
-                print(colored(f"\n   🔍 Checking {iface_name} configuration...", Colors.CYAN))
+                # First, check if network config is already correct (by MAC)
+                print(colored(f"\n   🔍 Checking {iface_name} (MAC: {iface_mac})...", Colors.CYAN))
                 
                 check_script = f'''
+$targetMAC = "{iface_mac}"
 $targetIP = "{ip}"
 $targetPrefix = {prefix}
 $targetGateway = "{gateway}"
 $targetDNS = @({','.join([f'"{d}"' for d in dns_list])})
 
-# Find active adapter
-$adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
+# Find adapter by MAC address
+$adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
 if (-not $adapter) {{
     Write-Host "CONFIG_CHECK:NO_ADAPTER"
+    Write-Host "TARGET_MAC:$targetMAC"
+    # List available adapters for debugging
+    Write-Host "AVAILABLE_ADAPTERS:"
+    Get-NetAdapter | ForEach-Object {{ Write-Host "  $($_.Name) - $($_.MacAddress) - $($_.Status)" }}
     exit
 }}
 
 $ifName = $adapter.Name
+Write-Host "FOUND_ADAPTER:$ifName"
 
 # Get current config
 $currentIP = Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -5704,19 +5701,24 @@ if ($ipMatch -and $gwMatch -and $dnsMatch) {{
                         print(colored(f"   ✅ Network already configured correctly ({ip}/{prefix})", Colors.GREEN))
                         continue  # Skip to next interface
                     elif 'CONFIG_CHECK:NO_ADAPTER' in check_output:
-                        print(colored(f"   ⚠️  No active network adapter found", Colors.YELLOW))
+                        print(colored(f"   ⚠️  No adapter found with MAC: {iface_mac}", Colors.YELLOW))
+                        # Show available adapters
+                        for line in check_output.split('\n'):
+                            if line.strip().startswith('AVAILABLE_ADAPTERS:') or line.strip().startswith('  '):
+                                print(f"      {line.strip()}")
+                        continue  # Skip this interface
                     else:
                         # Show mismatch details
                         print(colored(f"   ℹ️  Network config needs update", Colors.YELLOW))
                         for line in check_output.split('\n'):
-                            if line.startswith('CURRENT_') or line.startswith('EXPECTED_'):
+                            if line.startswith('CURRENT_') or line.startswith('EXPECTED_') or line.startswith('FOUND_ADAPTER'):
                                 print(f"      {line}")
                 except Exception as e:
                     print(colored(f"   ⚠️  Could not check config: {e}", Colors.YELLOW))
                 
-                print(colored(f"\n   🔧 Configuring {iface_name}...", Colors.CYAN))
+                print(colored(f"\n   🔧 Configuring by MAC {iface_mac}...", Colors.CYAN))
                 
-                # PowerShell with logging
+                # PowerShell with logging - find adapter by MAC
                 ps_script = f'''
 $ErrorActionPreference = "Continue"
 $logFile = "C:\\temp\\network-reconfig.log"
@@ -5735,28 +5737,23 @@ Log "=========================================="
 Log "Network reconfiguration started"
 Log "=========================================="
 
-$ifName = "{iface_name}"
+$targetMAC = "{iface_mac}"
 $ip = "{ip}"
 $prefix = {prefix}
 $gateway = "{gateway}"
 $dns = @({','.join([f'"{d}"' for d in dns_list])})
 
-Log "Target: $ifName -> $ip/$prefix via $gateway"
+Log "Target MAC: $targetMAC -> $ip/$prefix via $gateway"
 
 try {{
-    $adapter = Get-NetAdapter -Name $ifName -ErrorAction SilentlyContinue
+    # Find adapter by MAC address
+    $adapter = Get-NetAdapter | Where-Object {{ $_.MacAddress -eq $targetMAC }}
     if (-not $adapter) {{
-        $adapter = Get-NetAdapter | Where-Object {{ $_.Name -like "*Ethernet*" -and $_.Status -eq "Up" }} | Select-Object -First 1
-        if (-not $adapter) {{
-            $adapter = Get-NetAdapter | Where-Object {{ $_.Status -eq "Up" }} | Select-Object -First 1
-        }}
-        if ($adapter) {{
-            $ifName = $adapter.Name
-            Log "Using adapter: $ifName"
-        }} else {{
-            throw "No active adapter found"
-        }}
+        throw "No adapter found with MAC: $targetMAC"
     }}
+    
+    $ifName = $adapter.Name
+    Log "Found adapter: $ifName (MAC: $targetMAC)"
 
     Get-NetIPAddress -InterfaceAlias $ifName -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {{
         Log "Removing: $($_.IPAddress)"
@@ -5781,13 +5778,13 @@ try {{
                     stdout, stderr, rc = client.run_powershell(ps_script)
                     
                     if "SUCCESS" in stdout:
-                        print(colored(f"   ✅ {iface_name} configured: {ip}/{prefix}", Colors.GREEN))
+                        print(colored(f"   ✅ Configured: {ip}/{prefix}", Colors.GREEN))
                     else:
                         print(colored(f"   ⚠️  Partial success (rc={rc})", Colors.YELLOW))
                         print(colored(f"      Check log: C:\\temp\\network-reconfig.log", Colors.CYAN))
                 except Exception as e:
                     if "Connection reset" in str(e) or "WinRM" in str(e):
-                        print(colored(f"   ✅ {iface_name} likely configured (connection reset)", Colors.GREEN))
+                        print(colored(f"   ✅ Likely configured (connection reset)", Colors.GREEN))
                         print(colored("      This is normal when changing IP", Colors.CYAN))
                     else:
                         print(colored(f"   ⚠️  Error: {e}", Colors.YELLOW))
