@@ -279,10 +279,50 @@ class MigrationTool:
         self._selected_vm = info['name']
     
     def select_vm(self):
-        vm_name = self.input_prompt("VM name to select")
-        if vm_name:
-            self._selected_vm = vm_name
-            print(colored(f"✅ VM '{vm_name}' selected", Colors.GREEN))
+        """List Nutanix VMs and select one for the migration workflow."""
+        if not self.nutanix and not self.connect_nutanix():
+            return
+        
+        print(colored("\n📋 Nutanix VMs:", Colors.BOLD))
+        
+        vms = self.nutanix.list_vms()
+        if not vms:
+            print(colored("❌ No VMs found", Colors.RED))
+            return
+        
+        # Sort by name and display
+        sorted_vms = sorted(vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
+        
+        for i, vm in enumerate(sorted_vms, 1):
+            spec = vm.get('spec', {})
+            status = vm.get('status', {})
+            name = spec.get('name', 'N/A')
+            power = status.get('resources', {}).get('power_state', 'N/A')
+            power_icon = "🟢" if power == "ON" else "🔴"
+            
+            # Mark current selection
+            current = " ← selected" if self._selected_vm and name.lower() == self._selected_vm.lower() else ""
+            print(f"   {i:3}. {power_icon} {name}{colored(current, Colors.YELLOW)}")
+        
+        print(f"\n   Total: {len(sorted_vms)} VMs")
+        print(f"   0. Cancel")
+        
+        choice = self.input_prompt("\nSelect VM number")
+        if not choice or choice == "0":
+            return
+        
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(sorted_vms):
+                vm_name = sorted_vms[idx].get('spec', {}).get('name')
+                self._selected_vm = vm_name
+                print(colored(f"\n✅ VM '{vm_name}' selected for migration workflow", Colors.GREEN))
+            else:
+                print(colored("❌ Invalid selection", Colors.RED))
+        except ValueError:
+            # Allow direct name input
+            self._selected_vm = choice
+            print(colored(f"\n✅ VM '{choice}' selected", Colors.GREEN))
     
     def list_nutanix_images(self):
         if not self.nutanix and not self.connect_nutanix():
@@ -1621,6 +1661,151 @@ class MigrationTool:
         for img in created_images:
             print(f"      - {img['name']} ({img['uuid']})")
     
+    def download_vm_disks(self):
+        """Download VM disks from Nutanix - wrapper that uses selected VM."""
+        # This is essentially export_vm but explicitly named for the workflow
+        self.export_vm()
+    
+    def create_pvcs_for_vm(self):
+        """Create PVCs in Harvester for the selected VM's disks."""
+        print(colored("\n📦 Create PVCs for VM Disks", Colors.BOLD))
+        print(colored("=" * 60, Colors.BLUE))
+        
+        if not self.harvester and not self.connect_harvester():
+            return
+        
+        vm_name = self._selected_vm.lower().replace(' ', '-')
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        vm_dir = os.path.join(staging_dir, 'migrations', vm_name)
+        
+        # Find QCOW2 files
+        qcow2_files = []
+        if os.path.exists(vm_dir):
+            for f in sorted(os.listdir(vm_dir)):
+                if f.endswith('.qcow2'):
+                    qcow2_files.append(os.path.join(vm_dir, f))
+        
+        if not qcow2_files:
+            print(colored(f"❌ No QCOW2 files found in {vm_dir}", Colors.RED))
+            print(colored("   Run 'Download VM disks' first (option 3)", Colors.YELLOW))
+            return
+        
+        print(f"\n📁 Found {len(qcow2_files)} disk(s) for {self._selected_vm}:")
+        
+        import subprocess
+        import math
+        
+        disk_info = []
+        for i, qcow2_path in enumerate(qcow2_files):
+            try:
+                result = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', qcow2_path],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    info = json.loads(result.stdout)
+                    virtual_size = info.get('virtual-size', 0)
+                    size_gi = math.ceil(virtual_size / (1024**3))
+                    disk_info.append({
+                        'path': qcow2_path,
+                        'name': f"{vm_name}-disk{i}",
+                        'size_gi': size_gi
+                    })
+                    print(f"   [{i}] {os.path.basename(qcow2_path)} → PVC: {vm_name}-disk{i} ({size_gi} GiB)")
+            except Exception as e:
+                print(colored(f"   [{i}] Error reading {qcow2_path}: {e}", Colors.RED))
+        
+        if not disk_info:
+            return
+        
+        # Get namespace
+        namespaces = self.harvester.list_namespaces()
+        ns_names = [ns.get('metadata', {}).get('name', '') for ns in namespaces 
+                   if not ns.get('metadata', {}).get('name', '').startswith('kube-')
+                   and not ns.get('metadata', {}).get('name', '').startswith('cattle-')]
+        
+        print(f"\n   Available namespaces: {', '.join(ns_names[:5])}")
+        namespace = self.input_prompt("   Namespace [harvester-public]") or "harvester-public"
+        
+        # Get storage class
+        scs = self.harvester.list_storage_classes()
+        sc_names = [sc.get('metadata', {}).get('name', '') for sc in scs]
+        default_sc = "harvester-longhorn-dual-node" if "harvester-longhorn-dual-node" in sc_names else sc_names[0] if sc_names else ""
+        print(f"   Available storage classes: {', '.join(sc_names[:3])}")
+        storage_class = self.input_prompt(f"   Storage class [{default_sc}]") or default_sc
+        
+        # Create PVCs
+        confirm = self.input_prompt(f"\n   Create {len(disk_info)} PVC(s)? (y/n) [y]") or "y"
+        if confirm.lower() != 'y':
+            return
+        
+        for disk in disk_info:
+            print(colored(f"\n   Creating PVC: {disk['name']} ({disk['size_gi']} GiB)...", Colors.CYAN))
+            try:
+                self.harvester.create_empty_block_pvc(
+                    name=disk['name'],
+                    size_gi=disk['size_gi'],
+                    storage_class=storage_class,
+                    namespace=namespace
+                )
+                print(colored(f"   ✅ PVC created: {disk['name']}", Colors.GREEN))
+            except Exception as e:
+                if "already exists" in str(e):
+                    print(colored(f"   ⚠️  PVC already exists: {disk['name']}", Colors.YELLOW))
+                else:
+                    print(colored(f"   ❌ Error: {e}", Colors.RED))
+        
+        print(colored(f"\n✅ PVCs ready. Use 'Import disks to PVCs' (option 5) to populate them.", Colors.GREEN))
+    
+    def import_disks_to_pvcs(self):
+        """Import disk data from staging to Harvester PVCs."""
+        print(colored("\n📥 Import Disks to PVCs", Colors.BOLD))
+        print(colored("=" * 60, Colors.BLUE))
+        
+        vm_name = self._selected_vm.lower().replace(' ', '-')
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        vm_dir = os.path.join(staging_dir, 'migrations', vm_name)
+        
+        # Find QCOW2 files
+        qcow2_files = []
+        if os.path.exists(vm_dir):
+            for f in sorted(os.listdir(vm_dir)):
+                if f.endswith('.qcow2'):
+                    qcow2_files.append(f)
+        
+        if not qcow2_files:
+            print(colored(f"❌ No QCOW2 files found in {vm_dir}", Colors.RED))
+            return
+        
+        print(f"\n📁 Found {len(qcow2_files)} disk(s) for {self._selected_vm}:")
+        for i, f in enumerate(qcow2_files):
+            print(f"   [{i}] {f}")
+        
+        # Ask which disk(s) to import
+        print(f"\n   Options: 'all' or disk number (0-{len(qcow2_files)-1})")
+        choice = self.input_prompt("   Import which disk(s)? [all]") or "all"
+        
+        if choice.lower() == 'all':
+            disk_idx = None  # Import all
+        else:
+            try:
+                disk_idx = int(choice)
+            except:
+                print(colored("❌ Invalid choice", Colors.RED))
+                return
+        
+        # Get namespace and storage class
+        namespace = self.input_prompt("   Namespace [harvester-public]") or "harvester-public"
+        storage_class = self.input_prompt("   Storage class [harvester-longhorn-dual-node]") or "harvester-longhorn-dual-node"
+        
+        # Call import_vm_disk
+        self.import_vm_disk(
+            vm_name=vm_name,
+            disk_idx=disk_idx,
+            namespace=namespace,
+            storage_class=storage_class
+        )
+
     def import_to_harvester(self):
         """Create independent volume in Harvester using CDI DataVolume."""
         print(colored("\n📦 Create Volume in Harvester (DataVolume)", Colors.BOLD))
@@ -2435,25 +2620,15 @@ class MigrationTool:
                 self.harvester.start_vm(vm_name, namespace)
                 print(colored(f"✅ VM starting", Colors.GREEN))
                 
-                # Offer post-migration configuration
+                # Show next steps
                 if loaded_config and source_nics:
-                    print(colored("\n📋 Post-Migration Configuration Available", Colors.BOLD))
-                    print("   The VM has a saved config with network settings to restore:")
+                    print(colored("\n📋 Network settings to restore:", Colors.BOLD))
                     for i, nic in enumerate(source_nics):
                         ip = nic.get('ip') if not nic.get('dhcp') else 'DHCP'
                         print(f"      NIC-{i}: {ip}")
-                    
-                    postconfig = self.input_prompt("\n   Run post-migration configuration? (y/n) [y]") or "y"
-                    if postconfig.lower() == 'y':
-                        print(colored("\n   ⏳ Waiting 60s for Windows to boot...", Colors.CYAN))
-                        import time
-                        time.sleep(60)
-                        
-                        # Call postmig with known vm_name and namespace
-                        self.postmig_autoconfigure(vm_name, namespace)
-                    else:
-                        print(colored("\n💡 To configure later:", Colors.YELLOW))
-                        print("   Menu Windows → Post-migration auto-configure (option 8)")
+                    print(colored("\n💡 Next step: Menu Migration → Post-migration Windows (option 7)", Colors.YELLOW))
+                else:
+                    print(colored("\n💡 Next step: Configure VM network if needed", Colors.YELLOW))
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
@@ -2727,46 +2902,67 @@ class MigrationTool:
         while True:
             self.print_header()
             self.print_menu("MIGRATION", [
-                ("1", "Check staging"),
-                ("2", "List staging disks"),
-                ("3", "Disk image details"),
-                ("4", "Export VM (Nutanix → Staging)"),
-                ("5", "Convert RAW → QCOW2"),
-                ("6", "Create volume in Harvester (DataVolume)"),
-                ("7", "Create VM in Harvester (from PVCs)"),
-                ("8", "Delete staging file"),
-                ("9", "Full migration"),
+                ("1", "Select source VM"),
+                ("2", "Export VM config (pre-check)"),
+                ("3", "Download VM disks (QCOW2)"),
+                ("4", "Create PVCs in Harvester"),
+                ("5", "Import disks to PVCs"),
+                ("6", "Create VM in Harvester"),
+                ("7", "Post-migration Windows"),
+                ("8", "Post-migration Linux"),
+                ("─", "─" * 30),
+                ("9", "Check staging"),
+                ("10", "List staging disks"),
+                ("11", "Disk image details"),
                 ("0", "Back")
             ])
             
             choice = self.input_prompt()
             
             if choice == "1":
-                self.check_staging()
+                self.select_vm()
                 self.pause()
             elif choice == "2":
-                self.list_staging_disks()
+                if not self._selected_vm:
+                    print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
+                else:
+                    self.windows_precheck()
                 self.pause()
             elif choice == "3":
-                self.show_disk_info()
+                if not self._selected_vm:
+                    print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
+                else:
+                    self.export_vm()
                 self.pause()
             elif choice == "4":
-                self.export_vm()
+                if not self._selected_vm:
+                    print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
+                else:
+                    self.create_pvcs_for_vm()
                 self.pause()
             elif choice == "5":
-                self.convert_disk()
+                if not self._selected_vm:
+                    print(colored("❌ No VM selected. Use option 1 first.", Colors.RED))
+                else:
+                    self.import_disks_to_pvcs()
                 self.pause()
             elif choice == "6":
-                self.import_to_harvester()
-                self.pause()
-            elif choice == "7":
                 self.create_harvester_vm()
                 self.pause()
+            elif choice == "7":
+                self.postmig_autoconfigure()
+                self.pause()
             elif choice == "8":
-                self.delete_staging_file()
+                print(colored("\n🚧 Post-migration Linux - Coming soon", Colors.YELLOW))
                 self.pause()
             elif choice == "9":
-                print(colored("\n🚧 Full migration - Under development", Colors.YELLOW))
+                self.check_staging()
+                self.pause()
+            elif choice == "10":
+                self.list_staging_disks()
+                self.pause()
+            elif choice == "11":
+                self.show_disk_info()
                 self.pause()
             elif choice == "0":
                 break

@@ -378,6 +378,11 @@ class HarvesterClient:
         result = self._request("GET", "/apis/storage.k8s.io/v1/storageclasses")
         return result.get('items', [])
     
+    def list_namespaces(self) -> List[dict]:
+        """List namespaces."""
+        result = self._request("GET", "/api/v1/namespaces")
+        return result.get('items', [])
+    
     def list_pvcs(self, namespace: str = None) -> List[dict]:
         """List persistent volume claims."""
         ns = namespace or self.namespace
