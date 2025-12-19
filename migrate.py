@@ -176,6 +176,193 @@ class MigrationTool:
     def pause(self):
         input(colored("\nPress Enter to continue...", Colors.CYAN))
     
+    # === Migration Tracker Methods ===
+    
+    MIGRATION_STEPS = ['precheck', 'export', 'create_pvcs', 'import_disks', 'create_vm', 'postmig']
+    STEP_LABELS = {
+        'precheck': 'Pre-check (collect config)',
+        'export': 'Export/Download disks',
+        'create_pvcs': 'Create PVCs',
+        'import_disks': 'Import disks to PVCs',
+        'create_vm': 'Create VM in Harvester',
+        'postmig': 'Post-migration config'
+    }
+    
+    def get_tracker_path(self) -> str:
+        """Get path to migration tracker JSON file."""
+        staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
+        return os.path.join(staging_dir, 'migrations', 'migration-tracker.json')
+    
+    def load_tracker(self) -> dict:
+        """Load migration tracker from JSON file."""
+        tracker_path = self.get_tracker_path()
+        if os.path.exists(tracker_path):
+            try:
+                with open(tracker_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(colored(f"⚠️  Error loading tracker: {e}", Colors.YELLOW))
+        return {"migrations": {}}
+    
+    def save_tracker(self, tracker: dict):
+        """Save migration tracker to JSON file."""
+        tracker_path = self.get_tracker_path()
+        os.makedirs(os.path.dirname(tracker_path), exist_ok=True)
+        with open(tracker_path, 'w') as f:
+            json.dump(tracker, f, indent=2)
+    
+    def add_vm_to_tracker(self, vm_name: str, os_type: str = "windows") -> bool:
+        """Add a VM to the migration tracker."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key in tracker['migrations']:
+            print(colored(f"⚠️  VM '{vm_name}' already in tracker", Colors.YELLOW))
+            return False
+        
+        tracker['migrations'][vm_key] = {
+            "display_name": vm_name,
+            "added_at": datetime.utcnow().isoformat() + "Z",
+            "os_type": os_type,
+            "source": "nutanix",
+            "steps": {step: {"done": False, "date": None} for step in self.MIGRATION_STEPS}
+        }
+        
+        self.save_tracker(tracker)
+        return True
+    
+    def remove_vm_from_tracker(self, vm_name: str) -> bool:
+        """Remove a VM from the migration tracker."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            print(colored(f"❌ VM '{vm_name}' not in tracker", Colors.RED))
+            return False
+        
+        del tracker['migrations'][vm_key]
+        self.save_tracker(tracker)
+        return True
+    
+    def update_step(self, vm_name: str, step_name: str) -> bool:
+        """Mark a step as completed for a VM."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            # Auto-add VM if not in tracker
+            self.add_vm_to_tracker(vm_name)
+            tracker = self.load_tracker()
+        
+        if step_name not in self.MIGRATION_STEPS:
+            print(colored(f"❌ Invalid step: {step_name}", Colors.RED))
+            return False
+        
+        tracker['migrations'][vm_key]['steps'][step_name] = {
+            "done": True,
+            "date": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        self.save_tracker(tracker)
+        return True
+    
+    def reset_step(self, vm_name: str, step_name: str) -> bool:
+        """Reset a step for a VM."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            print(colored(f"❌ VM '{vm_name}' not in tracker", Colors.RED))
+            return False
+        
+        if step_name == 'all':
+            for step in self.MIGRATION_STEPS:
+                tracker['migrations'][vm_key]['steps'][step] = {"done": False, "date": None}
+        else:
+            if step_name not in self.MIGRATION_STEPS:
+                print(colored(f"❌ Invalid step: {step_name}", Colors.RED))
+                return False
+            tracker['migrations'][vm_key]['steps'][step_name] = {"done": False, "date": None}
+        
+        self.save_tracker(tracker)
+        return True
+    
+    def is_step_done(self, vm_name: str, step_name: str) -> bool:
+        """Check if a step is already completed."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            return False
+        
+        return tracker['migrations'][vm_key]['steps'].get(step_name, {}).get('done', False)
+    
+    def get_step_date(self, vm_name: str, step_name: str) -> str:
+        """Get the completion date of a step."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            return None
+        
+        return tracker['migrations'][vm_key]['steps'].get(step_name, {}).get('date')
+    
+    def get_next_step(self, vm_name: str) -> str:
+        """Get the next step to be done for a VM."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            return self.MIGRATION_STEPS[0]
+        
+        steps = tracker['migrations'][vm_key]['steps']
+        for step in self.MIGRATION_STEPS:
+            if not steps.get(step, {}).get('done', False):
+                return step
+        
+        return "completed"
+    
+    def get_vm_progress(self, vm_name: str) -> str:
+        """Get progress bar for a VM like [✓✓✓○○○]."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            return "[○○○○○○]"
+        
+        steps = tracker['migrations'][vm_key]['steps']
+        progress = ""
+        for step in self.MIGRATION_STEPS:
+            if steps.get(step, {}).get('done', False):
+                progress += "✓"
+            else:
+                progress += "○"
+        
+        return f"[{progress}]"
+    
+    def get_vm_progress_count(self, vm_name: str) -> tuple:
+        """Get progress count for a VM (done, total)."""
+        tracker = self.load_tracker()
+        vm_key = vm_name.lower()
+        
+        if vm_key not in tracker['migrations']:
+            return (0, len(self.MIGRATION_STEPS))
+        
+        steps = tracker['migrations'][vm_key]['steps']
+        done = sum(1 for step in self.MIGRATION_STEPS if steps.get(step, {}).get('done', False))
+        return (done, len(self.MIGRATION_STEPS))
+    
+    def check_step_and_confirm(self, vm_name: str, step_name: str) -> bool:
+        """Check if step is done and ask for confirmation to re-run."""
+        if self.is_step_done(vm_name, step_name):
+            date = self.get_step_date(vm_name, step_name)
+            date_str = date[:10] if date else "unknown"
+            print(colored(f"\n⚠️  Step '{self.STEP_LABELS.get(step_name, step_name)}' already completed ({date_str})", Colors.YELLOW))
+            confirm = self.input_prompt("   Re-run this step? (y/n) [n]") or "n"
+            if confirm.lower() != 'y':
+                return False
+        return True
+
     # === Connection Methods ===
     
     def connect_nutanix(self) -> bool:
@@ -279,33 +466,36 @@ class MigrationTool:
         self._selected_vm = info['name']
     
     def select_vm(self):
-        """List Nutanix VMs and select one for the migration workflow."""
-        if not self.nutanix and not self.connect_nutanix():
+        """Select a VM from the migration tracker for the workflow."""
+        print(colored("\n📋 Select VM for Migration", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        tracker = self.load_tracker()
+        migrations = tracker.get('migrations', {})
+        
+        if not migrations:
+            print(colored("   No VMs in migration tracker.", Colors.YELLOW))
+            print(colored("   Use 'Migration Tracker → Add VM' first.", Colors.YELLOW))
             return
         
-        print(colored("\n📋 Nutanix VMs:", Colors.BOLD))
+        # Sort VMs and display
+        vm_list = sorted(migrations.keys())
         
-        vms = self.nutanix.list_vms()
-        if not vms:
-            print(colored("❌ No VMs found", Colors.RED))
-            return
-        
-        # Sort by name and display
-        sorted_vms = sorted(vms, key=lambda x: x.get('spec', {}).get('name', '').lower())
-        
-        for i, vm in enumerate(sorted_vms, 1):
-            spec = vm.get('spec', {})
-            status = vm.get('status', {})
-            name = spec.get('name', 'N/A')
-            power = status.get('resources', {}).get('power_state', 'N/A')
-            power_icon = "🟢" if power == "ON" else "🔴"
+        print("\n   VMs in migration tracker:")
+        for i, vm_key in enumerate(vm_list, 1):
+            vm_data = migrations[vm_key]
+            display_name = vm_data.get('display_name', vm_key)
+            os_type = vm_data.get('os_type', '?')
+            progress = self.get_vm_progress(vm_key)
+            next_step = self.get_next_step(vm_key)
+            next_label = self.STEP_LABELS.get(next_step, next_step)[:20] if next_step != "completed" else "✅ Done"
             
             # Mark current selection
-            current = " ← selected" if self._selected_vm and name.lower() == self._selected_vm.lower() else ""
-            print(f"   {i:3}. {power_icon} {name}{colored(current, Colors.YELLOW)}")
+            current = colored(" ← selected", Colors.YELLOW) if self._selected_vm and self._selected_vm.lower() == vm_key else ""
+            
+            print(f"   {i:3}. {display_name:<20} {progress} → {next_label}{current}")
         
-        print(f"\n   Total: {len(sorted_vms)} VMs")
-        print(f"   0. Cancel")
+        print(f"\n   0. Cancel")
         
         choice = self.input_prompt("\nSelect VM number")
         if not choice or choice == "0":
@@ -313,16 +503,18 @@ class MigrationTool:
         
         try:
             idx = int(choice) - 1
-            if 0 <= idx < len(sorted_vms):
-                vm_name = sorted_vms[idx].get('spec', {}).get('name')
-                self._selected_vm = vm_name
-                print(colored(f"\n✅ VM '{vm_name}' selected for migration workflow", Colors.GREEN))
+            if 0 <= idx < len(vm_list):
+                vm_key = vm_list[idx]
+                display_name = migrations[vm_key].get('display_name', vm_key)
+                self._selected_vm = display_name
+                next_step = self.get_next_step(vm_key)
+                next_label = self.STEP_LABELS.get(next_step, next_step) if next_step != "completed" else "All done!"
+                print(colored(f"\n✅ VM '{display_name}' selected", Colors.GREEN))
+                print(colored(f"   Next step: {next_label}", Colors.CYAN))
             else:
                 print(colored("❌ Invalid selection", Colors.RED))
         except ValueError:
-            # Allow direct name input
-            self._selected_vm = choice
-            print(colored(f"\n✅ VM '{choice}' selected", Colors.GREEN))
+            print(colored("❌ Invalid input", Colors.RED))
     
     def list_nutanix_images(self):
         if not self.nutanix and not self.connect_nutanix():
@@ -1313,6 +1505,10 @@ class MigrationTool:
             print(colored("❌ No VM selected. Use 'Select VM' first.", Colors.RED))
             return
         
+        # Check if step already done
+        if not self.check_step_and_confirm(self._selected_vm, 'export'):
+            return
+        
         if not self.nutanix:
             self.connect_nutanix()
             if not self.nutanix:
@@ -1454,6 +1650,10 @@ class MigrationTool:
             if convert.lower() != 'n':
                 for raw_file in downloaded_files:
                     self._convert_single_file(raw_file)
+        
+        # Update tracker
+        self.update_step(self._selected_vm, 'export')
+        print(colored(f"   ✅ Step 'export' marked complete in tracker", Colors.GREEN))
     
     def _export_vm_api(self):
         """Export VM disks via API (original method)."""
@@ -1660,6 +1860,10 @@ class MigrationTool:
         print(colored("\n💡 TIP: After successful migration, delete the Nutanix export images:", Colors.YELLOW))
         for img in created_images:
             print(f"      - {img['name']} ({img['uuid']})")
+        
+        # Update tracker
+        self.update_step(self._selected_vm, 'export')
+        print(colored(f"   ✅ Step 'export' marked complete in tracker", Colors.GREEN))
     
     def download_vm_disks(self):
         """Download VM disks from Nutanix - wrapper that uses selected VM."""
@@ -1670,6 +1874,10 @@ class MigrationTool:
         """Create PVCs in Harvester for the selected VM's disks."""
         print(colored("\n📦 Create PVCs for VM Disks", Colors.BOLD))
         print(colored("=" * 60, Colors.BLUE))
+        
+        # Check if step already done
+        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'create_pvcs'):
+            return
         
         if not self.harvester and not self.connect_harvester():
             return
@@ -1756,11 +1964,19 @@ class MigrationTool:
                     print(colored(f"   ❌ Error: {e}", Colors.RED))
         
         print(colored(f"\n✅ PVCs ready. Use 'Import disks to PVCs' (option 5) to populate them.", Colors.GREEN))
+        
+        # Update tracker
+        self.update_step(self._selected_vm, 'create_pvcs')
+        print(colored(f"   ✅ Step 'create_pvcs' marked complete in tracker", Colors.GREEN))
     
     def import_disks_to_pvcs(self):
         """Import disk data from staging to Harvester PVCs."""
         print(colored("\n📥 Import Disks to PVCs", Colors.BOLD))
         print(colored("=" * 60, Colors.BLUE))
+        
+        # Check if step already done
+        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'import_disks'):
+            return
         
         vm_name = self._selected_vm.lower().replace(' ', '-')
         staging_dir = self.config.get('transfer', {}).get('staging_mount', '/mnt/data')
@@ -1805,6 +2021,10 @@ class MigrationTool:
             namespace=namespace,
             storage_class=storage_class
         )
+        
+        # Update tracker
+        self.update_step(self._selected_vm, 'import_disks')
+        print(colored(f"\n   ✅ Step 'import_disks' marked complete in tracker", Colors.GREEN))
 
     def import_to_harvester(self):
         """Create independent volume in Harvester using CDI DataVolume."""
@@ -2218,6 +2438,10 @@ class MigrationTool:
         if not self.harvester and not self.connect_harvester():
             return
         
+        # Check if step already done
+        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'create_vm'):
+            return
+        
         print(colored("\n🖥️  Create VM in Harvester", Colors.BOLD))
         print(colored("-" * 50, Colors.BLUE))
         
@@ -2615,6 +2839,11 @@ class MigrationTool:
             print(colored(f"\n✅ VM created: {vm_name}", Colors.GREEN))
             print(colored("   This VM has NO image dependencies!", Colors.GREEN))
             
+            # Update tracker
+            if self._selected_vm:
+                self.update_step(self._selected_vm, 'create_vm')
+                print(colored(f"   ✅ Step 'create_vm' marked complete in tracker", Colors.GREEN))
+            
             start = self.input_prompt("\nStart VM? (y/n) [y]") or "y"
             if start.lower() == 'y':
                 self.harvester.start_vm(vm_name, namespace)
@@ -2634,13 +2863,330 @@ class MigrationTool:
     
     # === Menus ===
     
+    def menu_tracker(self):
+        """Migration Tracker menu."""
+        while True:
+            self.print_header()
+            self.print_menu("MIGRATION TRACKER", [
+                ("1", "List all migrations"),
+                ("2", "Add VM to migration list"),
+                ("3", "Remove VM from migration list"),
+                ("4", "Reset VM step(s)"),
+                ("5", "View VM details"),
+                ("0", "Back")
+            ])
+            
+            choice = self.input_prompt()
+            
+            if choice == "1":
+                self.tracker_list_all()
+                self.pause()
+            elif choice == "2":
+                self.tracker_add_vm()
+                self.pause()
+            elif choice == "3":
+                self.tracker_remove_vm()
+                self.pause()
+            elif choice == "4":
+                self.tracker_reset_steps()
+                self.pause()
+            elif choice == "5":
+                self.tracker_view_vm()
+                self.pause()
+            elif choice == "0":
+                break
+    
+    def tracker_list_all(self):
+        """List all VMs in the migration tracker."""
+        print(colored("\n📋 Migration Status Overview", Colors.BOLD))
+        print(colored("=" * 80, Colors.BLUE))
+        
+        tracker = self.load_tracker()
+        migrations = tracker.get('migrations', {})
+        
+        if not migrations:
+            print(colored("   No VMs in migration tracker.", Colors.YELLOW))
+            print(colored("   Use 'Add VM to migration list' to start.", Colors.YELLOW))
+            return
+        
+        # Header
+        print(f"{'VM Name':<25} {'OS':<10} {'Progress':<12} {'Next Step':<20} {'Added':<12}")
+        print(colored("=" * 80, Colors.BLUE))
+        
+        for vm_key, vm_data in sorted(migrations.items()):
+            display_name = vm_data.get('display_name', vm_key)
+            os_type = vm_data.get('os_type', 'unknown')
+            progress = self.get_vm_progress(vm_key)
+            done, total = self.get_vm_progress_count(vm_key)
+            next_step = self.get_next_step(vm_key)
+            next_label = self.STEP_LABELS.get(next_step, next_step)[:18]
+            added = vm_data.get('added_at', '')[:10]
+            
+            # Color based on progress
+            if next_step == "completed":
+                progress_colored = colored(progress, Colors.GREEN)
+                next_label = colored("✅ Completed", Colors.GREEN)
+            elif done == 0:
+                progress_colored = colored(progress, Colors.YELLOW)
+            else:
+                progress_colored = colored(progress, Colors.CYAN)
+            
+            print(f"{display_name:<25} {os_type:<10} {progress_colored} {next_label:<20} {added:<12}")
+        
+        print(colored("=" * 80, Colors.BLUE))
+        print(f"Total: {len(migrations)} VM(s) in migration pipeline")
+    
+    def tracker_add_vm(self):
+        """Add a VM from Nutanix to the migration tracker."""
+        print(colored("\n➕ Add VM to Migration List", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        if not self.nutanix and not self.connect_nutanix():
+            return
+        
+        # Get existing migrations to filter them out
+        tracker = self.load_tracker()
+        existing = set(tracker.get('migrations', {}).keys())
+        
+        # List Nutanix VMs
+        vms = self.nutanix.list_vms()
+        if not vms:
+            print(colored("❌ No VMs found in Nutanix", Colors.RED))
+            return
+        
+        # Filter out already tracked VMs and sort
+        available_vms = []
+        for vm in vms:
+            name = vm.get('spec', {}).get('name', '')
+            if name.lower() not in existing:
+                available_vms.append(vm)
+        
+        available_vms.sort(key=lambda x: x.get('spec', {}).get('name', '').lower())
+        
+        if not available_vms:
+            print(colored("   All VMs are already in the tracker!", Colors.YELLOW))
+            return
+        
+        print(f"\n   Available VMs ({len(available_vms)}):")
+        for i, vm in enumerate(available_vms, 1):
+            name = vm.get('spec', {}).get('name', 'N/A')
+            power = vm.get('status', {}).get('resources', {}).get('power_state', 'N/A')
+            power_icon = "🟢" if power == "ON" else "🔴"
+            print(f"   {i:3}. {power_icon} {name}")
+        
+        print(f"\n   0. Cancel")
+        
+        choice = self.input_prompt("\nSelect VM to add")
+        if not choice or choice == "0":
+            return
+        
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_vms):
+                vm_name = available_vms[idx].get('spec', {}).get('name')
+                
+                # Ask for OS type
+                print(colored(f"\n   VM: {vm_name}", Colors.CYAN))
+                print("   OS Type:")
+                print("   1. Windows")
+                print("   2. Linux")
+                os_choice = self.input_prompt("   Select OS type [1]") or "1"
+                os_type = "linux" if os_choice == "2" else "windows"
+                
+                if self.add_vm_to_tracker(vm_name, os_type):
+                    print(colored(f"\n✅ VM '{vm_name}' added to migration tracker ({os_type})", Colors.GREEN))
+                    self._selected_vm = vm_name
+                    print(colored(f"   Selected for migration workflow", Colors.GREEN))
+            else:
+                print(colored("❌ Invalid selection", Colors.RED))
+        except ValueError:
+            print(colored("❌ Invalid input", Colors.RED))
+    
+    def tracker_remove_vm(self):
+        """Remove a VM from the migration tracker."""
+        print(colored("\n➖ Remove VM from Migration List", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        tracker = self.load_tracker()
+        migrations = tracker.get('migrations', {})
+        
+        if not migrations:
+            print(colored("   No VMs in tracker.", Colors.YELLOW))
+            return
+        
+        vm_list = list(migrations.keys())
+        print("\n   VMs in tracker:")
+        for i, vm_key in enumerate(sorted(vm_list), 1):
+            vm_data = migrations[vm_key]
+            display_name = vm_data.get('display_name', vm_key)
+            progress = self.get_vm_progress(vm_key)
+            print(f"   {i}. {display_name} {progress}")
+        
+        print(f"   0. Cancel")
+        
+        choice = self.input_prompt("\nSelect VM to remove")
+        if not choice or choice == "0":
+            return
+        
+        try:
+            idx = int(choice) - 1
+            sorted_keys = sorted(vm_list)
+            if 0 <= idx < len(sorted_keys):
+                vm_key = sorted_keys[idx]
+                display_name = migrations[vm_key].get('display_name', vm_key)
+                
+                confirm = self.input_prompt(f"   Remove '{display_name}'? (y/n) [n]") or "n"
+                if confirm.lower() == 'y':
+                    if self.remove_vm_from_tracker(vm_key):
+                        print(colored(f"✅ VM '{display_name}' removed from tracker", Colors.GREEN))
+                        if self._selected_vm and self._selected_vm.lower() == vm_key:
+                            self._selected_vm = None
+            else:
+                print(colored("❌ Invalid selection", Colors.RED))
+        except ValueError:
+            print(colored("❌ Invalid input", Colors.RED))
+    
+    def tracker_reset_steps(self):
+        """Reset step(s) for a VM in the tracker."""
+        print(colored("\n🔄 Reset VM Step(s)", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        tracker = self.load_tracker()
+        migrations = tracker.get('migrations', {})
+        
+        if not migrations:
+            print(colored("   No VMs in tracker.", Colors.YELLOW))
+            return
+        
+        # Select VM
+        vm_list = sorted(migrations.keys())
+        print("\n   Select VM:")
+        for i, vm_key in enumerate(vm_list, 1):
+            vm_data = migrations[vm_key]
+            display_name = vm_data.get('display_name', vm_key)
+            progress = self.get_vm_progress(vm_key)
+            print(f"   {i}. {display_name} {progress}")
+        
+        print(f"   0. Cancel")
+        
+        choice = self.input_prompt("\nSelect VM")
+        if not choice or choice == "0":
+            return
+        
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(vm_list):
+                vm_key = vm_list[idx]
+                vm_data = migrations[vm_key]
+                display_name = vm_data.get('display_name', vm_key)
+                steps = vm_data.get('steps', {})
+                
+                # Show steps for this VM
+                print(colored(f"\n   Steps for {display_name}:", Colors.BOLD))
+                for i, step in enumerate(self.MIGRATION_STEPS, 1):
+                    step_data = steps.get(step, {})
+                    done = step_data.get('done', False)
+                    date = step_data.get('date', '')[:10] if step_data.get('date') else '-'
+                    status = colored("✓", Colors.GREEN) if done else colored("○", Colors.YELLOW)
+                    label = self.STEP_LABELS.get(step, step)
+                    print(f"   {i}. {status} {label:<30} {date}")
+                
+                print(f"   A. Reset ALL steps")
+                print(f"   0. Cancel")
+                
+                step_choice = self.input_prompt("\n   Select step to reset")
+                if not step_choice or step_choice == "0":
+                    return
+                
+                if step_choice.lower() == 'a':
+                    confirm = self.input_prompt(f"   Reset ALL steps for {display_name}? (y/n) [n]") or "n"
+                    if confirm.lower() == 'y':
+                        self.reset_step(vm_key, 'all')
+                        print(colored(f"✅ All steps reset for {display_name}", Colors.GREEN))
+                else:
+                    step_idx = int(step_choice) - 1
+                    if 0 <= step_idx < len(self.MIGRATION_STEPS):
+                        step_name = self.MIGRATION_STEPS[step_idx]
+                        self.reset_step(vm_key, step_name)
+                        print(colored(f"✅ Step '{self.STEP_LABELS.get(step_name)}' reset for {display_name}", Colors.GREEN))
+                    else:
+                        print(colored("❌ Invalid selection", Colors.RED))
+            else:
+                print(colored("❌ Invalid selection", Colors.RED))
+        except ValueError:
+            print(colored("❌ Invalid input", Colors.RED))
+    
+    def tracker_view_vm(self):
+        """View detailed status of a VM in the tracker."""
+        print(colored("\n🔍 View VM Details", Colors.BOLD))
+        print(colored("-" * 50, Colors.BLUE))
+        
+        tracker = self.load_tracker()
+        migrations = tracker.get('migrations', {})
+        
+        if not migrations:
+            print(colored("   No VMs in tracker.", Colors.YELLOW))
+            return
+        
+        vm_list = sorted(migrations.keys())
+        print("\n   Select VM:")
+        for i, vm_key in enumerate(vm_list, 1):
+            display_name = migrations[vm_key].get('display_name', vm_key)
+            print(f"   {i}. {display_name}")
+        
+        print(f"   0. Cancel")
+        
+        choice = self.input_prompt("\nSelect VM")
+        if not choice or choice == "0":
+            return
+        
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(vm_list):
+                vm_key = vm_list[idx]
+                vm_data = migrations[vm_key]
+                
+                display_name = vm_data.get('display_name', vm_key)
+                os_type = vm_data.get('os_type', 'unknown')
+                source = vm_data.get('source', 'unknown')
+                added_at = vm_data.get('added_at', 'unknown')
+                steps = vm_data.get('steps', {})
+                
+                print(colored(f"\n{'=' * 50}", Colors.BLUE))
+                print(colored(f"   VM: {display_name}", Colors.BOLD))
+                print(colored(f"{'=' * 50}", Colors.BLUE))
+                print(f"   OS Type:  {os_type}")
+                print(f"   Source:   {source}")
+                print(f"   Added:    {added_at}")
+                print(f"   Progress: {self.get_vm_progress(vm_key)}")
+                
+                print(colored(f"\n   Steps:", Colors.BOLD))
+                for step in self.MIGRATION_STEPS:
+                    step_data = steps.get(step, {})
+                    done = step_data.get('done', False)
+                    date = step_data.get('date', '')
+                    date_str = date[:19].replace('T', ' ') if date else '-'
+                    status = colored("✓ Done", Colors.GREEN) if done else colored("○ Pending", Colors.YELLOW)
+                    label = self.STEP_LABELS.get(step, step)
+                    print(f"   {label:<30} {status:<15} {date_str}")
+                
+                next_step = self.get_next_step(vm_key)
+                if next_step != "completed":
+                    print(colored(f"\n   → Next: {self.STEP_LABELS.get(next_step, next_step)}", Colors.CYAN))
+                else:
+                    print(colored(f"\n   ✅ Migration completed!", Colors.GREEN))
+            else:
+                print(colored("❌ Invalid selection", Colors.RED))
+        except ValueError:
+            print(colored("❌ Invalid input", Colors.RED))
+
     def menu_nutanix(self):
         while True:
             self.print_header()
             self.print_menu("NUTANIX", [
                 ("1", "List VMs"),
                 ("2", "VM details"),
-                ("3", "Select VM"),
+                ("3", "Add VM to migration → Tracker"),
                 ("4", "Power ON VM"),
                 ("5", "Power OFF VM"),
                 ("6", "List images"),
@@ -2657,7 +3203,7 @@ class MigrationTool:
                 self.show_vm_details()
                 self.pause()
             elif choice == "3":
-                self.select_vm()
+                self.tracker_add_vm()
                 self.pause()
             elif choice == "4":
                 self.power_on_nutanix_vm()
@@ -3643,6 +4189,10 @@ Log "=========================================="
             print(colored("❌ pywinrm not installed. Run: pip install pywinrm[kerberos]", Colors.RED))
             return
         
+        # Check if step already done
+        if self._selected_vm and not self.check_step_and_confirm(self._selected_vm, 'precheck'):
+            return
+        
         # Get target host
         if self._selected_vm:
             print(f"   Selected VM: {self._selected_vm}")
@@ -3964,6 +4514,11 @@ Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\
                 print(colored("   ⚠️  Nutanix not configured - boot_type will need to be set manually", Colors.YELLOW))
             
             print(colored(f"\n   💾 Configuration saved: {config_path}", Colors.GREEN))
+            
+            # Update tracker
+            if self._selected_vm:
+                self.update_step(self._selected_vm, 'precheck')
+                print(colored(f"   ✅ Step 'precheck' marked complete in tracker", Colors.GREEN))
             
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
@@ -4620,6 +5175,11 @@ Remove-Item $iso -Force -ErrorAction SilentlyContinue
         print(colored("\n🔧 Post-Migration Auto-Configure", Colors.BOLD))
         print(colored("-" * 50, Colors.BLUE))
         
+        # Check if step already done (use selected_vm or passed vm_name)
+        check_vm = vm_name or self._selected_vm
+        if check_vm and not self.check_step_and_confirm(check_vm, 'postmig'):
+            return
+        
         if not self.harvester and not self.connect_harvester():
             return
         
@@ -5202,6 +5762,13 @@ Write-Host "CLEANUP_DONE"
                 print("   2. Switch VM to VirtIO bus (Menu Harvester → Switch VM disk bus)")
                 print("   3. Reboot and verify performance")
             
+            # Update tracker
+            track_vm = vm_name or self._selected_vm
+            if track_vm:
+                self.update_step(track_vm, 'postmig')
+                print(colored(f"\n   ✅ Step 'postmig' marked complete in tracker", Colors.GREEN))
+                print(colored(f"\n   🎉 Migration of {track_vm} is COMPLETE!", Colors.GREEN + Colors.BOLD))
+            
         except Exception as e:
             print(colored(f"❌ Error: {e}", Colors.RED))
     
@@ -5351,25 +5918,28 @@ Write-Host "CLEANUP_DONE"
         while True:
             self.print_header()
             self.print_menu("MAIN MENU", [
-                ("1", "Nutanix"),
-                ("2", "Harvester"),
-                ("3", "Migration"),
-                ("4", "Windows Tools"),
-                ("5", "Configuration"),
+                ("1", "Migration Tracker"),
+                ("2", "Migration"),
+                ("3", "Nutanix"),
+                ("4", "Harvester"),
+                ("5", "Windows Tools"),
+                ("6", "Configuration"),
                 ("q", "Quit")
             ])
             
             choice = self.input_prompt()
             
             if choice == "1":
-                self.menu_nutanix()
+                self.menu_tracker()
             elif choice == "2":
-                self.menu_harvester()
-            elif choice == "3":
                 self.menu_migration()
+            elif choice == "3":
+                self.menu_nutanix()
             elif choice == "4":
-                self.menu_windows()
+                self.menu_harvester()
             elif choice == "5":
+                self.menu_windows()
+            elif choice == "6":
                 self.menu_config()
             elif choice.lower() == "q":
                 print(colored("\nGoodbye! 👋", Colors.CYAN))
